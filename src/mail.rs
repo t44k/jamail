@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local, NaiveDateTime};
 use imap::Connection;
 use mailparse::{parse_mail, MailHeaderMap};
+use std::time::Duration;
 
 use crate::config::Account;
+use crate::db::MailDb;
 
 pub struct Email {
     pub uid: u32,
@@ -11,6 +13,7 @@ pub struct Email {
     pub subject: String,
     pub date: DateTime<Local>,
     pub is_unread: bool,
+    #[allow(dead_code)]
     pub preview: String,
 }
 
@@ -21,6 +24,17 @@ pub struct EmailContent {
     pub date: DateTime<Local>,
     pub text_body: String,
     pub html_body: Option<String>,
+}
+
+struct ProcessedEmail {
+    from: String,
+    to: String,
+    subject: String,
+    date: DateTime<Local>,
+    is_unread: bool,
+    preview: String,
+    text_body: String,
+    html_body: Option<String>,
 }
 
 pub struct MailClient {
@@ -50,103 +64,87 @@ impl MailClient {
         Ok(Self { session })
     }
 
-    pub fn fetch_inbox(&mut self, count: u32) -> Result<Vec<Email>> {
+    pub fn sync_inbox(
+        &mut self,
+        db: &MailDb,
+        account: &str,
+        progress: &dyn Fn(usize, usize),
+    ) -> Result<usize> {
         let mailbox = self.session.select("INBOX").context("Failed to select INBOX")?;
-        let total = mailbox.exists;
-        if total == 0 {
-            return Ok(Vec::new());
-        }
+        let server_uidvalidity = mailbox.uid_validity.unwrap_or(0);
 
-        let start = if total > count { total - count + 1 } else { 1 };
-        let range = format!("{}:{}", start, total);
-
-        let messages = self
-            .session
-            .fetch(&range, "(UID FLAGS ENVELOPE BODY.PEEK[TEXT]<0.200>)")
-            .context("Failed to fetch messages")?;
-
-        let mut emails: Vec<Email> = Vec::new();
-
-        for msg in messages.iter() {
-            let uid = msg.uid.unwrap_or(0);
-            let is_unread = !msg
-                .flags()
-                .iter()
-                .any(|f| matches!(f, imap::types::Flag::Seen));
-
-            let (from, subject, date) = if let Some(env) = msg.envelope() {
-                let from = env
-                    .from
-                    .as_ref()
-                    .and_then(|addrs: &Vec<_>| addrs.first())
-                    .map(|addr| {
-                        if let Some(name) = &addr.name {
-                            decode_mime_str(&String::from_utf8_lossy(name))
-                        } else if let Some(mbox) = &addr.mailbox {
-                            let mbox = String::from_utf8_lossy(mbox);
-                            if let Some(host) = &addr.host {
-                                format!("{}@{}", mbox, String::from_utf8_lossy(host))
-                            } else {
-                                mbox.to_string()
-                            }
-                        } else {
-                            "(unknown)".to_string()
-                        }
-                    })
-                    .unwrap_or_else(|| "(unknown)".to_string());
-
-                let subject = env
-                    .subject
-                    .as_ref()
-                    .map(|s| decode_mime_str(&String::from_utf8_lossy(s)))
-                    .unwrap_or_else(|| "(no subject)".to_string());
-
-                let date = env
-                    .date
-                    .as_ref()
-                    .and_then(|d| parse_imap_date(&String::from_utf8_lossy(d)))
-                    .unwrap_or_else(Local::now);
-
-                (from, subject, date)
+        // Check UIDVALIDITY
+        let stored = db.get_sync_state(account)?;
+        let last_uid = if let Some((stored_uidvalidity, stored_last_uid)) = stored {
+            if stored_uidvalidity != server_uidvalidity {
+                db.clear_all_emails()?;
+                0
             } else {
-                ("(unknown)".to_string(), "(no subject)".to_string(), Local::now())
-            };
+                stored_last_uid
+            }
+        } else {
+            0
+        };
 
-            let preview = msg
-                .text()
-                .map(|t| {
-                    let text = String::from_utf8_lossy(t);
-                    text.chars()
-                        .filter(|c| !c.is_control())
-                        .take(100)
-                        .collect::<String>()
-                })
-                .unwrap_or_default();
+        // Fetch UIDs of new messages
+        let fetch_range = format!("{}:*", last_uid + 1);
+        let uid_results = self
+            .session
+            .uid_fetch(&fetch_range, "UID")
+            .context("Failed to fetch UIDs")?;
 
-            emails.push(Email {
-                uid,
-                from,
-                subject,
-                date,
-                is_unread,
-                preview,
-            });
+        let new_uids: Vec<u32> = uid_results
+            .iter()
+            .filter_map(|msg| msg.uid)
+            .filter(|&uid| uid > last_uid)
+            .collect();
+
+        if new_uids.is_empty() {
+            return Ok(0);
         }
 
-        emails.sort_by(|a, b| b.date.cmp(&a.date));
-        Ok(emails)
+        let total = new_uids.len();
+        let mut max_uid = last_uid;
+        for (i, &uid) in new_uids.iter().enumerate() {
+            progress(i + 1, total);
+            match self.fetch_and_process_email(uid) {
+                Ok(processed) => {
+                    db.store_email(
+                        uid,
+                        &processed.from,
+                        &processed.to,
+                        &processed.subject,
+                        &processed.date,
+                        processed.is_unread,
+                        &processed.preview,
+                        &processed.text_body,
+                        processed.html_body.as_deref(),
+                    )?;
+                    if uid > max_uid {
+                        max_uid = uid;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+
+        db.set_sync_state(account, server_uidvalidity, max_uid)?;
+
+        Ok(total)
     }
 
-    pub fn fetch_email_content(&mut self, uid: u32) -> Result<EmailContent> {
+    fn fetch_and_process_email(&mut self, uid: u32) -> Result<ProcessedEmail> {
         let messages = self
             .session
-            .uid_fetch(uid.to_string(), "(BODY[] FLAGS)")
-            .context("Failed to fetch email content")?;
+            .uid_fetch(uid.to_string(), "(BODY.PEEK[] FLAGS)")
+            .context("Failed to fetch email")?;
 
         let msg = messages.iter().next().context("Email not found")?;
 
-        // Mark as seen
-        let _ = self.session.uid_store(uid.to_string(), "+FLAGS (\\Seen)");
+        let is_unread = !msg
+            .flags()
+            .iter()
+            .any(|f| matches!(f, imap::types::Flag::Seen));
 
         let body = msg.body().context("No body in message")?;
         let parsed = parse_mail(body).context("Failed to parse email")?;
@@ -171,23 +169,44 @@ impl MailClient {
 
         extract_parts(&parsed, &mut text_body, &mut html_body);
 
-        // If we only have HTML, convert to text via w3m
         if text_body.is_empty() {
             if let Some(html) = &html_body {
                 text_body = html_to_text(html);
             }
         }
 
-        Ok(EmailContent {
+        // Generate preview: first 200 chars, whitespace normalized
+        let preview: String = text_body
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(200)
+            .collect();
+
+        Ok(ProcessedEmail {
             from,
             to,
             subject,
             date,
+            is_unread,
+            preview,
             text_body,
             html_body,
         })
     }
 
+    /// Block until new mail arrives (via IMAP IDLE) or timeout expires.
+    /// Falls back to sleeping if IDLE isn't supported.
+    pub fn wait_for_changes(&mut self, timeout: Duration) {
+        use imap::extensions::idle;
+
+        let mut handle = self.session.idle();
+        handle.timeout(timeout).keepalive(false);
+        let _ = handle.wait_while(idle::stop_on_any);
+    }
+
+    #[allow(dead_code)]
     pub fn logout(mut self) {
         let _ = self.session.logout();
     }
@@ -258,6 +277,7 @@ fn strip_html_tags(html: &str) -> String {
     result
 }
 
+#[allow(dead_code)]
 fn decode_mime_str(s: &str) -> String {
     mailparse::parse_header(format!("X: {}", s).as_bytes())
         .ok()

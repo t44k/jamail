@@ -1,4 +1,5 @@
-use crate::mail::{open_in_browser, relative_time, Email, EmailContent, MailClient};
+use crate::db::MailDb;
+use crate::mail::{open_in_browser, relative_time, Email, EmailContent};
 use crate::theme;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -13,6 +14,7 @@ const LIST_PEEK_WIDTH: u16 = 12;
 pub enum ViewMode {
     List,
     Detail,
+    Search,
 }
 
 pub struct App {
@@ -21,9 +23,14 @@ pub struct App {
     pub view: ViewMode,
     pub detail: Option<EmailContent>,
     pub detail_scroll: u16,
+    pub detail_from_search: bool,
     pub list_scroll_offset: usize,
     pub status_msg: String,
     pub should_quit: bool,
+    pub search_query: String,
+    pub search_results: Vec<Email>,
+    pub search_selected: usize,
+    pub search_scroll_offset: usize,
 }
 
 impl App {
@@ -34,9 +41,14 @@ impl App {
             view: ViewMode::List,
             detail: None,
             detail_scroll: 0,
+            detail_from_search: false,
             list_scroll_offset: 0,
             status_msg: String::new(),
             should_quit: false,
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_selected: 0,
+            search_scroll_offset: 0,
         }
     }
 
@@ -52,30 +64,127 @@ impl App {
         }
     }
 
-    pub fn open_detail(&mut self, client: &mut MailClient) {
-        if let Some(email) = self.emails.get(self.selected) {
-            let uid = email.uid;
-            match client.fetch_email_content(uid) {
-                Ok(content) => {
-                    self.detail = Some(content);
-                    self.detail_scroll = 0;
-                    self.view = ViewMode::Detail;
-                    // Mark as read in local list
-                    if let Some(e) = self.emails.get_mut(self.selected) {
+    pub fn open_detail(&mut self, db: &MailDb) {
+        self.detail_from_search = matches!(self.view, ViewMode::Search);
+        let (uid, list_idx) = match self.view {
+            ViewMode::Search => {
+                if let Some(email) = self.search_results.get(self.search_selected) {
+                    // Find the index in the main list for marking read
+                    let idx = self.emails.iter().position(|e| e.uid == email.uid);
+                    (email.uid, idx)
+                } else {
+                    return;
+                }
+            }
+            _ => {
+                if let Some(email) = self.emails.get(self.selected) {
+                    (email.uid, Some(self.selected))
+                } else {
+                    return;
+                }
+            }
+        };
+
+        match db.get_email_content(uid) {
+            Ok(Some(content)) => {
+                self.detail = Some(content);
+                self.detail_scroll = 0;
+                self.view = ViewMode::Detail;
+                // Mark as read in DB and local list
+                let _ = db.mark_read(uid);
+                if let Some(idx) = list_idx {
+                    if let Some(e) = self.emails.get_mut(idx) {
                         e.is_unread = false;
                     }
                 }
-                Err(e) => {
-                    self.status_msg = format!("Error: {}", e);
+            }
+            Ok(None) => {
+                self.status_msg = "Email not found in cache".to_string();
+            }
+            Err(e) => {
+                self.status_msg = format!("Error: {}", e);
+            }
+        }
+    }
+
+    pub fn enter_search(&mut self) {
+        self.search_query.clear();
+        self.search_results.clear();
+        self.search_selected = 0;
+        self.search_scroll_offset = 0;
+        self.view = ViewMode::Search;
+    }
+
+    pub fn search_input(&mut self, ch: char) {
+        self.search_query.push(ch);
+        self.search_results.clear();
+    }
+
+    pub fn search_backspace(&mut self) {
+        self.search_query.pop();
+        self.search_results.clear();
+    }
+
+    pub fn execute_search(&mut self, db: &MailDb) {
+        if self.search_query.is_empty() {
+            return;
+        }
+        match db.search_emails(&self.search_query) {
+            Ok(results) => {
+                self.search_results = results;
+                self.search_selected = 0;
+                self.search_scroll_offset = 0;
+                self.status_msg = format!("{} results", self.search_results.len());
+            }
+            Err(e) => {
+                self.status_msg = format!("Search error: {}", e);
+                self.search_results.clear();
+            }
+        }
+    }
+
+    pub fn exit_search(&mut self) {
+        self.view = ViewMode::List;
+        self.search_query.clear();
+        self.search_results.clear();
+    }
+
+    pub fn search_move_up(&mut self) {
+        if self.search_selected > 0 {
+            self.search_selected -= 1;
+        }
+    }
+
+    pub fn search_move_down(&mut self) {
+        if self.search_selected + 1 < self.search_results.len() {
+            self.search_selected += 1;
+        }
+    }
+
+    pub fn refresh_emails(&mut self, db: &MailDb) {
+        let selected_uid = self.emails.get(self.selected).map(|e| e.uid);
+        if let Ok(emails) = db.get_email_list() {
+            self.emails = emails;
+            if let Some(uid) = selected_uid {
+                if let Some(idx) = self.emails.iter().position(|e| e.uid == uid) {
+                    self.selected = idx;
                 }
+            }
+            if self.selected >= self.emails.len() && !self.emails.is_empty() {
+                self.selected = self.emails.len() - 1;
             }
         }
     }
 
     pub fn close_detail(&mut self) {
-        self.view = ViewMode::List;
+        self.view = if self.detail_from_search {
+            ViewMode::Search
+        } else {
+            ViewMode::List
+        };
         self.detail = None;
         self.detail_scroll = 0;
+        self.detail_from_search = false;
     }
 
     pub fn open_in_browser(&self) {
@@ -110,6 +219,7 @@ impl App {
         match self.view {
             ViewMode::List => self.render_list(frame, content_area),
             ViewMode::Detail => self.render_detail_with_peek(frame, content_area),
+            ViewMode::Search => self.render_search(frame, content_area),
         }
 
         self.render_status_bar(frame, status_area);
@@ -371,12 +481,80 @@ impl App {
         }
     }
 
+    fn render_search(&mut self, frame: &mut Frame, area: Rect) {
+        let [search_area, results_area] =
+            Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
+
+        // Search input box
+        let search_text = format!("/ {}", self.search_query);
+        let search_input = Paragraph::new(search_text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::SENDER_COLOR))
+                    .title(" Search ")
+                    .title_style(Style::default().fg(theme::SENDER_COLOR))
+                    .style(Style::default().bg(theme::BG_HEADER)),
+            )
+            .style(Style::default().fg(theme::FG_TEXT).bg(theme::BG_HEADER));
+        frame.render_widget(search_input, search_area);
+
+        // Results list
+        let visible_height = results_area.height as usize;
+
+        if self.search_selected < self.search_scroll_offset {
+            self.search_scroll_offset = self.search_selected;
+        } else if self.search_selected >= self.search_scroll_offset + visible_height {
+            self.search_scroll_offset = self.search_selected - visible_height + 1;
+        }
+
+        if self.search_results.is_empty() {
+            let msg = if self.search_query.is_empty() {
+                "Type a search query and press Enter"
+            } else {
+                "No results"
+            };
+            let p = Paragraph::new(msg)
+                .style(Style::default().fg(theme::FG_DIM).bg(theme::BG));
+            frame.render_widget(p, results_area);
+        } else {
+            let visible_emails = self
+                .search_results
+                .iter()
+                .enumerate()
+                .skip(self.search_scroll_offset)
+                .take(visible_height);
+
+            for (i, email) in visible_emails {
+                let y = results_area.y + (i - self.search_scroll_offset) as u16;
+                if y >= results_area.y + results_area.height {
+                    break;
+                }
+                let row_area = Rect::new(results_area.x, y, results_area.width, 1);
+                let is_selected = i == self.search_selected;
+                self.render_email_row(frame, row_area, email, is_selected);
+            }
+
+            if self.search_results.len() > visible_height {
+                let mut scrollbar_state = ScrollbarState::new(self.search_results.len())
+                    .position(self.search_selected);
+                frame.render_stateful_widget(
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                        .style(Style::default().fg(theme::FG_DIM)),
+                    results_area,
+                    &mut scrollbar_state,
+                );
+            }
+        }
+    }
+
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
         let (keys, info) = match self.view {
             ViewMode::List => (
                 vec![
                     ("j/k", "navigate"),
                     ("Enter", "open"),
+                    ("/", "search"),
                     ("q", "quit"),
                 ],
                 format!(
@@ -401,6 +579,14 @@ impl App {
                 } else {
                     " Plain text".to_string()
                 },
+            ),
+            ViewMode::Search => (
+                vec![
+                    ("Esc", "back"),
+                    ("Enter", "search/open"),
+                    ("j/k", "navigate"),
+                ],
+                format!(" {} results", self.search_results.len()),
             ),
         };
 

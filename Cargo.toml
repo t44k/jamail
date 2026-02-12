@@ -15,3 +15,6 @@ toml = "0.8"
 unicode-width = "0.2"
 textwrap = "0.16"
 anyhow = "1"
+rusqlite = { version = "0.38", features = ["bundled"] }
+zstd = "0.13"
+dirs = "6"

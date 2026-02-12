@@ -1,6 +1,8 @@
 mod app;
 mod config;
+mod db;
 mod mail;
+mod sync;
 #[allow(dead_code)]
 mod theme;
 
@@ -13,6 +15,8 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 use std::io::{self, IsTerminal};
+use std::sync::mpsc;
+use std::time::Duration;
 
 fn main() -> Result<()> {
     if !io::stdout().is_terminal() {
@@ -22,16 +26,16 @@ fn main() -> Result<()> {
     // Load config
     let config = config::HimalayaConfig::load().context("Failed to load himalaya config")?;
     let (name, account) = config.default_account()?;
-    eprintln!("Connecting to account: {} ({})", name, account.email);
 
-    // Connect to IMAP
-    let mut client =
-        mail::MailClient::connect(account).context("Failed to connect to IMAP server")?;
-    eprintln!("Connected. Fetching emails...");
+    // Open database (creates on first run)
+    let db = db::MailDb::open().context("Failed to open mail database")?;
 
-    // Fetch emails
-    let emails = client.fetch_inbox(50).context("Failed to fetch inbox")?;
-    eprintln!("Loaded {} emails.", emails.len());
+    // Load cached emails immediately (may be empty on first run)
+    let emails = db.get_email_list().context("Failed to load emails from database")?;
+
+    // Spawn background sync thread
+    let (sync_tx, sync_rx) = mpsc::channel();
+    sync::spawn_sync_thread(account.clone(), name.to_string(), sync_tx);
 
     // Setup terminal
     enable_raw_mode()?;
@@ -42,15 +46,12 @@ fn main() -> Result<()> {
 
     // Run app
     let mut app = App::new(emails);
-    let result = run_app(&mut terminal, &mut app, &mut client);
+    let result = run_app(&mut terminal, &mut app, &db, &sync_rx);
 
     // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-
-    // Logout
-    client.logout();
 
     if let Err(err) = result {
         eprintln!("Error: {:?}", err);
@@ -62,10 +63,42 @@ fn main() -> Result<()> {
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    client: &mut mail::MailClient,
+    db: &db::MailDb,
+    sync_rx: &mpsc::Receiver<sync::SyncEvent>,
 ) -> Result<()> {
     loop {
         terminal.draw(|frame| app.render(frame))?;
+
+        // Drain sync events (non-blocking)
+        while let Ok(ev) = sync_rx.try_recv() {
+            match ev {
+                sync::SyncEvent::Syncing => {
+                    app.status_msg = "Syncing...".to_string();
+                }
+                sync::SyncEvent::Progress(done, total) => {
+                    app.status_msg = format!("Syncing {}/{}...", done, total);
+                    if done % 20 == 0 || done == total {
+                        app.refresh_emails(db);
+                    }
+                }
+                sync::SyncEvent::Complete(count) => {
+                    if count > 0 {
+                        app.refresh_emails(db);
+                        app.status_msg = format!("+{} new", count);
+                    } else {
+                        app.status_msg.clear();
+                    }
+                }
+                sync::SyncEvent::Error(e) => {
+                    app.status_msg = format!("Sync: {}", e);
+                }
+            }
+        }
+
+        // Poll for keyboard events with 200ms timeout
+        if !event::poll(Duration::from_millis(200))? {
+            continue;
+        }
 
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
@@ -80,7 +113,8 @@ fn run_app(
                     }
                     KeyCode::Char('j') | KeyCode::Down => app.move_down(),
                     KeyCode::Char('k') | KeyCode::Up => app.move_up(),
-                    KeyCode::Enter => app.open_detail(client),
+                    KeyCode::Enter => app.open_detail(db),
+                    KeyCode::Char('/') => app.enter_search(),
                     KeyCode::Char('g') => app.selected = 0,
                     KeyCode::Char('G') => {
                         if !app.emails.is_empty() {
@@ -103,6 +137,21 @@ fn run_app(
                         }
                     }
                     KeyCode::Char('v') => app.open_in_browser(),
+                    _ => {}
+                },
+                ViewMode::Search => match key.code {
+                    KeyCode::Esc => app.exit_search(),
+                    KeyCode::Enter => {
+                        if !app.search_results.is_empty() {
+                            app.open_detail(db);
+                        } else {
+                            app.execute_search(db);
+                        }
+                    }
+                    KeyCode::Backspace => app.search_backspace(),
+                    KeyCode::Char(c) => app.search_input(c),
+                    KeyCode::Down => app.search_move_down(),
+                    KeyCode::Up => app.search_move_up(),
                     _ => {}
                 },
             }

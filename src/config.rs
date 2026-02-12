@@ -10,7 +10,7 @@ pub struct HimalayaConfig {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Account {
     #[serde(default)]
     pub default: bool,
@@ -21,7 +21,7 @@ pub struct Account {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Backend {
     #[serde(rename = "type")]
     pub backend_type: String,
@@ -33,14 +33,14 @@ pub struct Backend {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Encryption {
     #[serde(rename = "type")]
     pub encryption_type: String,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Auth {
     #[serde(rename = "type")]
     pub auth_type: String,
