@@ -1,0 +1,54 @@
+# jamail configuration
+# Copy to ~/.config/jamail/config.yaml
+
+accounts:
+  # Account name (used internally, shown in folder selector)
+  personal:
+    default: true
+    email: alice@example.com
+    display_name: Alice Smith
+    imap:
+      host: imap.example.com
+      port: 993
+      login: alice@example.com
+      auth:
+        # type: password — use the value directly
+        type: password
+        value: my-secret-password
+
+  work:
+    email: alice@corp.com
+    imap:
+      host: imap.corp.com
+      port: 993
+      login: alice@corp.com
+      auth:
+        # type: command — run a shell command and read password from stdout
+        # Works with pass, gpg, secret-tool, 1password-cli, etc.
+        type: command
+        value: pass show email/work
+    # Optional: only sync these folders, in this order.
+    # Without this, all folders are synced (except Gmail's All Mail/Spam).
+    folders:
+      - INBOX
+      - Sent
+      - Drafts
+      - Archive
+
+  # Gmail example
+  gmail:
+    email: alice@gmail.com
+    imap:
+      host: imap.gmail.com
+      port: 993
+      login: alice@gmail.com
+      auth:
+        # For Gmail, use an App Password (not your account password):
+        # https://myaccount.google.com/apppasswords
+        type: password
+        value: xxxx-xxxx-xxxx-xxxx
+    folders:
+      - INBOX
+      - "[Gmail]/Sent Mail"
+      - "[Gmail]/Drafts"
+      - "[Gmail]/Starred"

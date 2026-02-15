@@ -1,25 +1,57 @@
-use crate::config::Account;
+use crate::config::JamailAccount;
 use crate::db::MailDb;
-use crate::mail::MailClient;
+use crate::mail::{FolderInfo, MailClient};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
 pub enum SyncEvent {
-    Syncing,
-    Progress(usize, usize),
-    Complete(usize),
+    Syncing(String),
+    Progress(String, usize, usize),
+    FolderComplete(String, usize),
+    AllComplete,
     Error(String),
+    FoldersLoaded(Vec<FolderInfo>),
 }
 
-/// Spawn a background thread that syncs mail, then waits for changes via IDLE
-/// (or polls every 60s), and repeats. Reconnects automatically on error.
-pub fn spawn_sync_thread(account: Account, account_name: String, tx: Sender<SyncEvent>) {
-    thread::spawn(move || sync_loop(account, account_name, tx));
+pub struct SyncControl {
+    pub current_folder: RwLock<String>,
+    pub shutdown: AtomicBool,
+    pub folder_filter: RwLock<Vec<String>>,
 }
 
-fn sync_loop(account: Account, account_name: String, tx: Sender<SyncEvent>) {
+impl SyncControl {
+    pub fn new(initial_folder: &str) -> Self {
+        Self {
+            current_folder: RwLock::new(initial_folder.to_string()),
+            shutdown: AtomicBool::new(false),
+            folder_filter: RwLock::new(vec![initial_folder.to_string()]),
+        }
+    }
+}
+
+pub fn spawn_sync_thread(
+    account: JamailAccount,
+    account_name: String,
+    control: Arc<SyncControl>,
+    tx: Sender<SyncEvent>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || sync_loop(account, account_name, control, tx))
+}
+
+fn sync_loop(
+    account: JamailAccount,
+    account_name: String,
+    control: Arc<SyncControl>,
+    tx: Sender<SyncEvent>,
+) {
     loop {
+        if control.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+
         let db = match MailDb::open() {
             Ok(db) => db,
             Err(e) => {
@@ -31,7 +63,10 @@ fn sync_loop(account: Account, account_name: String, tx: Sender<SyncEvent>) {
             }
         };
 
-        if tx.send(SyncEvent::Syncing).is_err() {
+        if tx
+            .send(SyncEvent::Syncing("connecting".to_string()))
+            .is_err()
+        {
             return;
         }
 
@@ -41,31 +76,108 @@ fn sync_loop(account: Account, account_name: String, tx: Sender<SyncEvent>) {
                 if tx.send(SyncEvent::Error(format!("{}", e))).is_err() {
                     return;
                 }
-                thread::sleep(Duration::from_secs(60));
+                thread::sleep(Duration::from_secs(5));
                 continue;
             }
         };
 
-        // Inner loop: sync → wait for changes → repeat
-        // Breaks on connection error to trigger reconnect
-        loop {
-            match client.sync_inbox(&db, &account_name, &|done, total| {
-                let _ = tx.send(SyncEvent::Progress(done, total));
-            }) {
-                Ok(count) => {
-                    if tx.send(SyncEvent::Complete(count)).is_err() {
-                        return;
+        // Fetch folder list from IMAP
+        match client.list_folders() {
+            Ok(folders) => {
+                let _ = db.store_folders(&account_name, &folders);
+
+                // Apply folder filter from config, prioritizing INBOX first
+                let filtered: Vec<String> = if let Some(ref filter) = account.folders {
+                    // Use config ordering, keep only folders that exist on server
+                    let server_names: std::collections::HashSet<&str> =
+                        folders.iter().map(|f| f.name.as_str()).collect();
+                    filter
+                        .iter()
+                        .filter(|f| server_names.contains(f.as_str()))
+                        .cloned()
+                        .collect()
+                } else {
+                    // No explicit filter: skip [Gmail]/All Mail and [Gmail]/Spam
+                    // (they're huge and duplicate content from other folders)
+                    let skip = ["[Gmail]/All Mail", "[Gmail]/Spam", "[Gmail]/Important"];
+                    // Put INBOX first, then the rest alphabetically
+                    let mut names: Vec<String> = folders
+                        .iter()
+                        .map(|f| f.name.clone())
+                        .filter(|n| !skip.contains(&n.as_str()))
+                        .collect();
+                    names.sort();
+                    if let Some(pos) = names.iter().position(|n| n == "INBOX") {
+                        let inbox = names.remove(pos);
+                        names.insert(0, inbox);
                     }
+                    names
+                };
+
+                if let Ok(mut ff) = control.folder_filter.write() {
+                    *ff = filtered;
                 }
-                Err(e) => {
-                    let _ = tx.send(SyncEvent::Error(format!("{}", e)));
-                    break;
+
+                let _ = tx.send(SyncEvent::FoldersLoaded(folders));
+            }
+            Err(e) => {
+                let _ = tx.send(SyncEvent::Error(format!("List folders: {}", e)));
+            }
+        }
+
+        // Inner loop: sync all folders → IDLE on current → repeat
+        loop {
+            if control.shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let folders_to_sync: Vec<String> = control
+                .folder_filter
+                .read()
+                .map(|f| f.clone())
+                .unwrap_or_default();
+
+            let mut had_error = false;
+            for folder in &folders_to_sync {
+                if control.shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                let _ = tx.send(SyncEvent::Syncing(folder.clone()));
+
+                match client.sync_folder(&db, &account_name, folder, &|done, total| {
+                    let _ = tx.send(SyncEvent::Progress(folder.clone(), done, total));
+                }) {
+                    Ok(count) => {
+                        let _ = tx.send(SyncEvent::FolderComplete(folder.clone(), count));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(SyncEvent::Error(format!("{}: {}", folder, e)));
+                        had_error = true;
+                        break;
+                    }
                 }
             }
 
-            // Wait for new mail via IDLE, or timeout after 60s.
-            // If IDLE is supported, the server pushes a notification immediately
-            // when new mail arrives. Otherwise this just sleeps 60s.
+            if had_error {
+                break; // Reconnect
+            }
+
+            let _ = tx.send(SyncEvent::AllComplete);
+
+            // SELECT the current folder for IDLE
+            let current = control
+                .current_folder
+                .read()
+                .map(|f| f.clone())
+                .unwrap_or_else(|_| "INBOX".to_string());
+
+            // Need to SELECT the folder before IDLE
+            if client.select_folder(&current).is_err() {
+                break; // Connection issue
+            }
+
+            // IDLE waits for new mail or 60s timeout
             client.wait_for_changes(Duration::from_secs(60));
         }
 

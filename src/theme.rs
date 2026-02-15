@@ -22,6 +22,26 @@ pub const DETAIL_FROM: Color = Color::Rgb(130, 170, 255);
 pub const DETAIL_SUBJECT: Color = Color::Rgb(240, 240, 255);
 pub const DETAIL_BODY: Color = Color::Rgb(200, 200, 215);
 
+// Thread indicators
+pub const THREAD_INDICATOR: Color = Color::Rgb(100, 140, 200);
+pub const THREAD_BRANCH: Color = Color::Rgb(60, 60, 80);
+
+// Attachments
+pub const ATTACHMENT_COLOR: Color = Color::Rgb(180, 140, 60);
+pub const ATTACHMENT_SELECTED: Color = Color::Rgb(255, 200, 80);
+pub const ATTACHMENT_SELECTED_BG: Color = Color::Rgb(50, 45, 30);
+
+// Links
+pub const LINK_COLOR: Color = Color::Rgb(100, 180, 240);
+pub const LINK_SELECTED: Color = Color::Rgb(140, 220, 255);
+pub const LINK_SELECTED_BG: Color = Color::Rgb(30, 50, 80);
+
+// Mode indicator
+pub const MODE_INDICATOR: Color = Color::Rgb(180, 140, 60);
+
+// Selection highlight
+pub const SELECTION_BG: Color = Color::Rgb(50, 80, 140);
+
 // Status bar
 pub const STATUS_BG: Color = Color::Rgb(30, 32, 44);
 pub const STATUS_FG: Color = Color::Rgb(140, 140, 160);
@@ -33,7 +53,9 @@ pub fn style_selected() -> Style {
 }
 
 pub fn style_unread_marker() -> Style {
-    Style::default().fg(UNREAD_MARKER).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(UNREAD_MARKER)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn style_sender() -> Style {
@@ -73,7 +95,9 @@ pub fn style_detail_header_value() -> Style {
 }
 
 pub fn style_detail_from() -> Style {
-    Style::default().fg(DETAIL_FROM).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(DETAIL_FROM)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn style_detail_subject() -> Style {
@@ -92,4 +116,17 @@ pub fn style_status_bar() -> Style {
 
 pub fn style_status_key() -> Style {
     Style::default().fg(STATUS_KEY).bg(STATUS_BG)
+}
+
+pub fn style_link() -> Style {
+    Style::default()
+        .fg(LINK_COLOR)
+        .add_modifier(Modifier::UNDERLINED)
+}
+
+pub fn style_link_selected() -> Style {
+    Style::default()
+        .fg(LINK_SELECTED)
+        .bg(LINK_SELECTED_BG)
+        .add_modifier(Modifier::UNDERLINED | Modifier::BOLD)
 }
