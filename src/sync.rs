@@ -1,11 +1,17 @@
 use crate::config::JamailAccount;
 use crate::db::MailDb;
 use crate::mail::{FolderInfo, MailClient};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
+
+pub struct MarkSeenRequest {
+    pub folder: String,
+    pub uid: u32,
+}
 
 pub enum SyncEvent {
     Syncing(String),
@@ -14,12 +20,14 @@ pub enum SyncEvent {
     AllComplete,
     Error(String),
     FoldersLoaded(Vec<FolderInfo>),
+    FlagsChanged(String),
 }
 
 pub struct SyncControl {
     pub current_folder: RwLock<String>,
     pub shutdown: AtomicBool,
     pub folder_filter: RwLock<Vec<String>>,
+    pub mark_seen_queue: Mutex<Vec<MarkSeenRequest>>,
 }
 
 impl SyncControl {
@@ -28,6 +36,7 @@ impl SyncControl {
             current_folder: RwLock::new(initial_folder.to_string()),
             shutdown: AtomicBool::new(false),
             folder_filter: RwLock::new(vec![initial_folder.to_string()]),
+            mark_seen_queue: Mutex::new(Vec::new()),
         }
     }
 }
@@ -150,6 +159,18 @@ fn sync_loop(
                 }) {
                     Ok(count) => {
                         let _ = tx.send(SyncEvent::FolderComplete(folder.clone(), count));
+
+                        // Sync flags from server for this folder
+                        match client.sync_flags(&db, &account_name, folder) {
+                            Ok(true) => {
+                                let _ = tx.send(SyncEvent::FlagsChanged(folder.clone()));
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                let _ = tx
+                                    .send(SyncEvent::Error(format!("Flag sync {}: {}", folder, e)));
+                            }
+                        }
                     }
                     Err(e) => {
                         let _ = tx.send(SyncEvent::Error(format!("{}: {}", folder, e)));
@@ -164,6 +185,28 @@ fn sync_loop(
             }
 
             let _ = tx.send(SyncEvent::AllComplete);
+
+            // Drain mark-seen queue and apply on server
+            if let Ok(mut queue) = control.mark_seen_queue.lock() {
+                let requests: Vec<MarkSeenRequest> = queue.drain(..).collect();
+                drop(queue);
+
+                if !requests.is_empty() {
+                    let mut by_folder: HashMap<String, Vec<u32>> = HashMap::new();
+                    for req in requests {
+                        by_folder.entry(req.folder).or_default().push(req.uid);
+                    }
+                    for (folder, uids) in &by_folder {
+                        if let Err(e) = client
+                            .select_folder(folder)
+                            .and_then(|_| client.mark_seen(uids))
+                        {
+                            let _ =
+                                tx.send(SyncEvent::Error(format!("Mark seen {}: {}", folder, e)));
+                        }
+                    }
+                }
+            }
 
             // SELECT the current folder for IDLE
             let current = control

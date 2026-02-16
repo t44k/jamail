@@ -619,6 +619,47 @@ impl MailDb {
         Ok(result)
     }
 
+    pub fn get_all_uids(&self, account: &str, folder: &str) -> Result<Vec<u32>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT uid FROM emails WHERE account = ?1 AND folder = ?2")?;
+        let rows = stmt.query_map(params![account, folder], |row| row.get(0))?;
+        let mut uids = Vec::new();
+        for row in rows {
+            uids.push(row?);
+        }
+        Ok(uids)
+    }
+
+    pub fn update_flags(&self, account: &str, folder: &str, flags: &[(u32, bool)]) -> Result<bool> {
+        let mut changed = false;
+        for &(uid, is_unread) in flags {
+            let rows = self.conn.execute(
+                "UPDATE emails SET is_unread = ?1 WHERE account = ?2 AND folder = ?3 AND uid = ?4 AND is_unread != ?1",
+                params![is_unread as i32, account, folder, uid],
+            )?;
+            if rows > 0 {
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn get_email_uid_and_folder(&self, id: i64) -> Result<Option<(u32, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT uid, folder FROM emails WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => {
+                let uid: u32 = row.get(0)?;
+                let folder: String = row.get(1)?;
+                Ok(Some((uid, folder)))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn get_folders(&self, account: &str) -> Result<Vec<FolderInfo>> {
         let mut stmt = self
             .conn

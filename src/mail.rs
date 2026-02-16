@@ -311,6 +311,67 @@ impl MailClient {
         let _ = handle.wait_while(idle::stop_on_any);
     }
 
+    /// Mark the given UIDs as \Seen on the server.
+    /// Caller must have already SELECTed the folder.
+    pub fn mark_seen(&mut self, uids: &[u32]) -> Result<()> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+        let uid_list: String = uids
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.session
+            .uid_store(&uid_list, "+FLAGS.SILENT (\\Seen)")
+            .context("Failed to store \\Seen flag")?;
+        Ok(())
+    }
+
+    /// Fetch FLAGS for the given UIDs. Returns Vec<(uid, is_unread)>.
+    /// Caller must have already SELECTed the folder.
+    pub fn fetch_flags(&mut self, uids: &[u32]) -> Result<Vec<(u32, bool)>> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::with_capacity(uids.len());
+        for chunk in uids.chunks(500) {
+            let uid_list: String = chunk
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let fetched = self
+                .session
+                .uid_fetch(&uid_list, "FLAGS")
+                .context("Failed to fetch flags")?;
+            for msg in fetched.iter() {
+                if let Some(uid) = msg.uid {
+                    let is_unread = !msg
+                        .flags()
+                        .iter()
+                        .any(|f| matches!(f, imap::types::Flag::Seen));
+                    results.push((uid, is_unread));
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Fetch server flags for all known UIDs in a folder and reconcile with DB.
+    /// Returns true if any flags changed.
+    pub fn sync_flags(&mut self, db: &MailDb, account: &str, folder: &str) -> Result<bool> {
+        let known_uids = db.get_all_uids(account, folder)?;
+        if known_uids.is_empty() {
+            return Ok(false);
+        }
+        self.session
+            .select(folder)
+            .with_context(|| format!("Failed to select folder for flag sync: {}", folder))?;
+        let server_flags = self.fetch_flags(&known_uids)?;
+        db.update_flags(account, folder, &server_flags)
+    }
+
     #[allow(dead_code)]
     pub fn logout(mut self) {
         let _ = self.session.logout();

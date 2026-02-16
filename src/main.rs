@@ -168,6 +168,11 @@ fn run_app(
                 sync::SyncEvent::Error(e) => {
                     app.status_msg = format!("Sync: {}", e);
                 }
+                sync::SyncEvent::FlagsChanged(folder) => {
+                    if folder == app.current_folder {
+                        app.refresh_emails(db);
+                    }
+                }
                 sync::SyncEvent::FoldersLoaded(folders) => {
                     app.account_folders
                         .insert(app.current_account.clone(), folders);
@@ -282,7 +287,10 @@ fn run_app(
                             KeyCode::PageUp => app.page_up(page),
                             KeyCode::Home | KeyCode::Char('g') => app.go_home(),
                             KeyCode::End | KeyCode::Char('G') => app.go_end(),
-                            KeyCode::Enter => app.open_detail(db),
+                            KeyCode::Enter => {
+                                app.open_detail(db);
+                                enqueue_mark_seen(app, db, &current_sync_control);
+                            }
                             KeyCode::Char(' ') | KeyCode::Char('l') => app.toggle_thread_expand(),
                             KeyCode::Tab => app.next_thread(),
                             KeyCode::BackTab => app.prev_thread(),
@@ -327,7 +335,10 @@ fn run_app(
                                 DetailMode::Links => app.prev_link(),
                             },
                             KeyCode::Left => match app.detail_mode {
-                                DetailMode::Text => app.prev_in_list(db),
+                                DetailMode::Text => {
+                                    app.prev_in_list(db);
+                                    enqueue_mark_seen(app, db, &current_sync_control);
+                                }
                                 DetailMode::Attachments => {
                                     app.prev_attachment();
                                     app.update_image_preview(db);
@@ -335,7 +346,10 @@ fn run_app(
                                 DetailMode::Links => app.prev_link(),
                             },
                             KeyCode::Right => match app.detail_mode {
-                                DetailMode::Text => app.next_in_list(db),
+                                DetailMode::Text => {
+                                    app.next_in_list(db);
+                                    enqueue_mark_seen(app, db, &current_sync_control);
+                                }
                                 DetailMode::Attachments => {
                                     app.next_attachment();
                                     app.update_image_preview(db);
@@ -362,8 +376,14 @@ fn run_app(
                             KeyCode::PageUp => app.scroll_detail_page_up(page),
                             KeyCode::Home => app.scroll_detail_home(),
                             KeyCode::End => app.scroll_detail_end(),
-                            KeyCode::Char('n') => app.next_in_thread(db),
-                            KeyCode::Char('p') => app.prev_in_thread(db),
+                            KeyCode::Char('n') => {
+                                app.next_in_thread(db);
+                                enqueue_mark_seen(app, db, &current_sync_control);
+                            }
+                            KeyCode::Char('p') => {
+                                app.prev_in_thread(db);
+                                enqueue_mark_seen(app, db, &current_sync_control);
+                            }
                             KeyCode::Char('r') => app.enter_reply(db),
                             KeyCode::Char('f') => app.enter_forward(db),
                             KeyCode::Char('h') => app.toggle_raw_headers(),
@@ -376,6 +396,7 @@ fn run_app(
                         KeyCode::Enter => {
                             if !app.search_results.is_empty() {
                                 app.open_detail(db);
+                                enqueue_mark_seen(app, db, &current_sync_control);
                             } else {
                                 app.execute_search(db);
                             }
@@ -697,6 +718,15 @@ fn handle_compose_send(
             app.status_msg = format!("Send failed: {}", e);
             // Stay in compose so user can retry
         }
+    }
+}
+
+fn enqueue_mark_seen(app: &App, db: &db::MailDb, sync_control: &sync::SyncControl) {
+    if let Some(id) = app.detail_id
+        && let Ok(Some((uid, folder))) = db.get_email_uid_and_folder(id)
+        && let Ok(mut queue) = sync_control.mark_seen_queue.lock()
+    {
+        queue.push(sync::MarkSeenRequest { folder, uid });
     }
 }
 
