@@ -141,9 +141,7 @@ pub fn build_threads(emails: &[Email]) -> Vec<Thread> {
             let norm = normalize_subject(&email.subject);
             if norm.chars().count() >= 10 {
                 let root = uf.find(i);
-                subject_to_root
-                    .entry(norm)
-                    .or_insert((root, email.date));
+                subject_to_root.entry(norm).or_insert((root, email.date));
             }
         }
     }

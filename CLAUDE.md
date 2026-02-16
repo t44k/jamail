@@ -45,13 +45,14 @@ Both threads open their own `MailDb` connection. SQLite WAL mode allows concurre
 
 ### Module Responsibilities
 
-- **main.rs** — Terminal setup/teardown, event loop dispatch, account/folder switching, mouse text extraction, clipboard copy
-- **app.rs** — All UI state and rendering (ViewMode::FolderSelect/List/Detail/Search), folder tree, vertical folder label, mouse selection tracking
+- **main.rs** — Terminal setup/teardown, event loop dispatch, account/folder switching, compose key dispatch, SMTP send handler, mouse text extraction, clipboard copy
+- **app.rs** — All UI state and rendering (ViewMode::FolderSelect/List/Detail/Search/Compose), folder tree, vertical folder label, mouse selection tracking, compose view (body editor, autocomplete, file browser)
 - **mail.rs** — IMAP protocol: connect, list_folders, sync_folder (incremental via UIDVALIDITY), MIME parsing, IMAP IDLE, date parsing, HTML→text conversion (via w3m subprocess)
-- **db.rs** — SQLite schema (v2: account+folder scoped), zstd compression/decompression, FTS5 search, schema migration, CRUD operations
+- **db.rs** — SQLite schema (v2: account+folder scoped), zstd compression/decompression, FTS5 search, schema migration, CRUD operations, known-address extraction for autocomplete
 - **sync.rs** — Background thread lifecycle: SyncControl, multi-folder sync loop, SyncEvent enum
-- **config.rs** — YAML config deserialization (JamailConfig, JamailAccount, ImapConfig, AuthConfig)
-- **theme.rs** — Color palette and style constants (dark theme, all RGB values)
+- **config.rs** — YAML config deserialization (JamailConfig, JamailAccount, ImapConfig, AuthConfig, SmtpConfig)
+- **smtp.rs** — SMTP email sending via `lettre` (blocking transport, STARTTLS/implicit TLS, plain text and multipart with attachments)
+- **theme.rs** — Color palette and style constants (dark theme, all RGB values, compose view colors)
 - **thread.rs** — Email threading via Message-ID/In-Reply-To/References + subject-based fallback
 
 ### Key Design Decisions
@@ -62,7 +63,12 @@ Both threads open their own `MailDb` connection. SQLite WAL mode allows concurre
 - **Database schema versioning** — `schema_version` table tracks version. On upgrade, all tables are dropped and recreated (DB is just a cache).
 - **IMAP sync is incremental** — tracks UIDVALIDITY and last_uid per (account, folder) in sync_state table.
 - **`BODY.PEEK[]`** is used instead of `BODY[]` to avoid marking messages as \Seen on the server.
-- **Auth supports `password` and `command` types** — command runs a shell command and captures stdout (e.g., `pass show email/work`).
+- **Auth supports `password` and `command` types** — command runs a shell command and captures stdout (e.g., `pass show email/work`). Reused for both IMAP and SMTP.
+- **SMTP is optional** — `SmtpConfig` is an `Option` on `JamailAccount`. Compose/reply/forward UI is always available; sending shows an error if SMTP is not configured. Uses `lettre` crate with blocking transport (no async runtime).
+- **Compose state lives on `App`** — all compose fields (to, cc, bcc, subject, body lines, cursor position, attachments, autocomplete, file browser) are flat fields on the `App` struct. `ComposeField` enum tracks which field is active; `ComposeMode` tracks New/Reply/Forward.
+- **Body editor operates on `Vec<String>`** — one element per line, with `(cursor_row, cursor_col)` in char units. `char_to_byte_pos()` converts char index to byte offset for correct string manipulation.
+- **Contact autocomplete** — `db.get_known_addresses()` extracts distinct from/to addresses from the cache. Filtered by substring match on the current token (text after last comma) in address fields. Up to 10 suggestions shown as an overlay.
+- **Forward auto-attaches originals** — attachment data is extracted from DB, written to `/tmp/jamail_fwd_<id>/`, and added to `compose_attachments`. Temp files are cleaned up on send or cancel.
 - **Date parsing** uses `mailparse::dateparse` as primary parser, with a custom `normalize_timezone()` preprocessing step that maps non-RFC2822 timezone abbreviations (CEST, BST, JST, etc.) to numeric offsets before parsing.
 - **Mouse selection** is constrained to the detail panel's inner rect (`selectable_area`). Text is extracted from ratatui's `CompletedFrame` buffer on mouse release and copied via wl-copy/xclip/xsel.
 - **Threads store indices, not clones** — `Thread.email_indices: Vec<usize>` references into `App.emails`. Summary data (`newest_from`, `has_attachments`) is cached on the Thread struct to avoid lookups during rendering. `build_threads()` takes `&[Email]`.

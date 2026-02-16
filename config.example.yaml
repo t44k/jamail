@@ -15,6 +15,15 @@ accounts:
         # type: password — use the value directly
         type: password
         value: my-secret-password
+    # Optional: SMTP config for sending email (compose, reply, forward)
+    smtp:
+      host: smtp.example.com
+      port: 587                # 587 for STARTTLS, 465 for implicit TLS
+      login: alice@example.com
+      auth:
+        type: password
+        value: my-secret-password
+      starttls: true           # true = STARTTLS (port 587), false = implicit TLS (port 465)
 
   work:
     email: alice@corp.com
@@ -27,6 +36,14 @@ accounts:
         # Works with pass, gpg, secret-tool, 1password-cli, etc.
         type: command
         value: pass show email/work
+    smtp:
+      host: smtp.corp.com
+      port: 587
+      login: alice@corp.com
+      auth:
+        type: command
+        value: pass show email/work
+      starttls: true
     # Optional: only sync these folders, in this order.
     # Without this, all folders are synced (except Gmail's All Mail/Spam).
     folders:
@@ -47,6 +64,14 @@ accounts:
         # https://myaccount.google.com/apppasswords
         type: password
         value: xxxx-xxxx-xxxx-xxxx
+    smtp:
+      host: smtp.gmail.com
+      port: 587
+      login: alice@gmail.com
+      auth:
+        type: password
+        value: xxxx-xxxx-xxxx-xxxx
+      starttls: true
     folders:
       - INBOX
       - "[Gmail]/Sent Mail"

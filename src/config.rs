@@ -16,7 +16,22 @@ pub struct JamailAccount {
     pub email: String,
     pub display_name: Option<String>,
     pub imap: ImapConfig,
+    pub smtp: Option<SmtpConfig>,
     pub folders: Option<Vec<String>>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SmtpConfig {
+    pub host: String,
+    pub port: u16,
+    pub login: String,
+    pub auth: AuthConfig,
+    #[serde(default = "default_true")]
+    pub starttls: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -47,6 +47,13 @@ pub const STATUS_BG: Color = Color::Rgb(30, 32, 44);
 pub const STATUS_FG: Color = Color::Rgb(140, 140, 160);
 pub const STATUS_KEY: Color = Color::Rgb(200, 160, 80);
 
+// Compose view
+pub const COMPOSE_BORDER: Color = Color::Rgb(100, 140, 200);
+pub const COMPOSE_FIELD_ACTIVE: Color = Color::Rgb(80, 200, 120);
+pub const COMPOSE_CURSOR: Color = Color::Rgb(200, 200, 220);
+pub const COMPOSE_QUOTE: Color = Color::Rgb(100, 140, 180);
+pub const COMPOSE_DROPDOWN_BG: Color = Color::Rgb(35, 38, 52);
+
 // Styles
 pub fn style_selected() -> Style {
     Style::default().bg(BG_SELECTED)

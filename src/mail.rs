@@ -30,6 +30,7 @@ pub struct AttachmentData {
     pub data: Vec<u8>,
 }
 
+#[derive(Clone)]
 pub struct EmailContent {
     pub from: String,
     pub to: String,
@@ -182,25 +183,22 @@ impl MailClient {
             let batch_result = (|| -> Result<usize> {
                 let mut batch_stored = 0;
                 for sub_chunk in raw_batch.chunks(PROCESS_PARALLELISM) {
-                    let sub_processed: Vec<(u32, ProcessedEmail)> =
-                        std::thread::scope(|s| {
-                            let handles: Vec<_> = sub_chunk
-                                .iter()
-                                .map(|(uid, is_unread, body)| {
-                                    let uid = *uid;
-                                    let is_unread = *is_unread;
-                                    s.spawn(move || -> Option<(u32, ProcessedEmail)> {
-                                        process_raw_email(body, is_unread)
-                                            .ok()
-                                            .map(|p| (uid, p))
-                                    })
+                    let sub_processed: Vec<(u32, ProcessedEmail)> = std::thread::scope(|s| {
+                        let handles: Vec<_> = sub_chunk
+                            .iter()
+                            .map(|(uid, is_unread, body)| {
+                                let uid = *uid;
+                                let is_unread = *is_unread;
+                                s.spawn(move || -> Option<(u32, ProcessedEmail)> {
+                                    process_raw_email(body, is_unread).ok().map(|p| (uid, p))
                                 })
-                                .collect();
-                            handles
-                                .into_iter()
-                                .filter_map(|h| h.join().ok().flatten())
-                                .collect()
-                        });
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .filter_map(|h| h.join().ok().flatten())
+                            .collect()
+                    });
                     for (uid, processed) in &sub_processed {
                         db.store_email_core(
                             account,
@@ -266,7 +264,11 @@ impl MailClient {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
-        let uid_list: String = uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let uid_list: String = uids
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let messages = self
             .session
             .uid_fetch(&uid_list, "(BODY.PEEK[] FLAGS)")

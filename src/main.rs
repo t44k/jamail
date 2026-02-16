@@ -2,17 +2,18 @@ mod app;
 mod config;
 mod db;
 mod mail;
+mod smtp;
 mod sync;
 #[allow(dead_code)]
 mod theme;
 mod thread;
 
 use anyhow::{Context, Result};
-use app::{App, DetailMode, ViewMode};
+use app::{App, ComposeField, DetailMode, ViewMode};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -288,6 +289,7 @@ fn run_app(
                             KeyCode::Char('t') => app.toggle_thread_mode(),
                             KeyCode::Char('/') => app.enter_search(),
                             KeyCode::Char('F') => app.enter_folder_select(),
+                            KeyCode::Char('n') => app.enter_compose_new(db),
                             _ => {}
                         }
                     }
@@ -362,6 +364,8 @@ fn run_app(
                             KeyCode::End => app.scroll_detail_end(),
                             KeyCode::Char('n') => app.next_in_thread(db),
                             KeyCode::Char('p') => app.prev_in_thread(db),
+                            KeyCode::Char('r') => app.enter_reply(db),
+                            KeyCode::Char('f') => app.enter_forward(db),
                             KeyCode::Char('h') => app.toggle_raw_headers(),
                             KeyCode::Char('v') => app.open_in_browser(),
                             _ => {}
@@ -382,6 +386,156 @@ fn run_app(
                         KeyCode::Up => app.search_move_up(),
                         _ => {}
                     },
+                    ViewMode::Compose => {
+                        // Global compose keys (checked first)
+                        let modifiers = key.modifiers;
+                        let is_ctrl = modifiers.contains(KeyModifiers::CONTROL);
+
+                        // Ctrl+Enter to send
+                        if is_ctrl && key.code == KeyCode::Enter {
+                            handle_compose_send(app, db, accounts);
+                            continue;
+                        }
+
+                        // Ctrl+A to open file browser
+                        if is_ctrl && key.code == KeyCode::Char('a') {
+                            app.open_file_browser();
+                            continue;
+                        }
+
+                        // Ctrl+D to remove last attachment
+                        if is_ctrl && key.code == KeyCode::Char('d') {
+                            app.compose_remove_last_attachment();
+                            continue;
+                        }
+
+                        match app.compose_field {
+                            ComposeField::FileBrowser => match key.code {
+                                KeyCode::Up => app.filebrowser_up(),
+                                KeyCode::Down => app.filebrowser_down(),
+                                KeyCode::Enter => app.filebrowser_enter(),
+                                KeyCode::Backspace => app.filebrowser_parent(),
+                                KeyCode::Char('.') => app.filebrowser_toggle_hidden(),
+                                KeyCode::Esc => {
+                                    app.compose_field = ComposeField::Body;
+                                }
+                                _ => {}
+                            },
+                            ComposeField::To | ComposeField::Cc | ComposeField::Bcc => {
+                                if app.compose_show_suggestions {
+                                    match key.code {
+                                        KeyCode::Down => {
+                                            if app.compose_suggestion_selected + 1
+                                                < app.compose_suggestions.len()
+                                            {
+                                                app.compose_suggestion_selected += 1;
+                                            }
+                                        }
+                                        KeyCode::Up => {
+                                            if app.compose_suggestion_selected > 0 {
+                                                app.compose_suggestion_selected -= 1;
+                                            }
+                                        }
+                                        KeyCode::Tab | KeyCode::Enter => {
+                                            app.compose_accept_suggestion();
+                                        }
+                                        KeyCode::Esc => {
+                                            app.compose_show_suggestions = false;
+                                        }
+                                        KeyCode::Char(c) => {
+                                            app.compose_address_input(c);
+                                        }
+                                        KeyCode::Backspace => {
+                                            app.compose_address_backspace();
+                                        }
+                                        _ => {}
+                                    }
+                                } else {
+                                    match key.code {
+                                        KeyCode::Esc => {
+                                            app.cancel_compose();
+                                        }
+                                        KeyCode::Char(c) => {
+                                            app.compose_address_input(c);
+                                        }
+                                        KeyCode::Backspace => {
+                                            app.compose_address_backspace();
+                                        }
+                                        KeyCode::Tab => {
+                                            app.compose_next_field();
+                                        }
+                                        KeyCode::BackTab => {
+                                            app.compose_prev_field();
+                                        }
+                                        KeyCode::Down | KeyCode::Enter => {
+                                            app.compose_next_field();
+                                        }
+                                        KeyCode::Up => {
+                                            app.compose_prev_field();
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            ComposeField::Subject => match key.code {
+                                KeyCode::Esc => {
+                                    app.cancel_compose();
+                                }
+                                KeyCode::Char(c) => {
+                                    app.compose_subject.push(c);
+                                }
+                                KeyCode::Backspace => {
+                                    app.compose_subject.pop();
+                                }
+                                KeyCode::Tab | KeyCode::Down | KeyCode::Enter => {
+                                    app.compose_next_field();
+                                }
+                                KeyCode::BackTab | KeyCode::Up => {
+                                    app.compose_prev_field();
+                                }
+                                _ => {}
+                            },
+                            ComposeField::Body => match key.code {
+                                KeyCode::Esc => {
+                                    app.cancel_compose();
+                                }
+                                KeyCode::Char(c) => {
+                                    app.compose_body_insert_char(c);
+                                }
+                                KeyCode::Enter => {
+                                    app.compose_body_newline();
+                                }
+                                KeyCode::Backspace => {
+                                    app.compose_body_backspace();
+                                }
+                                KeyCode::Delete => {
+                                    app.compose_body_delete();
+                                }
+                                KeyCode::Left => {
+                                    app.compose_body_left();
+                                }
+                                KeyCode::Right => {
+                                    app.compose_body_right();
+                                }
+                                KeyCode::Up => {
+                                    app.compose_body_up();
+                                }
+                                KeyCode::Down => {
+                                    app.compose_body_down();
+                                }
+                                KeyCode::Home => {
+                                    app.compose_body_home();
+                                }
+                                KeyCode::End => {
+                                    app.compose_body_end();
+                                }
+                                KeyCode::BackTab => {
+                                    app.compose_prev_field();
+                                }
+                                _ => {}
+                            },
+                        }
+                    }
                 }
             }
             Event::Mouse(mouse) => match mouse.kind {
@@ -415,6 +569,13 @@ fn run_app(
                         DetailMode::Links => app.prev_link(),
                     },
                     ViewMode::Search => app.search_move_up(),
+                    ViewMode::Compose => {
+                        if app.compose_field == ComposeField::FileBrowser {
+                            app.filebrowser_up();
+                        } else if app.compose_body_scroll > 0 {
+                            app.compose_body_scroll -= 1;
+                        }
+                    }
                 },
                 MouseEventKind::ScrollDown => match &app.view {
                     ViewMode::FolderSelect => app.folder_tree_down(),
@@ -428,6 +589,13 @@ fn run_app(
                         DetailMode::Links => app.next_link(),
                     },
                     ViewMode::Search => app.search_move_down(),
+                    ViewMode::Compose => {
+                        if app.compose_field == ComposeField::FileBrowser {
+                            app.filebrowser_down();
+                        } else {
+                            app.compose_body_scroll += 1;
+                        }
+                    }
                 },
                 _ => {}
             },
@@ -477,6 +645,59 @@ fn extract_selection_text(buffer: &Buffer, sel: &app::Selection, area: Rect) -> 
     }
 
     result
+}
+
+fn handle_compose_send(
+    app: &mut App,
+    _db: &db::MailDb,
+    accounts: &[(String, config::JamailAccount)],
+) {
+    // Look up SMTP config for current account
+    let smtp_config = accounts
+        .iter()
+        .find(|(n, _)| *n == app.current_account)
+        .and_then(|(_, acc)| acc.smtp.as_ref());
+
+    let smtp_config = match smtp_config {
+        Some(c) => c.clone(),
+        None => {
+            app.status_msg = "No SMTP config for this account".to_string();
+            return;
+        }
+    };
+
+    // Validate To is non-empty
+    if app.compose_to.trim().is_empty() {
+        app.status_msg = "To field is empty".to_string();
+        return;
+    }
+
+    let body = app.compose_body_text();
+
+    app.status_msg = "Sending...".to_string();
+
+    match smtp::send_email(
+        &smtp_config,
+        &app.compose_from,
+        &app.compose_to,
+        &app.compose_cc,
+        &app.compose_bcc,
+        &app.compose_subject,
+        &body,
+        &app.compose_attachments,
+        app.compose_reply_message_id.as_deref(),
+        app.compose_reply_references.as_deref(),
+    ) {
+        Ok(()) => {
+            app.status_msg = "Message sent!".to_string();
+            app.cleanup_forward_temps();
+            app.view = ViewMode::List;
+        }
+        Err(e) => {
+            app.status_msg = format!("Send failed: {}", e);
+            // Stay in compose so user can retry
+        }
+    }
 }
 
 fn copy_to_clipboard(text: &str) {

@@ -262,7 +262,13 @@ impl MailDb {
             self.conn.execute(
                 "INSERT INTO attachments (email_id, filename, mime_type, size_bytes, content_zstd)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![email_id, att.filename, att.mime_type, att.size_bytes as i64, compressed],
+                params![
+                    email_id,
+                    att.filename,
+                    att.mime_type,
+                    att.size_bytes as i64,
+                    compressed
+                ],
             )?;
         }
 
@@ -293,8 +299,23 @@ impl MailDb {
     ) -> Result<i64> {
         self.begin_tx()?;
         let result = self.store_email_core(
-            account, folder, uid, from, to, subject, date, is_unread, preview, text_body,
-            html_body, raw_headers, message_id, in_reply_to, refs, has_attachments, attachments,
+            account,
+            folder,
+            uid,
+            from,
+            to,
+            subject,
+            date,
+            is_unread,
+            preview,
+            text_body,
+            html_body,
+            raw_headers,
+            message_id,
+            in_reply_to,
+            refs,
+            has_attachments,
+            attachments,
         );
         match result {
             Ok(id) => {
@@ -568,6 +589,34 @@ impl MailDb {
             )?;
         }
         Ok(())
+    }
+
+    pub fn get_known_addresses(&self) -> Result<Vec<String>> {
+        let mut addrs = std::collections::HashSet::new();
+
+        let mut stmt = self.conn.prepare("SELECT DISTINCT from_addr FROM emails")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for addr in rows.flatten() {
+            let trimmed = addr.trim().to_string();
+            if !trimmed.is_empty() {
+                addrs.insert(trimmed);
+            }
+        }
+
+        let mut stmt = self.conn.prepare("SELECT DISTINCT to_addr FROM emails")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for to_field in rows.flatten() {
+            for part in to_field.split(',') {
+                let trimmed = part.trim().to_string();
+                if !trimmed.is_empty() {
+                    addrs.insert(trimmed);
+                }
+            }
+        }
+
+        let mut result: Vec<String> = addrs.into_iter().collect();
+        result.sort_by_key(|a| a.to_lowercase());
+        Ok(result)
     }
 
     pub fn get_folders(&self, account: &str) -> Result<Vec<FolderInfo>> {

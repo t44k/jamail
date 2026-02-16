@@ -1,5 +1,8 @@
 use crate::db::{AttachmentMeta, MailDb};
-use crate::mail::{Email, EmailContent, FolderInfo, open_in_browser, relative_time};
+use crate::mail::{
+    Email, EmailContent, FolderInfo, normalize_subject, open_in_browser, relative_time,
+};
+use crate::smtp::ComposeAttachment;
 use crate::theme;
 use crate::thread::{DisplayRow, ThreadedView, build_threads, rebuild_rows};
 use ratatui::{
@@ -14,6 +17,7 @@ use ratatui::{
 use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 const LIST_PEEK_WIDTH: u16 = 12;
 
@@ -23,6 +27,30 @@ pub enum ViewMode {
     List,
     Detail,
     Search,
+    Compose,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ComposeField {
+    To,
+    Cc,
+    Bcc,
+    Subject,
+    Body,
+    FileBrowser,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ComposeMode {
+    New,
+    Reply,
+    Forward,
+}
+
+pub struct FileBrowserEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -114,6 +142,37 @@ pub struct App {
     pub folder_tree_expanded: HashSet<String>,
     pub folder_tree_scroll: usize,
     pub account_folders: HashMap<String, Vec<FolderInfo>>,
+
+    // Compose state
+    pub compose_mode: ComposeMode,
+    pub compose_field: ComposeField,
+    pub compose_from: String,
+    pub compose_to: String,
+    pub compose_cc: String,
+    pub compose_bcc: String,
+    pub compose_subject: String,
+    pub compose_body: Vec<String>,
+    pub compose_cursor_row: usize,
+    pub compose_cursor_col: usize,
+    pub compose_body_scroll: usize,
+    pub compose_attachments: Vec<ComposeAttachment>,
+    pub compose_reply_message_id: Option<String>,
+    pub compose_reply_references: Option<String>,
+    pub compose_forward_email_id: Option<i64>,
+    pub compose_previous_view: ViewMode,
+
+    // Autocomplete
+    pub compose_known_addresses: Vec<String>,
+    pub compose_suggestions: Vec<String>,
+    pub compose_suggestion_selected: usize,
+    pub compose_show_suggestions: bool,
+
+    // File browser
+    pub filebrowser_path: PathBuf,
+    pub filebrowser_entries: Vec<FileBrowserEntry>,
+    pub filebrowser_selected: usize,
+    pub filebrowser_scroll: usize,
+    pub filebrowser_show_hidden: bool,
 }
 
 impl App {
@@ -169,6 +228,34 @@ impl App {
             folder_tree_expanded,
             folder_tree_scroll: 0,
             account_folders: HashMap::new(),
+
+            compose_mode: ComposeMode::New,
+            compose_field: ComposeField::To,
+            compose_from: String::new(),
+            compose_to: String::new(),
+            compose_cc: String::new(),
+            compose_bcc: String::new(),
+            compose_subject: String::new(),
+            compose_body: vec![String::new()],
+            compose_cursor_row: 0,
+            compose_cursor_col: 0,
+            compose_body_scroll: 0,
+            compose_attachments: Vec::new(),
+            compose_reply_message_id: None,
+            compose_reply_references: None,
+            compose_forward_email_id: None,
+            compose_previous_view: ViewMode::List,
+
+            compose_known_addresses: Vec::new(),
+            compose_suggestions: Vec::new(),
+            compose_suggestion_selected: 0,
+            compose_show_suggestions: false,
+
+            filebrowser_path: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
+            filebrowser_entries: Vec::new(),
+            filebrowser_selected: 0,
+            filebrowser_scroll: 0,
+            filebrowser_show_hidden: false,
         }
     }
 
@@ -240,7 +327,8 @@ impl App {
                             thread_idx,
                             email_idx,
                         } => {
-                            let idx = self.threaded_view.threads[thread_idx].email_indices[email_idx];
+                            let idx =
+                                self.threaded_view.threads[thread_idx].email_indices[email_idx];
                             self.emails[idx].id
                         }
                     }
@@ -271,7 +359,11 @@ impl App {
                 }
                 // Update thread unread counts
                 for thread in &mut self.threaded_view.threads {
-                    if thread.email_indices.iter().any(|&idx| self.emails[idx].id == id) {
+                    if thread
+                        .email_indices
+                        .iter()
+                        .any(|&idx| self.emails[idx].id == id)
+                    {
                         thread.unread_count = thread
                             .email_indices
                             .iter()
@@ -376,8 +468,8 @@ impl App {
                             thread_idx,
                             email_idx,
                         } => {
-                            let idx = self.threaded_view.threads[*thread_idx].email_indices
-                                [*email_idx];
+                            let idx =
+                                self.threaded_view.threads[*thread_idx].email_indices[*email_idx];
                             self.emails[idx].id == id
                         }
                     });
@@ -500,8 +592,7 @@ impl App {
                         thread_idx,
                         email_idx,
                     } => {
-                        let idx =
-                            self.threaded_view.threads[*thread_idx].email_indices[*email_idx];
+                        let idx = self.threaded_view.threads[*thread_idx].email_indices[*email_idx];
                         self.emails[idx].id == id
                     }
                 });
@@ -582,7 +673,11 @@ impl App {
                     e.is_unread = false;
                 }
                 for thread in &mut self.threaded_view.threads {
-                    if thread.email_indices.iter().any(|&idx| self.emails[idx].id == id) {
+                    if thread
+                        .email_indices
+                        .iter()
+                        .any(|&idx| self.emails[idx].id == id)
+                    {
                         thread.unread_count = thread
                             .email_indices
                             .iter()
@@ -624,14 +719,12 @@ impl App {
                     thread_idx,
                     email_idx,
                 } => {
-                    let idx =
-                        self.threaded_view.threads[*thread_idx].email_indices[*email_idx];
+                    let idx = self.threaded_view.threads[*thread_idx].email_indices[*email_idx];
                     self.emails[idx].id == id
                 }
                 DisplayRow::ThreadSummary { thread_idx } => {
                     let thread = &self.threaded_view.threads[*thread_idx];
-                    thread.message_count == 1
-                        && self.emails[thread.email_indices[0]].id == id
+                    thread.message_count == 1 && self.emails[thread.email_indices[0]].id == id
                 }
             }) {
                 self.selected = pos;
@@ -1061,6 +1154,531 @@ impl App {
         folder_display_name(&self.current_folder)
     }
 
+    // ── Compose ────────────────────────────────────────────────────
+
+    fn build_from_address(&self) -> String {
+        let account = self
+            .accounts
+            .iter()
+            .find(|(n, _)| *n == self.current_account);
+        if let Some((_, acc)) = account {
+            if let Some(ref name) = acc.display_name {
+                format!("{} <{}>", name, acc.email)
+            } else {
+                acc.email.clone()
+            }
+        } else {
+            String::new()
+        }
+    }
+
+    fn clear_compose(&mut self) {
+        self.compose_to.clear();
+        self.compose_cc.clear();
+        self.compose_bcc.clear();
+        self.compose_subject.clear();
+        self.compose_body = vec![String::new()];
+        self.compose_cursor_row = 0;
+        self.compose_cursor_col = 0;
+        self.compose_body_scroll = 0;
+        self.compose_attachments.clear();
+        self.compose_reply_message_id = None;
+        self.compose_reply_references = None;
+        self.cleanup_forward_temps();
+        self.compose_forward_email_id = None;
+        self.compose_suggestions.clear();
+        self.compose_suggestion_selected = 0;
+        self.compose_show_suggestions = false;
+    }
+
+    pub fn enter_compose_new(&mut self, db: &MailDb) {
+        self.compose_previous_view = self.view.clone();
+        self.clear_compose();
+        self.compose_mode = ComposeMode::New;
+        self.compose_from = self.build_from_address();
+        self.compose_field = ComposeField::To;
+        self.compose_known_addresses = db.get_known_addresses().unwrap_or_default();
+        self.view = ViewMode::Compose;
+    }
+
+    pub fn enter_reply(&mut self, db: &MailDb) {
+        let detail = match self.detail.clone() {
+            Some(d) => d,
+            None => return,
+        };
+        let email_id = match self.detail_id {
+            Some(id) => id,
+            None => return,
+        };
+        let email = self.emails.iter().find(|e| e.id == email_id).cloned();
+
+        self.compose_previous_view = self.view.clone();
+        self.clear_compose();
+        self.compose_mode = ComposeMode::Reply;
+        self.compose_from = self.build_from_address();
+        self.compose_to = detail.from.clone();
+
+        let normalized = normalize_subject(&detail.subject);
+        self.compose_subject = if normalized == detail.subject {
+            format!("Re: {}", detail.subject)
+        } else {
+            format!("Re: {}", normalized)
+        };
+
+        // Build quoted body
+        let date_str = detail.date.format("%a, %d %b %Y %H:%M").to_string();
+        let mut body_lines = vec![
+            String::new(),
+            String::new(),
+            format!("On {}, {} wrote:", date_str, detail.from),
+        ];
+        for line in detail.text_body.lines() {
+            body_lines.push(format!("> {}", line));
+        }
+        self.compose_body = body_lines;
+        self.compose_cursor_row = 0;
+        self.compose_cursor_col = 0;
+
+        // Threading headers
+        if let Some(ref e) = email
+            && !e.message_id.is_empty()
+        {
+            self.compose_reply_message_id = Some(e.message_id.clone());
+            // Build References chain
+            let refs = if !e.references.is_empty() {
+                format!("{} {}", e.references, e.message_id)
+            } else {
+                e.message_id.clone()
+            };
+            self.compose_reply_references = Some(refs);
+        }
+
+        self.compose_field = ComposeField::Body;
+        self.compose_known_addresses = db.get_known_addresses().unwrap_or_default();
+        self.view = ViewMode::Compose;
+    }
+
+    pub fn enter_forward(&mut self, db: &MailDb) {
+        let detail = match self.detail.clone() {
+            Some(d) => d,
+            None => return,
+        };
+        let email_id = match self.detail_id {
+            Some(id) => id,
+            None => return,
+        };
+
+        self.compose_previous_view = self.view.clone();
+        self.clear_compose();
+        self.compose_mode = ComposeMode::Forward;
+        self.compose_from = self.build_from_address();
+
+        let normalized = normalize_subject(&detail.subject);
+        self.compose_subject = if normalized == detail.subject {
+            format!("Fwd: {}", detail.subject)
+        } else {
+            format!("Fwd: {}", normalized)
+        };
+
+        // Build forwarded message body
+        let date_str = detail.date.format("%a, %d %b %Y %H:%M:%S").to_string();
+        let mut body_lines = vec![
+            String::new(),
+            String::new(),
+            "---------- Forwarded message ----------".to_string(),
+            format!("From: {}", detail.from),
+            format!("Date: {}", date_str),
+            format!("Subject: {}", detail.subject),
+            format!("To: {}", detail.to),
+            String::new(),
+        ];
+        for line_str in detail.text_body.lines() {
+            body_lines.push(line_str.to_string());
+        }
+        self.compose_body = body_lines;
+        self.compose_cursor_row = 0;
+        self.compose_cursor_col = 0;
+
+        // Auto-attach original attachments to temp files
+        let metas = db.get_attachments_meta(email_id).unwrap_or_default();
+        if !metas.is_empty() {
+            let tmp_dir = PathBuf::from(format!("/tmp/jamail_fwd_{}", email_id));
+            let _ = std::fs::create_dir_all(&tmp_dir);
+            for meta in &metas {
+                if let Ok(Some(data)) = db.get_attachment_data(meta.id) {
+                    let path = tmp_dir.join(&meta.filename);
+                    if std::fs::write(&path, &data).is_ok() {
+                        self.compose_attachments.push(ComposeAttachment {
+                            path: path.clone(),
+                            filename: meta.filename.clone(),
+                            size: data.len() as u64,
+                        });
+                    }
+                }
+            }
+            self.compose_forward_email_id = Some(email_id);
+        }
+
+        self.compose_field = ComposeField::To;
+        self.compose_known_addresses = db.get_known_addresses().unwrap_or_default();
+        self.view = ViewMode::Compose;
+    }
+
+    pub fn cancel_compose(&mut self) {
+        self.cleanup_forward_temps();
+        self.view = self.compose_previous_view.clone();
+    }
+
+    pub fn cleanup_forward_temps(&mut self) {
+        if let Some(id) = self.compose_forward_email_id.take() {
+            let tmp_dir = PathBuf::from(format!("/tmp/jamail_fwd_{}", id));
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+    }
+
+    // ── Compose body editor ──────────────────────────────────────
+
+    fn char_to_byte_pos(s: &str, char_idx: usize) -> usize {
+        s.char_indices()
+            .nth(char_idx)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len())
+    }
+
+    pub fn compose_body_insert_char(&mut self, ch: char) {
+        if self.compose_cursor_row >= self.compose_body.len() {
+            self.compose_body.push(String::new());
+            self.compose_cursor_row = self.compose_body.len() - 1;
+        }
+        let byte_pos = Self::char_to_byte_pos(
+            &self.compose_body[self.compose_cursor_row],
+            self.compose_cursor_col,
+        );
+        self.compose_body[self.compose_cursor_row].insert(byte_pos, ch);
+        self.compose_cursor_col += 1;
+    }
+
+    pub fn compose_body_newline(&mut self) {
+        if self.compose_cursor_row >= self.compose_body.len() {
+            self.compose_body.push(String::new());
+            self.compose_cursor_row = self.compose_body.len() - 1;
+        }
+        let byte_pos = Self::char_to_byte_pos(
+            &self.compose_body[self.compose_cursor_row],
+            self.compose_cursor_col,
+        );
+        let rest = self.compose_body[self.compose_cursor_row][byte_pos..].to_string();
+        self.compose_body[self.compose_cursor_row].truncate(byte_pos);
+        self.compose_cursor_row += 1;
+        self.compose_body.insert(self.compose_cursor_row, rest);
+        self.compose_cursor_col = 0;
+    }
+
+    pub fn compose_body_backspace(&mut self) {
+        if self.compose_cursor_col > 0 {
+            let byte_start = Self::char_to_byte_pos(
+                &self.compose_body[self.compose_cursor_row],
+                self.compose_cursor_col - 1,
+            );
+            let byte_end = Self::char_to_byte_pos(
+                &self.compose_body[self.compose_cursor_row],
+                self.compose_cursor_col,
+            );
+            self.compose_body[self.compose_cursor_row].replace_range(byte_start..byte_end, "");
+            self.compose_cursor_col -= 1;
+        } else if self.compose_cursor_row > 0 {
+            let current_line = self.compose_body.remove(self.compose_cursor_row);
+            self.compose_cursor_row -= 1;
+            self.compose_cursor_col = self.compose_body[self.compose_cursor_row].chars().count();
+            self.compose_body[self.compose_cursor_row].push_str(&current_line);
+        }
+    }
+
+    pub fn compose_body_delete(&mut self) {
+        if self.compose_cursor_row >= self.compose_body.len() {
+            return;
+        }
+        let line_chars = self.compose_body[self.compose_cursor_row].chars().count();
+        if self.compose_cursor_col < line_chars {
+            let byte_start = Self::char_to_byte_pos(
+                &self.compose_body[self.compose_cursor_row],
+                self.compose_cursor_col,
+            );
+            let byte_end = Self::char_to_byte_pos(
+                &self.compose_body[self.compose_cursor_row],
+                self.compose_cursor_col + 1,
+            );
+            self.compose_body[self.compose_cursor_row].replace_range(byte_start..byte_end, "");
+        } else if self.compose_cursor_row + 1 < self.compose_body.len() {
+            let next_line = self.compose_body.remove(self.compose_cursor_row + 1);
+            self.compose_body[self.compose_cursor_row].push_str(&next_line);
+        }
+    }
+
+    pub fn compose_body_left(&mut self) {
+        if self.compose_cursor_col > 0 {
+            self.compose_cursor_col -= 1;
+        } else if self.compose_cursor_row > 0 {
+            self.compose_cursor_row -= 1;
+            self.compose_cursor_col = self.compose_body[self.compose_cursor_row].chars().count();
+        }
+    }
+
+    pub fn compose_body_right(&mut self) {
+        if self.compose_cursor_row >= self.compose_body.len() {
+            return;
+        }
+        let line_chars = self.compose_body[self.compose_cursor_row].chars().count();
+        if self.compose_cursor_col < line_chars {
+            self.compose_cursor_col += 1;
+        } else if self.compose_cursor_row + 1 < self.compose_body.len() {
+            self.compose_cursor_row += 1;
+            self.compose_cursor_col = 0;
+        }
+    }
+
+    pub fn compose_body_up(&mut self) {
+        if self.compose_cursor_row > 0 {
+            self.compose_cursor_row -= 1;
+            let line_chars = self.compose_body[self.compose_cursor_row].chars().count();
+            self.compose_cursor_col = self.compose_cursor_col.min(line_chars);
+        }
+    }
+
+    pub fn compose_body_down(&mut self) {
+        if self.compose_cursor_row + 1 < self.compose_body.len() {
+            self.compose_cursor_row += 1;
+            let line_chars = self.compose_body[self.compose_cursor_row].chars().count();
+            self.compose_cursor_col = self.compose_cursor_col.min(line_chars);
+        }
+    }
+
+    pub fn compose_body_home(&mut self) {
+        self.compose_cursor_col = 0;
+    }
+
+    pub fn compose_body_end(&mut self) {
+        if self.compose_cursor_row < self.compose_body.len() {
+            self.compose_cursor_col = self.compose_body[self.compose_cursor_row].chars().count();
+        }
+    }
+
+    fn compose_ensure_cursor_visible(&mut self, viewport_height: usize) {
+        if viewport_height == 0 {
+            return;
+        }
+        if self.compose_cursor_row < self.compose_body_scroll {
+            self.compose_body_scroll = self.compose_cursor_row;
+        } else if self.compose_cursor_row >= self.compose_body_scroll + viewport_height {
+            self.compose_body_scroll = self.compose_cursor_row - viewport_height + 1;
+        }
+    }
+
+    // ── Autocomplete ─────────────────────────────────────────────
+
+    fn compose_active_address_field(&mut self) -> &mut String {
+        match self.compose_field {
+            ComposeField::To => &mut self.compose_to,
+            ComposeField::Cc => &mut self.compose_cc,
+            ComposeField::Bcc => &mut self.compose_bcc,
+            _ => &mut self.compose_to, // fallback
+        }
+    }
+
+    fn compose_active_address_field_ref(&self) -> &String {
+        match self.compose_field {
+            ComposeField::To => &self.compose_to,
+            ComposeField::Cc => &self.compose_cc,
+            ComposeField::Bcc => &self.compose_bcc,
+            _ => &self.compose_to,
+        }
+    }
+
+    pub fn compose_update_suggestions(&mut self) {
+        if !matches!(
+            self.compose_field,
+            ComposeField::To | ComposeField::Cc | ComposeField::Bcc
+        ) {
+            self.compose_show_suggestions = false;
+            self.compose_suggestions.clear();
+            return;
+        }
+
+        let field = self.compose_active_address_field_ref().clone();
+        let current_token = field.rsplit(',').next().unwrap_or("").trim().to_lowercase();
+
+        if current_token.len() < 2 {
+            self.compose_show_suggestions = false;
+            self.compose_suggestions.clear();
+            return;
+        }
+
+        self.compose_suggestions = self
+            .compose_known_addresses
+            .iter()
+            .filter(|a| a.to_lowercase().contains(&current_token))
+            .take(10)
+            .cloned()
+            .collect();
+
+        self.compose_show_suggestions = !self.compose_suggestions.is_empty();
+        self.compose_suggestion_selected = 0;
+    }
+
+    pub fn compose_accept_suggestion(&mut self) {
+        if !self.compose_show_suggestions || self.compose_suggestions.is_empty() {
+            return;
+        }
+        let suggestion = self.compose_suggestions[self.compose_suggestion_selected].clone();
+        let field = self.compose_active_address_field();
+
+        // Replace text after last comma with the suggestion
+        if let Some(last_comma) = field.rfind(',') {
+            field.truncate(last_comma + 1);
+            field.push(' ');
+            field.push_str(&suggestion);
+        } else {
+            *field = suggestion;
+        }
+        field.push_str(", ");
+
+        self.compose_show_suggestions = false;
+        self.compose_suggestions.clear();
+    }
+
+    pub fn compose_address_input(&mut self, ch: char) {
+        let field = self.compose_active_address_field();
+        field.push(ch);
+        self.compose_update_suggestions();
+    }
+
+    pub fn compose_address_backspace(&mut self) {
+        let field = self.compose_active_address_field();
+        field.pop();
+        self.compose_update_suggestions();
+    }
+
+    pub fn compose_next_field(&mut self) {
+        self.compose_show_suggestions = false;
+        self.compose_field = match self.compose_field {
+            ComposeField::To => ComposeField::Cc,
+            ComposeField::Cc => ComposeField::Bcc,
+            ComposeField::Bcc => ComposeField::Subject,
+            ComposeField::Subject => ComposeField::Body,
+            ComposeField::Body => ComposeField::Body,
+            ComposeField::FileBrowser => ComposeField::FileBrowser,
+        };
+    }
+
+    pub fn compose_prev_field(&mut self) {
+        self.compose_show_suggestions = false;
+        self.compose_field = match self.compose_field {
+            ComposeField::To => ComposeField::To,
+            ComposeField::Cc => ComposeField::To,
+            ComposeField::Bcc => ComposeField::Cc,
+            ComposeField::Subject => ComposeField::Bcc,
+            ComposeField::Body => ComposeField::Subject,
+            ComposeField::FileBrowser => ComposeField::Body,
+        };
+    }
+
+    // ── File browser ─────────────────────────────────────────────
+
+    pub fn open_file_browser(&mut self) {
+        self.compose_field = ComposeField::FileBrowser;
+        self.filebrowser_selected = 0;
+        self.filebrowser_scroll = 0;
+        self.refresh_filebrowser();
+    }
+
+    pub fn refresh_filebrowser(&mut self) {
+        self.filebrowser_entries.clear();
+        let entries = match std::fs::read_dir(&self.filebrowser_path) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !self.filebrowser_show_hidden && name.starts_with('.') {
+                continue;
+            }
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let entry = FileBrowserEntry { name, is_dir, size };
+            if is_dir {
+                dirs.push(entry);
+            } else {
+                files.push(entry);
+            }
+        }
+
+        dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+        self.filebrowser_entries = dirs;
+        self.filebrowser_entries.extend(files);
+        self.filebrowser_selected = 0;
+        self.filebrowser_scroll = 0;
+    }
+
+    pub fn filebrowser_up(&mut self) {
+        if self.filebrowser_selected > 0 {
+            self.filebrowser_selected -= 1;
+        }
+    }
+
+    pub fn filebrowser_down(&mut self) {
+        if self.filebrowser_selected + 1 < self.filebrowser_entries.len() {
+            self.filebrowser_selected += 1;
+        }
+    }
+
+    pub fn filebrowser_enter(&mut self) {
+        if let Some(entry) = self.filebrowser_entries.get(self.filebrowser_selected) {
+            if entry.is_dir {
+                self.filebrowser_path = self.filebrowser_path.join(&entry.name);
+                self.refresh_filebrowser();
+            } else {
+                // Attach the file
+                let path = self.filebrowser_path.join(&entry.name);
+                let size = entry.size;
+                let filename = entry.name.clone();
+                self.compose_attachments.push(ComposeAttachment {
+                    path,
+                    filename,
+                    size,
+                });
+                self.compose_field = ComposeField::Body;
+            }
+        }
+    }
+
+    pub fn filebrowser_parent(&mut self) {
+        if let Some(parent) = self.filebrowser_path.parent() {
+            self.filebrowser_path = parent.to_path_buf();
+            self.refresh_filebrowser();
+        }
+    }
+
+    pub fn filebrowser_toggle_hidden(&mut self) {
+        self.filebrowser_show_hidden = !self.filebrowser_show_hidden;
+        self.refresh_filebrowser();
+    }
+
+    pub fn compose_remove_last_attachment(&mut self) {
+        if let Some(att) = self.compose_attachments.pop() {
+            self.status_msg = format!("Removed: {}", att.filename);
+        }
+    }
+
+    pub fn compose_body_text(&self) -> String {
+        self.compose_body.join("\n")
+    }
+
     // ── Rendering ───────────────────────────────────────────────────
 
     pub fn render(&mut self, frame: &mut Frame) {
@@ -1078,6 +1696,7 @@ impl App {
             ViewMode::List => self.render_list(frame, content_area),
             ViewMode::Detail => self.render_detail_with_peek(frame, content_area),
             ViewMode::Search => self.render_search(frame, content_area),
+            ViewMode::Compose => self.render_compose(frame, content_area),
         }
 
         self.render_status_bar(frame, status_area);
@@ -2024,6 +2643,382 @@ impl App {
         }
     }
 
+    fn render_compose(&mut self, frame: &mut Frame, area: Rect) {
+        let compose_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::COMPOSE_BORDER))
+            .title(" Compose ")
+            .title_style(
+                Style::default()
+                    .fg(theme::SENDER_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .style(Style::default().bg(theme::BG));
+        let inner = compose_block.inner(area);
+        frame.render_widget(compose_block, area);
+
+        if inner.height < 5 || inner.width < 20 {
+            return;
+        }
+
+        // File browser mode
+        if self.compose_field == ComposeField::FileBrowser {
+            self.render_filebrowser(frame, inner);
+            return;
+        }
+
+        let mut y = inner.y;
+        let w = inner.width as usize;
+        let label_w = 9; // "Subject: " length
+
+        // From (read-only, dim)
+        if y < inner.y + inner.height {
+            let line = Line::from(vec![
+                Span::styled("From:    ", Style::default().fg(theme::FG_DIM)),
+                Span::styled(&self.compose_from, Style::default().fg(theme::FG_DIM)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(line).style(Style::default().bg(theme::BG)),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y += 1;
+        }
+
+        // To
+        if y < inner.y + inner.height {
+            let is_active = self.compose_field == ComposeField::To;
+            self.render_compose_field(
+                frame,
+                inner.x,
+                y,
+                inner.width,
+                "To:      ",
+                &self.compose_to.clone(),
+                is_active,
+            );
+            y += 1;
+        }
+
+        // Cc
+        if y < inner.y + inner.height {
+            let is_active = self.compose_field == ComposeField::Cc;
+            self.render_compose_field(
+                frame,
+                inner.x,
+                y,
+                inner.width,
+                "Cc:      ",
+                &self.compose_cc.clone(),
+                is_active,
+            );
+            y += 1;
+        }
+
+        // Bcc
+        if y < inner.y + inner.height {
+            let is_active = self.compose_field == ComposeField::Bcc;
+            self.render_compose_field(
+                frame,
+                inner.x,
+                y,
+                inner.width,
+                "Bcc:     ",
+                &self.compose_bcc.clone(),
+                is_active,
+            );
+            y += 1;
+        }
+
+        // Subject
+        if y < inner.y + inner.height {
+            let is_active = self.compose_field == ComposeField::Subject;
+            self.render_compose_field(
+                frame,
+                inner.x,
+                y,
+                inner.width,
+                "Subject: ",
+                &self.compose_subject.clone(),
+                is_active,
+            );
+            y += 1;
+        }
+
+        // Attachments line (only if any)
+        if !self.compose_attachments.is_empty() && y < inner.y + inner.height {
+            let att_str: String = self
+                .compose_attachments
+                .iter()
+                .map(|a| {
+                    format!(
+                        "{} ({})",
+                        a.filename,
+                        crate::smtp::format_attachment_size(a.size)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let line = Line::from(vec![
+                Span::styled("Attach:  ", Style::default().fg(theme::ATTACHMENT_COLOR)),
+                Span::styled(att_str, Style::default().fg(theme::ATTACHMENT_COLOR)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(line).style(Style::default().bg(theme::BG)),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y += 1;
+        }
+
+        // Separator
+        if y < inner.y + inner.height {
+            let sep = "─".repeat(w);
+            frame.render_widget(
+                Paragraph::new(Span::styled(sep, Style::default().fg(theme::FG_DIM)))
+                    .style(Style::default().bg(theme::BG)),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y += 1;
+        }
+
+        // Body area
+        let body_height = (inner.y + inner.height).saturating_sub(y) as usize;
+        if body_height > 0 && self.compose_field == ComposeField::Body {
+            self.compose_ensure_cursor_visible(body_height);
+        }
+
+        let is_body_active = self.compose_field == ComposeField::Body;
+
+        // Render body lines
+        for vi in 0..body_height {
+            let line_idx = self.compose_body_scroll + vi;
+            let row_y = y + vi as u16;
+            if row_y >= inner.y + inner.height {
+                break;
+            }
+
+            let row_area = Rect::new(inner.x, row_y, inner.width, 1);
+
+            if line_idx < self.compose_body.len() {
+                let line_text = &self.compose_body[line_idx];
+                let is_quote = line_text.starts_with("> ");
+
+                let style = if is_quote {
+                    Style::default().fg(theme::COMPOSE_QUOTE).bg(theme::BG)
+                } else {
+                    Style::default().fg(theme::FG_TEXT).bg(theme::BG)
+                };
+
+                // If this is the cursor line in body mode, render with cursor
+                if is_body_active && line_idx == self.compose_cursor_row {
+                    let chars: Vec<char> = line_text.chars().collect();
+                    let mut spans = Vec::new();
+                    for (ci, &ch) in chars.iter().enumerate() {
+                        if ci == self.compose_cursor_col {
+                            spans.push(Span::styled(
+                                ch.to_string(),
+                                Style::default().fg(theme::BG).bg(theme::COMPOSE_CURSOR),
+                            ));
+                        } else {
+                            spans.push(Span::styled(ch.to_string(), style));
+                        }
+                    }
+                    // Cursor at end of line
+                    if self.compose_cursor_col >= chars.len() {
+                        spans.push(Span::styled(
+                            " ",
+                            Style::default().fg(theme::BG).bg(theme::COMPOSE_CURSOR),
+                        ));
+                    }
+                    frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
+                } else {
+                    frame.render_widget(Paragraph::new(line_text.as_str()).style(style), row_area);
+                }
+            } else {
+                // Empty line below content
+                frame.render_widget(
+                    Paragraph::new("").style(Style::default().bg(theme::BG)),
+                    row_area,
+                );
+            }
+        }
+
+        // Render autocomplete dropdown as overlay
+        if self.compose_show_suggestions && !self.compose_suggestions.is_empty() {
+            let dropdown_y = match self.compose_field {
+                ComposeField::To => inner.y + 2,
+                ComposeField::Cc => inner.y + 3,
+                ComposeField::Bcc => inner.y + 4,
+                _ => inner.y + 2,
+            };
+            let dropdown_h = self.compose_suggestions.len().min(10) as u16;
+            let dropdown_w = inner.width.min(50);
+            let dropdown_x = inner.x + label_w as u16;
+
+            if dropdown_y + dropdown_h <= area.y + area.height {
+                let dropdown_area = Rect::new(dropdown_x, dropdown_y, dropdown_w, dropdown_h);
+                frame.render_widget(Clear, dropdown_area);
+
+                for (i, suggestion) in self.compose_suggestions.iter().enumerate() {
+                    let sy = dropdown_y + i as u16;
+                    if sy >= dropdown_y + dropdown_h {
+                        break;
+                    }
+                    let s_area = Rect::new(dropdown_x, sy, dropdown_w, 1);
+                    let is_sel = i == self.compose_suggestion_selected;
+                    let style = if is_sel {
+                        Style::default().fg(theme::FG_TEXT).bg(theme::BG_SELECTED)
+                    } else {
+                        Style::default()
+                            .fg(theme::FG_TEXT)
+                            .bg(theme::COMPOSE_DROPDOWN_BG)
+                    };
+                    let text = truncate_str(suggestion, dropdown_w as usize);
+                    frame.render_widget(Paragraph::new(text).style(style), s_area);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_compose_field(
+        &self,
+        frame: &mut Frame,
+        x: u16,
+        y: u16,
+        width: u16,
+        label: &str,
+        value: &str,
+        is_active: bool,
+    ) {
+        let area = Rect::new(x, y, width, 1);
+        let label_style = if is_active {
+            Style::default()
+                .fg(theme::COMPOSE_FIELD_ACTIVE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::FG_DIM)
+        };
+
+        if is_active {
+            // Render with cursor at end
+            let mut spans = vec![Span::styled(label, label_style)];
+            let chars: Vec<char> = value.chars().collect();
+            let visible_w = (width as usize).saturating_sub(label.len() + 1);
+            let start = if chars.len() > visible_w {
+                chars.len() - visible_w
+            } else {
+                0
+            };
+            for &ch in &chars[start..] {
+                spans.push(Span::styled(
+                    ch.to_string(),
+                    Style::default().fg(theme::FG_TEXT).bg(theme::BG),
+                ));
+            }
+            spans.push(Span::styled(
+                " ",
+                Style::default().fg(theme::BG).bg(theme::COMPOSE_CURSOR),
+            ));
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG)),
+                area,
+            );
+        } else {
+            let line = Line::from(vec![
+                Span::styled(label, label_style),
+                Span::styled(value, Style::default().fg(theme::FG_TEXT)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(line).style(Style::default().bg(theme::BG)),
+                area,
+            );
+        }
+    }
+
+    fn render_filebrowser(&mut self, frame: &mut Frame, area: Rect) {
+        let title = format!(" {} ", self.filebrowser_path.display());
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(theme::COMPOSE_BORDER))
+            .title(title)
+            .title_style(Style::default().fg(theme::SENDER_COLOR))
+            .style(Style::default().bg(theme::BG));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let visible_height = inner.height as usize;
+
+        if self.filebrowser_selected < self.filebrowser_scroll {
+            self.filebrowser_scroll = self.filebrowser_selected;
+        } else if self.filebrowser_selected >= self.filebrowser_scroll + visible_height {
+            self.filebrowser_scroll = self.filebrowser_selected - visible_height + 1;
+        }
+
+        if self.filebrowser_entries.is_empty() {
+            frame.render_widget(
+                Paragraph::new("(empty directory)")
+                    .style(Style::default().fg(theme::FG_DIM).bg(theme::BG)),
+                inner,
+            );
+            return;
+        }
+
+        for (vi, idx) in (self.filebrowser_scroll..self.filebrowser_entries.len())
+            .enumerate()
+            .take(visible_height)
+        {
+            let y = inner.y + vi as u16;
+            let row_area = Rect::new(inner.x, y, inner.width, 1);
+            let entry = &self.filebrowser_entries[idx];
+            let is_selected = idx == self.filebrowser_selected;
+            let bg = if is_selected {
+                theme::BG_SELECTED
+            } else {
+                theme::BG
+            };
+
+            let icon = if entry.is_dir { "/ " } else { "  " };
+            let size_str = if entry.is_dir {
+                String::new()
+            } else {
+                crate::smtp::format_attachment_size(entry.size)
+            };
+
+            let name_w = (inner.width as usize).saturating_sub(icon.len() + size_str.len() + 2);
+            let display_name = truncate_str(&entry.name, name_w);
+            let padding = name_w.saturating_sub(display_name.chars().count());
+
+            let spans = vec![
+                Span::styled(icon, Style::default().fg(theme::SENDER_COLOR).bg(bg)),
+                Span::styled(
+                    display_name,
+                    if entry.is_dir {
+                        Style::default().fg(theme::SENDER_COLOR).bg(bg)
+                    } else {
+                        Style::default().fg(theme::FG_TEXT).bg(bg)
+                    },
+                ),
+                Span::styled(" ".repeat(padding), Style::default().bg(bg)),
+                Span::styled(
+                    format!("  {}", size_str),
+                    Style::default().fg(theme::FG_DIM).bg(bg),
+                ),
+            ];
+            frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
+        }
+
+        if self.filebrowser_entries.len() > visible_height {
+            let mut scrollbar_state = ScrollbarState::new(self.filebrowser_entries.len())
+                .position(self.filebrowser_selected);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .style(Style::default().fg(theme::FG_DIM)),
+                inner,
+                &mut scrollbar_state,
+            );
+        }
+    }
+
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
         let (keys, info) = match self.view {
             ViewMode::FolderSelect => (
@@ -2125,6 +3120,44 @@ impl App {
                 ],
                 format!(" {} results", self.search_results.len()),
             ),
+            ViewMode::Compose => {
+                let keys = match self.compose_field {
+                    ComposeField::FileBrowser => vec![
+                        ("↑↓", "navigate"),
+                        ("Enter", "select"),
+                        ("Bksp", "parent"),
+                        (".", "hidden"),
+                        ("Esc", "cancel"),
+                    ],
+                    ComposeField::Body => vec![
+                        ("C-Enter", "send"),
+                        ("C-a", "attach"),
+                        ("C-d", "rm attach"),
+                        ("S-Tab", "prev field"),
+                        ("Esc", "cancel"),
+                    ],
+                    _ => vec![
+                        ("C-Enter", "send"),
+                        ("Tab", "next"),
+                        ("S-Tab", "prev"),
+                        ("C-a", "attach"),
+                        ("Esc", "cancel"),
+                    ],
+                };
+
+                let mode_label = match self.compose_mode {
+                    ComposeMode::New => "New",
+                    ComposeMode::Reply => "Reply",
+                    ComposeMode::Forward => "Forward",
+                };
+                let att_count = self.compose_attachments.len();
+                let info = if att_count > 0 {
+                    format!(" {}  {} attachment(s)", mode_label, att_count)
+                } else {
+                    format!(" {}", mode_label)
+                };
+                (keys, info)
+            }
         };
 
         let mut spans = Vec::new();
