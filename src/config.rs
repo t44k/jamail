@@ -18,6 +18,8 @@ pub struct JamailAccount {
     pub imap: ImapConfig,
     pub smtp: Option<SmtpConfig>,
     pub folders: Option<Vec<String>>,
+    pub senders: Option<Vec<String>>,
+    pub color: Option<String>,
 }
 
 fn default_true() -> bool {

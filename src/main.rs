@@ -24,7 +24,7 @@ use std::io::{self, IsTerminal};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
     if !io::stdout().is_terminal() {
@@ -126,6 +126,9 @@ fn run_app(
     sync_control: &Arc<sync::SyncControl>,
     accounts: &[(String, config::JamailAccount)],
 ) -> Result<()> {
+    // Track time between loop iterations to detect sleep/wake
+    let mut last_loop_time = Instant::now();
+
     // Track current sync control so we can shut it down on account switch
     let mut current_sync_control = Arc::clone(sync_control);
     // Keep sender alive to prevent channel from closing; receiver is swapped on account switch
@@ -143,33 +146,49 @@ fn run_app(
         while let Ok(ev) = current_sync_rx.try_recv() {
             match ev {
                 sync::SyncEvent::Syncing(folder) => {
-                    app.status_msg = format!("Syncing {}...", folder);
+                    app.spinner_active = true;
+                    if !app.status_sticky {
+                        app.status_msg = format!("Syncing {}...", folder);
+                    }
                 }
                 sync::SyncEvent::Progress(folder, done, total) => {
-                    app.status_msg = format!("Syncing {} {}/{}...", folder, done, total);
+                    if !app.status_sticky {
+                        app.status_msg = format!("Syncing {} {}/{}...", folder, done, total);
+                    }
                     if done % 20 == 0 || done == total {
-                        // Only refresh if the syncing folder matches current view
-                        if folder == app.current_folder {
+                        let should_refresh = folder == app.current_folder
+                            || (app.is_global_inbox && folder == "INBOX");
+                        if should_refresh {
                             app.refresh_emails(db);
                         }
                     }
                 }
                 sync::SyncEvent::FolderComplete(folder, count) => {
-                    if count > 0 && folder == app.current_folder {
+                    let should_refresh = folder == app.current_folder
+                        || (app.is_global_inbox && folder == "INBOX");
+                    if count > 0 && should_refresh {
                         app.refresh_emails(db);
-                        app.status_msg = format!("{}: +{} new", folder, count);
+                        if !app.status_sticky {
+                            app.status_msg = format!("{}: +{} new", folder, count);
+                        }
                     }
                 }
                 sync::SyncEvent::AllComplete => {
-                    if app.status_msg.starts_with("Syncing") {
+                    app.spinner_active = false;
+                    if !app.status_sticky && app.status_msg.starts_with("Syncing") {
                         app.status_msg.clear();
                     }
                 }
                 sync::SyncEvent::Error(e) => {
-                    app.status_msg = format!("Sync: {}", e);
+                    app.spinner_active = false;
+                    if !app.status_sticky {
+                        app.status_msg = format!("Sync: {}", e);
+                    }
                 }
                 sync::SyncEvent::FlagsChanged(folder) => {
-                    if folder == app.current_folder {
+                    let should_refresh = folder == app.current_folder
+                        || (app.is_global_inbox && folder == "INBOX");
+                    if should_refresh {
                         app.refresh_emails(db);
                     }
                 }
@@ -184,10 +203,43 @@ fn run_app(
             }
         }
 
+        // Check for SMTP send result
+        if let Some(rx) = &app.send_result_rx
+            && let Ok(result) = rx.try_recv()
+        {
+            app.send_result_rx = None;
+            app.spinner_active = false;
+            match result {
+                Ok(draft_id) => {
+                    // Mark draft as sent in DB
+                    if let Some(id) = draft_id {
+                        let _ = db.mark_draft_sent(id);
+                    }
+                    app.compose_draft_id = None;
+                    app.status_msg = "Message sent!".to_string();
+                    app.status_sticky = true;
+                    app.cleanup_forward_temps();
+                }
+                Err(e) => {
+                    app.status_msg = format!("Send failed: {}", e);
+                    app.status_sticky = true;
+                }
+            }
+        }
+
         // Poll for events with 200ms timeout
         if !event::poll(Duration::from_millis(200))? {
+            // Check for sleep/wake: if the loop took much longer than 200ms
+            let loop_elapsed = last_loop_time.elapsed();
+            last_loop_time = Instant::now();
+            if loop_elapsed > Duration::from_secs(70) {
+                current_sync_control
+                    .force_reconnect
+                    .store(true, Ordering::Relaxed);
+            }
             continue;
         }
+        last_loop_time = Instant::now();
 
         match event::read()? {
             Event::Key(key) => {
@@ -195,6 +247,30 @@ fn run_app(
                     continue;
                 }
                 app.clear_selection();
+                if app.status_sticky {
+                    app.status_msg.clear();
+                    app.status_sticky = false;
+                }
+
+                // Help overlay: ? toggles in all modes except Compose
+                if app.show_help {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('?') => app.show_help = false,
+                        KeyCode::Down => {
+                            app.help_scroll = app.help_scroll.saturating_add(1);
+                        }
+                        KeyCode::Up => {
+                            app.help_scroll = app.help_scroll.saturating_sub(1);
+                        }
+                        _ => app.show_help = false,
+                    }
+                    continue;
+                }
+                if key.code == KeyCode::Char('?') && app.view != ViewMode::Compose {
+                    app.show_help = true;
+                    app.help_scroll = 0;
+                    continue;
+                }
 
                 match &app.view {
                     ViewMode::FolderSelect => match key.code {
@@ -202,71 +278,89 @@ fn run_app(
                             app.should_quit = true;
                             return Ok(());
                         }
-                        KeyCode::Esc => {
+                        KeyCode::Esc | KeyCode::Left => {
                             app.view = ViewMode::List;
                         }
                         KeyCode::Up => app.folder_tree_up(),
                         KeyCode::Down => app.folder_tree_down(),
                         KeyCode::Tab => app.folder_tree_toggle_expand(),
-                        KeyCode::Enter => {
+                        KeyCode::Enter | KeyCode::Right => {
                             if let Some((acct_name, folder_name)) = app.folder_tree_select() {
-                                let needs_account_switch = acct_name != app.current_account;
+                                if acct_name == "*virtual*" {
+                                    // Virtual folder (Drafts/Sent)
+                                    app.load_virtual_folder(db, &folder_name);
+                                    app.view = ViewMode::List;
+                                } else if acct_name == "*global*" {
+                                    // Global inbox mode — read-only cross-account view
+                                    app.is_global_inbox = true;
+                                    app.virtual_folder = None;
+                                    app.local_messages.clear();
+                                    app.refresh_emails(db);
+                                    app.selected = 0;
+                                    app.list_scroll_offset = 0;
+                                    app.view = ViewMode::List;
+                                } else {
+                                    app.is_global_inbox = false;
+                                    app.virtual_folder = None;
+                                    app.local_messages.clear();
+                                    let needs_account_switch = acct_name != app.current_account;
 
-                                app.current_folder = folder_name.clone();
+                                    app.current_folder = folder_name.clone();
 
-                                if needs_account_switch {
-                                    // Shut down old sync thread
-                                    current_sync_control.shutdown.store(true, Ordering::Relaxed);
+                                    if needs_account_switch {
+                                        // Shut down old sync thread
+                                        current_sync_control.shutdown.store(true, Ordering::Relaxed);
 
-                                    app.current_account = acct_name.clone();
+                                        app.current_account = acct_name.clone();
 
-                                    // Load emails from cache for new account+folder
-                                    if let Ok(emails) =
-                                        db.get_email_list(&app.current_account, &app.current_folder)
-                                    {
-                                        app.emails = emails;
-                                        let expanded =
-                                            std::mem::take(&mut app.threaded_view.expanded);
-                                        app.threaded_view.threads =
-                                            thread::build_threads(&app.emails);
-                                        app.threaded_view.expanded = expanded;
-                                        thread::rebuild_rows(&mut app.threaded_view);
+                                        // Load emails from cache for new account+folder
+                                        if let Ok(emails) =
+                                            db.get_email_list(&app.current_account, &app.current_folder)
+                                        {
+                                            app.emails = emails;
+                                            let expanded =
+                                                std::mem::take(&mut app.threaded_view.expanded);
+                                            app.threaded_view.threads =
+                                                thread::build_threads(&app.emails);
+                                            app.threaded_view.expanded = expanded;
+                                            thread::rebuild_rows(&mut app.threaded_view);
+                                            app.selected = 0;
+                                            app.list_scroll_offset = 0;
+                                        }
+
+                                        // Spawn new sync thread
+                                        if let Some((_, new_account)) =
+                                            accounts.iter().find(|(n, _)| *n == acct_name)
+                                        {
+                                            let new_control =
+                                                Arc::new(sync::SyncControl::new(&folder_name));
+                                            let (tx, rx) = mpsc::channel();
+                                            let _handle = sync::spawn_sync_thread(
+                                                new_account.clone(),
+                                                acct_name.clone(),
+                                                Arc::clone(&new_control),
+                                                tx.clone(),
+                                            );
+                                            current_sync_control = new_control;
+                                            // Keep sender alive to prevent channel close
+                                            _sync_tx_keepalive = Some(tx);
+                                            current_sync_rx = rx;
+                                        }
+                                    } else {
+                                        // Same account, just switch folder
+                                        if let Ok(mut cf) = current_sync_control.current_folder.write()
+                                        {
+                                            *cf = folder_name;
+                                        }
+
+                                        // Load emails from cache immediately
+                                        app.refresh_emails(db);
                                         app.selected = 0;
                                         app.list_scroll_offset = 0;
                                     }
 
-                                    // Spawn new sync thread
-                                    if let Some((_, new_account)) =
-                                        accounts.iter().find(|(n, _)| *n == acct_name)
-                                    {
-                                        let new_control =
-                                            Arc::new(sync::SyncControl::new(&folder_name));
-                                        let (tx, rx) = mpsc::channel();
-                                        let _handle = sync::spawn_sync_thread(
-                                            new_account.clone(),
-                                            acct_name.clone(),
-                                            Arc::clone(&new_control),
-                                            tx.clone(),
-                                        );
-                                        current_sync_control = new_control;
-                                        // Keep sender alive to prevent channel close
-                                        _sync_tx_keepalive = Some(tx);
-                                        current_sync_rx = rx;
-                                    }
-                                } else {
-                                    // Same account, just switch folder
-                                    if let Ok(mut cf) = current_sync_control.current_folder.write()
-                                    {
-                                        *cf = folder_name;
-                                    }
-
-                                    // Load emails from cache immediately
-                                    app.refresh_emails(db);
-                                    app.selected = 0;
-                                    app.list_scroll_offset = 0;
+                                    app.view = ViewMode::List;
                                 }
-
-                                app.view = ViewMode::List;
                             }
                         }
                         _ => {}
@@ -287,12 +381,18 @@ fn run_app(
                             KeyCode::PageUp => app.page_up(page),
                             KeyCode::Home | KeyCode::Char('g') => app.go_home(),
                             KeyCode::End | KeyCode::Char('G') => app.go_end(),
-                            KeyCode::Enter => {
-                                app.open_detail(db);
-                                enqueue_mark_seen(app, db, &current_sync_control);
+                            KeyCode::Left => app.enter_folder_select(),
+                            KeyCode::Enter | KeyCode::Right => {
+                                if app.virtual_folder.as_deref() == Some("Drafts") {
+                                    // Resume editing the draft
+                                    app.resume_draft(db, app.selected);
+                                } else {
+                                    app.open_detail(db);
+                                    enqueue_mark_seen(app, db, &current_sync_control);
+                                }
                             }
-                            KeyCode::Char(' ') | KeyCode::Char('l') => app.toggle_thread_expand(),
-                            KeyCode::Tab => app.next_thread(),
+                            KeyCode::Tab | KeyCode::Char('l') => app.toggle_thread_expand(),
+                            KeyCode::Char(' ') => app.next_thread(),
                             KeyCode::BackTab => app.prev_thread(),
                             KeyCode::Char('t') => app.toggle_thread_mode(),
                             KeyCode::Char('/') => app.enter_search(),
@@ -336,8 +436,12 @@ fn run_app(
                             },
                             KeyCode::Left => match app.detail_mode {
                                 DetailMode::Text => {
-                                    app.prev_in_list(db);
-                                    enqueue_mark_seen(app, db, &current_sync_control);
+                                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                        app.prev_in_list(db);
+                                        enqueue_mark_seen(app, db, &current_sync_control);
+                                    } else {
+                                        app.close_detail();
+                                    }
                                 }
                                 DetailMode::Attachments => {
                                     app.prev_attachment();
@@ -347,8 +451,11 @@ fn run_app(
                             },
                             KeyCode::Right => match app.detail_mode {
                                 DetailMode::Text => {
-                                    app.next_in_list(db);
-                                    enqueue_mark_seen(app, db, &current_sync_control);
+                                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                        app.next_in_list(db);
+                                        enqueue_mark_seen(app, db, &current_sync_control);
+                                    }
+                                    // Plain Right in Text mode: no action
                                 }
                                 DetailMode::Attachments => {
                                     app.next_attachment();
@@ -356,11 +463,11 @@ fn run_app(
                                 }
                                 DetailMode::Links => app.next_link(),
                             },
-                            KeyCode::Enter => {
-                                if app.detail_mode == DetailMode::Links {
-                                    app.open_selected_link();
-                                }
-                            }
+                            KeyCode::Enter => match app.detail_mode {
+                                DetailMode::Links => app.open_selected_link(),
+                                DetailMode::Attachments => app.open_attachment(db),
+                                DetailMode::Text => {}
+                            },
                             KeyCode::Char('s') => {
                                 if app.detail_mode == DetailMode::Attachments {
                                     app.save_attachment(db);
@@ -370,20 +477,26 @@ fn run_app(
                                 app.cycle_detail_mode();
                                 app.update_image_preview(db);
                             }
-                            KeyCode::Char(' ') | KeyCode::PageDown => {
-                                app.scroll_detail_page_down(page)
+                            KeyCode::Char(' ') => app.scroll_detail_page_down(page),
+                            KeyCode::PageDown => {
+                                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                    app.next_in_thread(db);
+                                    enqueue_mark_seen(app, db, &current_sync_control);
+                                } else {
+                                    app.scroll_detail_page_down(page);
+                                }
                             }
-                            KeyCode::PageUp => app.scroll_detail_page_up(page),
+                            KeyCode::PageUp => {
+                                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                    app.prev_in_thread(db);
+                                    enqueue_mark_seen(app, db, &current_sync_control);
+                                } else {
+                                    app.scroll_detail_page_up(page);
+                                }
+                            }
                             KeyCode::Home => app.scroll_detail_home(),
                             KeyCode::End => app.scroll_detail_end(),
-                            KeyCode::Char('n') => {
-                                app.next_in_thread(db);
-                                enqueue_mark_seen(app, db, &current_sync_control);
-                            }
-                            KeyCode::Char('p') => {
-                                app.prev_in_thread(db);
-                                enqueue_mark_seen(app, db, &current_sync_control);
-                            }
+                            KeyCode::Char('n') => app.enter_compose_new(db),
                             KeyCode::Char('r') => app.enter_reply(db),
                             KeyCode::Char('f') => app.enter_forward(db),
                             KeyCode::Char('h') => app.toggle_raw_headers(),
@@ -392,8 +505,8 @@ fn run_app(
                         }
                     }
                     ViewMode::Search => match key.code {
-                        KeyCode::Esc => app.exit_search(),
-                        KeyCode::Enter => {
+                        KeyCode::Esc | KeyCode::Left => app.exit_search(),
+                        KeyCode::Enter | KeyCode::Right => {
                             if !app.search_results.is_empty() {
                                 app.open_detail(db);
                                 enqueue_mark_seen(app, db, &current_sync_control);
@@ -430,7 +543,24 @@ fn run_app(
                             continue;
                         }
 
+                        // Ctrl+S to save draft
+                        if is_ctrl && key.code == KeyCode::Char('s') {
+                            app.save_compose_as_draft(db);
+                            continue;
+                        }
+
                         match app.compose_field {
+                            ComposeField::From => match key.code {
+                                KeyCode::Left => app.cycle_sender_backward(),
+                                KeyCode::Right => app.cycle_sender_forward(),
+                                KeyCode::Tab | KeyCode::Down | KeyCode::Enter => {
+                                    app.compose_next_field();
+                                }
+                                KeyCode::Esc => {
+                                    app.cancel_compose();
+                                }
+                                _ => {}
+                            },
                             ComposeField::FileBrowser => match key.code {
                                 KeyCode::Up => app.filebrowser_up(),
                                 KeyCode::Down => app.filebrowser_down(),
@@ -670,7 +800,7 @@ fn extract_selection_text(buffer: &Buffer, sel: &app::Selection, area: Rect) -> 
 
 fn handle_compose_send(
     app: &mut App,
-    _db: &db::MailDb,
+    db: &db::MailDb,
     accounts: &[(String, config::JamailAccount)],
 ) {
     // Look up SMTP config for current account
@@ -694,31 +824,50 @@ fn handle_compose_send(
     }
 
     let body = app.compose_body_text();
+    let from = app.compose_from.clone();
+    let to = app.compose_to.clone();
+    let cc = app.compose_cc.clone();
+    let bcc = app.compose_bcc.clone();
+    let subject = app.compose_subject.clone();
+    let reply_msg_id = app.compose_reply_message_id.clone();
+    let reply_refs = app.compose_reply_references.clone();
 
+    // Collect attachment paths for the background thread
+    let attachments: Vec<smtp::ComposeAttachment> = app
+        .compose_attachments
+        .iter()
+        .map(|a| smtp::ComposeAttachment {
+            path: a.path.clone(),
+            filename: a.filename.clone(),
+            size: a.size,
+        })
+        .collect();
+
+    // Auto-save as draft before sending
+    app.save_compose_as_draft(db);
+    let draft_id = app.compose_draft_id;
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = smtp::send_email(
+            &smtp_config,
+            &from,
+            &to,
+            &cc,
+            &bcc,
+            &subject,
+            &body,
+            &attachments,
+            reply_msg_id.as_deref(),
+            reply_refs.as_deref(),
+        );
+        let _ = tx.send(result.map(|_| draft_id).map_err(|e| e.to_string()));
+    });
+
+    app.send_result_rx = Some(rx);
+    app.spinner_active = true;
     app.status_msg = "Sending...".to_string();
-
-    match smtp::send_email(
-        &smtp_config,
-        &app.compose_from,
-        &app.compose_to,
-        &app.compose_cc,
-        &app.compose_bcc,
-        &app.compose_subject,
-        &body,
-        &app.compose_attachments,
-        app.compose_reply_message_id.as_deref(),
-        app.compose_reply_references.as_deref(),
-    ) {
-        Ok(()) => {
-            app.status_msg = "Message sent!".to_string();
-            app.cleanup_forward_temps();
-            app.view = ViewMode::List;
-        }
-        Err(e) => {
-            app.status_msg = format!("Send failed: {}", e);
-            // Stay in compose so user can retry
-        }
-    }
+    app.view = app.compose_previous_view.clone();
 }
 
 fn enqueue_mark_seen(app: &App, db: &db::MailDb, sync_control: &sync::SyncControl) {

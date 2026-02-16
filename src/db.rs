@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::mail::{AttachmentData, Email, EmailContent, FolderInfo};
 use chrono::{DateTime, Local, TimeZone};
 
-const CURRENT_SCHEMA_VERSION: i32 = 2;
+const CURRENT_SCHEMA_VERSION: i32 = 3;
 
 pub struct AttachmentMeta {
     pub id: i64,
@@ -63,10 +63,11 @@ fn create_schema(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS emails;
          DROP TABLE IF EXISTS sync_state;
          DROP TABLE IF EXISTS folders;
+         DROP TABLE IF EXISTS local_messages;
          DROP TABLE IF EXISTS schema_version;
 
          CREATE TABLE schema_version (version INTEGER NOT NULL);
-         INSERT INTO schema_version VALUES (2);
+         INSERT INTO schema_version VALUES (3);
 
          CREATE TABLE folders (
              account   TEXT NOT NULL,
@@ -123,7 +124,24 @@ fn create_schema(conn: &Connection) -> Result<()> {
              size_bytes   INTEGER NOT NULL DEFAULT 0,
              content_zstd BLOB NOT NULL
          );
-         CREATE INDEX idx_attachments_email_id ON attachments(email_id);",
+         CREATE INDEX idx_attachments_email_id ON attachments(email_id);
+
+         CREATE TABLE local_messages (
+             id              INTEGER PRIMARY KEY AUTOINCREMENT,
+             account         TEXT NOT NULL,
+             status          TEXT NOT NULL DEFAULT 'draft',
+             from_addr       TEXT NOT NULL DEFAULT '',
+             to_addr         TEXT NOT NULL DEFAULT '',
+             cc              TEXT NOT NULL DEFAULT '',
+             bcc             TEXT NOT NULL DEFAULT '',
+             subject         TEXT NOT NULL DEFAULT '',
+             body            TEXT NOT NULL DEFAULT '',
+             in_reply_to     TEXT NOT NULL DEFAULT '',
+             refs            TEXT NOT NULL DEFAULT '',
+             created_at      TEXT NOT NULL,
+             sent_at         TEXT
+         );
+         CREATE INDEX idx_local_messages_status ON local_messages(status, created_at DESC);",
     )?;
     Ok(())
 }
@@ -332,7 +350,7 @@ impl MailDb {
     pub fn get_email_list(&self, account: &str, folder: &str) -> Result<Vec<Email>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, uid, from_addr, subject, date_ts, date_rfc3339, is_unread, preview,
-                    message_id, in_reply_to, refs, has_attachments
+                    message_id, in_reply_to, refs, has_attachments, account
              FROM emails WHERE account = ?1 AND folder = ?2
              ORDER BY date_ts DESC",
         )?;
@@ -350,6 +368,7 @@ impl MailDb {
             let in_reply_to: String = row.get(9)?;
             let references: String = row.get(10)?;
             let has_attachments: bool = row.get::<_, i32>(11)? != 0;
+            let acct: String = row.get(12)?;
 
             let date = Local
                 .timestamp_opt(date_ts, 0)
@@ -359,6 +378,7 @@ impl MailDb {
             Ok(Email {
                 id,
                 uid,
+                account: acct,
                 from,
                 subject,
                 date,
@@ -425,6 +445,57 @@ impl MailDb {
         }))
     }
 
+    pub fn get_global_inbox(&self) -> Result<Vec<Email>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, uid, from_addr, subject, date_ts, date_rfc3339, is_unread, preview,
+                    message_id, in_reply_to, refs, has_attachments, account
+             FROM emails WHERE folder = 'INBOX'
+             ORDER BY date_ts DESC",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let uid: u32 = row.get(1)?;
+            let from: String = row.get(2)?;
+            let subject: String = row.get(3)?;
+            let date_ts: i64 = row.get(4)?;
+            let _date_rfc3339: String = row.get(5)?;
+            let is_unread: bool = row.get::<_, i32>(6)? != 0;
+            let preview: String = row.get(7)?;
+            let message_id: String = row.get(8)?;
+            let in_reply_to: String = row.get(9)?;
+            let references: String = row.get(10)?;
+            let has_attachments: bool = row.get::<_, i32>(11)? != 0;
+            let acct: String = row.get(12)?;
+
+            let date = Local
+                .timestamp_opt(date_ts, 0)
+                .single()
+                .unwrap_or_else(Local::now);
+
+            Ok(Email {
+                id,
+                uid,
+                account: acct,
+                from,
+                subject,
+                date,
+                is_unread,
+                preview,
+                message_id,
+                in_reply_to,
+                references,
+                has_attachments,
+            })
+        })?;
+
+        let mut emails = Vec::new();
+        for row in rows {
+            emails.push(row?);
+        }
+        Ok(emails)
+    }
+
     pub fn mark_read(&self, id: i64) -> Result<()> {
         self.conn
             .execute("UPDATE emails SET is_unread = 0 WHERE id = ?1", params![id])?;
@@ -434,7 +505,7 @@ impl MailDb {
     pub fn search_emails(&self, account: &str, folder: &str, query: &str) -> Result<Vec<Email>> {
         let mut stmt = self.conn.prepare(
             "SELECT e.id, e.uid, e.from_addr, e.subject, e.date_ts, e.is_unread, e.preview,
-                    e.message_id, e.in_reply_to, e.refs, e.has_attachments
+                    e.message_id, e.in_reply_to, e.refs, e.has_attachments, e.account
              FROM emails_fts f
              JOIN emails e ON e.id = f.rowid
              WHERE emails_fts MATCH ?1
@@ -454,6 +525,7 @@ impl MailDb {
             let in_reply_to: String = row.get(8)?;
             let references: String = row.get(9)?;
             let has_attachments: bool = row.get::<_, i32>(10)? != 0;
+            let acct: String = row.get(11)?;
 
             let date = Local
                 .timestamp_opt(date_ts, 0)
@@ -463,6 +535,7 @@ impl MailDb {
             Ok(Email {
                 id,
                 uid,
+                account: acct,
                 from,
                 subject,
                 date,
@@ -676,4 +749,145 @@ impl MailDb {
         }
         Ok(result)
     }
+
+    // ── Local messages (drafts/sent) ──────────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_draft(
+        &self,
+        account: &str,
+        from: &str,
+        to: &str,
+        cc: &str,
+        bcc: &str,
+        subject: &str,
+        body: &str,
+        in_reply_to: &str,
+        refs: &str,
+    ) -> Result<i64> {
+        let now = Local::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO local_messages (account, status, from_addr, to_addr, cc, bcc, subject, body, in_reply_to, refs, created_at)
+             VALUES (?1, 'draft', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![account, from, to, cc, bcc, subject, body, in_reply_to, refs, now],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_draft(
+        &self,
+        id: i64,
+        from: &str,
+        to: &str,
+        cc: &str,
+        bcc: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE local_messages SET from_addr=?2, to_addr=?3, cc=?4, bcc=?5, subject=?6, body=?7
+             WHERE id=?1 AND status='draft'",
+            params![id, from, to, cc, bcc, subject, body],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_draft_sent(&self, id: i64) -> Result<()> {
+        let now = Local::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE local_messages SET status='sent', sent_at=?2 WHERE id=?1",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn delete_draft(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM local_messages WHERE id=?1 AND status='draft'",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_drafts(&self, account: &str) -> Result<Vec<LocalMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, account, status, from_addr, to_addr, cc, bcc, subject, body,
+                    in_reply_to, refs, created_at, sent_at
+             FROM local_messages WHERE status='draft' AND account=?1
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![account], local_message_from_row)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn get_sent(&self, account: &str) -> Result<Vec<LocalMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, account, status, from_addr, to_addr, cc, bcc, subject, body,
+                    in_reply_to, refs, created_at, sent_at
+             FROM local_messages WHERE status='sent' AND account=?1
+             ORDER BY sent_at DESC",
+        )?;
+        let rows = stmt.query_map(params![account], local_message_from_row)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_draft(&self, id: i64) -> Result<Option<LocalMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, account, status, from_addr, to_addr, cc, bcc, subject, body,
+                    in_reply_to, refs, created_at, sent_at
+             FROM local_messages WHERE id=?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(local_message_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct LocalMessage {
+    pub id: i64,
+    pub account: String,
+    pub status: String,
+    pub from_addr: String,
+    pub to_addr: String,
+    pub cc: String,
+    pub bcc: String,
+    pub subject: String,
+    pub body: String,
+    pub in_reply_to: String,
+    pub refs: String,
+    pub created_at: String,
+    pub sent_at: Option<String>,
+}
+
+fn local_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalMessage> {
+    Ok(LocalMessage {
+        id: row.get(0)?,
+        account: row.get(1)?,
+        status: row.get(2)?,
+        from_addr: row.get(3)?,
+        to_addr: row.get(4)?,
+        cc: row.get(5)?,
+        bcc: row.get(6)?,
+        subject: row.get(7)?,
+        body: row.get(8)?,
+        in_reply_to: row.get(9)?,
+        refs: row.get(10)?,
+        created_at: row.get(11)?,
+        sent_at: row.get(12)?,
+    })
 }

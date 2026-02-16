@@ -11,6 +11,7 @@ use crate::db::MailDb;
 pub struct Email {
     pub id: i64,
     pub uid: u32,
+    pub account: String,
     pub from: String,
     pub subject: String,
     pub date: DateTime<Local>,

@@ -8,7 +8,7 @@ use crate::thread::{DisplayRow, ThreadedView, build_threads, rebuild_rows};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 const LIST_PEEK_WIDTH: u16 = 12;
+const SPINNER_FRAMES: &[char] = &['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum ViewMode {
@@ -32,6 +33,7 @@ pub enum ViewMode {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ComposeField {
+    From,
     To,
     Cc,
     Bcc,
@@ -90,6 +92,10 @@ impl Selection {
 
 #[derive(Clone)]
 pub enum FolderTreeRow {
+    GlobalInbox,
+    VirtualFolder {
+        label: String,
+    },
     Account {
         name: String,
     },
@@ -109,7 +115,13 @@ pub struct App {
     pub detail_from_search: bool,
     pub list_scroll_offset: usize,
     pub status_msg: String,
+    pub status_sticky: bool,
     pub should_quit: bool,
+    pub show_help: bool,
+    pub help_scroll: usize,
+    pub spinner_active: bool,
+    pub spinner_tick: usize,
+    pub send_result_rx: Option<std::sync::mpsc::Receiver<Result<Option<i64>, String>>>,
     pub search_query: String,
     pub search_results: Vec<Email>,
     pub search_selected: usize,
@@ -130,11 +142,18 @@ pub struct App {
     pub image_picker: Option<Picker>,
     pub image_preview: Option<StatefulProtocol>,
     pub image_preview_id: Option<i64>,
+    pub text_preview: Option<String>,
+    pub text_preview_id: Option<i64>,
 
     // Account/folder context
     pub accounts: Vec<(String, crate::config::JamailAccount)>,
     pub current_account: String,
     pub current_folder: String,
+    pub is_global_inbox: bool,
+    /// When viewing virtual folders ("Drafts" or "Sent")
+    pub virtual_folder: Option<String>,
+    /// Cached local messages for drafts/sent view
+    pub local_messages: Vec<crate::db::LocalMessage>,
 
     // Folder selection screen
     pub folder_tree: Vec<FolderTreeRow>,
@@ -147,6 +166,8 @@ pub struct App {
     pub compose_mode: ComposeMode,
     pub compose_field: ComposeField,
     pub compose_from: String,
+    pub compose_senders: Vec<String>,
+    pub compose_sender_index: usize,
     pub compose_to: String,
     pub compose_cc: String,
     pub compose_bcc: String,
@@ -160,6 +181,7 @@ pub struct App {
     pub compose_reply_references: Option<String>,
     pub compose_forward_email_id: Option<i64>,
     pub compose_previous_view: ViewMode,
+    pub compose_draft_id: Option<i64>,
 
     // Autocomplete
     pub compose_known_addresses: Vec<String>,
@@ -200,7 +222,13 @@ impl App {
             detail_from_search: false,
             list_scroll_offset: 0,
             status_msg: String::new(),
+            status_sticky: false,
             should_quit: false,
+            show_help: false,
+            help_scroll: 0,
+            spinner_active: false,
+            spinner_tick: 0,
+            send_result_rx: None,
             search_query: String::new(),
             search_results: Vec::new(),
             search_selected: 0,
@@ -220,9 +248,14 @@ impl App {
             image_picker: picker,
             image_preview: None,
             image_preview_id: None,
+            text_preview: None,
+            text_preview_id: None,
             accounts,
             current_account,
             current_folder,
+            is_global_inbox: false,
+            virtual_folder: None,
+            local_messages: Vec::new(),
             folder_tree: Vec::new(),
             folder_tree_selected: 0,
             folder_tree_expanded,
@@ -232,6 +265,8 @@ impl App {
             compose_mode: ComposeMode::New,
             compose_field: ComposeField::To,
             compose_from: String::new(),
+            compose_senders: Vec::new(),
+            compose_sender_index: 0,
             compose_to: String::new(),
             compose_cc: String::new(),
             compose_bcc: String::new(),
@@ -245,6 +280,7 @@ impl App {
             compose_reply_references: None,
             compose_forward_email_id: None,
             compose_previous_view: ViewMode::List,
+            compose_draft_id: None,
 
             compose_known_addresses: Vec::new(),
             compose_suggestions: Vec::new(),
@@ -446,7 +482,12 @@ impl App {
         // Remember current selection by ID
         let selected_id = self.selected_email().map(|e| e.id);
 
-        if let Ok(emails) = db.get_email_list(&self.current_account, &self.current_folder) {
+        let result = if self.is_global_inbox {
+            db.get_global_inbox()
+        } else {
+            db.get_email_list(&self.current_account, &self.current_folder)
+        };
+        if let Ok(emails) = result {
             self.emails = emails;
 
             // Rebuild threads, preserving expansion state
@@ -488,6 +529,148 @@ impl App {
         }
     }
 
+    pub fn load_virtual_folder(&mut self, db: &MailDb, folder: &str) {
+        self.virtual_folder = Some(folder.to_string());
+        self.is_global_inbox = false;
+        let result = match folder {
+            "Drafts" => db.get_drafts(&self.current_account),
+            "Sent" => db.get_sent(&self.current_account),
+            _ => return,
+        };
+        match result {
+            Ok(msgs) => {
+                self.local_messages = msgs;
+                // Convert to Email entries for display in the list
+                self.emails = self
+                    .local_messages
+                    .iter()
+                    .map(|m| {
+                        let date = chrono::DateTime::parse_from_rfc3339(&m.created_at)
+                            .map(|d| d.with_timezone(&chrono::Local))
+                            .unwrap_or_else(|_| chrono::Local::now());
+                        Email {
+                            id: -m.id, // Negative to distinguish from real emails
+                            uid: 0,
+                            account: m.account.clone(),
+                            from: m.from_addr.clone(),
+                            subject: if m.subject.is_empty() {
+                                "(no subject)".to_string()
+                            } else {
+                                m.subject.clone()
+                            },
+                            date,
+                            is_unread: m.status == "draft",
+                            preview: truncate_str(&m.to_addr, 80),
+                            message_id: String::new(),
+                            in_reply_to: m.in_reply_to.clone(),
+                            references: m.refs.clone(),
+                            has_attachments: false,
+                        }
+                    })
+                    .collect();
+                self.threaded_view.threads = build_threads(&self.emails);
+                rebuild_rows(&mut self.threaded_view);
+                self.selected = 0;
+                self.list_scroll_offset = 0;
+            }
+            Err(_) => {
+                self.local_messages.clear();
+                self.emails.clear();
+            }
+        }
+    }
+
+    pub fn resume_draft(&mut self, db: &MailDb, draft_idx: usize) {
+        if draft_idx >= self.local_messages.len() {
+            return;
+        }
+        let draft = self.local_messages[draft_idx].clone();
+        self.compose_mode = ComposeMode::New;
+        self.compose_field = ComposeField::Body;
+        self.compose_from = draft.from_addr;
+        self.compose_senders = self.build_sender_list();
+        self.compose_sender_index = self
+            .compose_senders
+            .iter()
+            .position(|s| s == &self.compose_from)
+            .unwrap_or(0);
+        self.compose_to = draft.to_addr;
+        self.compose_cc = draft.cc;
+        self.compose_bcc = draft.bcc;
+        self.compose_subject = draft.subject;
+        self.compose_body = if draft.body.is_empty() {
+            vec![String::new()]
+        } else {
+            draft.body.lines().map(|l| l.to_string()).collect()
+        };
+        self.compose_cursor_row = 0;
+        self.compose_cursor_col = 0;
+        self.compose_body_scroll = 0;
+        self.compose_attachments.clear();
+        self.compose_reply_message_id = if draft.in_reply_to.is_empty() {
+            None
+        } else {
+            Some(draft.in_reply_to)
+        };
+        self.compose_reply_references = if draft.refs.is_empty() {
+            None
+        } else {
+            Some(draft.refs)
+        };
+        self.compose_forward_email_id = None;
+        self.compose_draft_id = Some(draft.id);
+        self.compose_previous_view = self.view.clone();
+        self.view = ViewMode::Compose;
+
+        // Load known addresses for autocomplete
+        if let Ok(addrs) = db.get_known_addresses() {
+            self.compose_known_addresses = addrs;
+        }
+    }
+
+    pub fn save_compose_as_draft(&mut self, db: &MailDb) {
+        let body = self.compose_body.join("\n");
+        let in_reply_to = self.compose_reply_message_id.as_deref().unwrap_or("");
+        let refs = self.compose_reply_references.as_deref().unwrap_or("");
+
+        let result = if let Some(draft_id) = self.compose_draft_id {
+            db.update_draft(
+                draft_id,
+                &self.compose_from,
+                &self.compose_to,
+                &self.compose_cc,
+                &self.compose_bcc,
+                &self.compose_subject,
+                &body,
+            )
+            .map(|_| draft_id)
+        } else {
+            db.save_draft(
+                &self.current_account,
+                &self.compose_from,
+                &self.compose_to,
+                &self.compose_cc,
+                &self.compose_bcc,
+                &self.compose_subject,
+                &body,
+                in_reply_to,
+                refs,
+            )
+        };
+
+        match result {
+            Ok(id) => {
+                self.compose_draft_id = Some(id);
+                self.status_msg = "Draft saved".to_string();
+                self.status_sticky = true;
+            }
+            Err(e) => {
+                self.status_msg = format!("Failed to save draft: {}", e);
+                self.status_sticky = true;
+            }
+        }
+    }
+
     pub fn close_detail(&mut self) {
         self.view = if self.detail_from_search {
             ViewMode::Search
@@ -505,6 +688,8 @@ impl App {
         self.selected_link = 0;
         self.image_preview = None;
         self.image_preview_id = None;
+        self.text_preview = None;
+        self.text_preview_id = None;
     }
 
     pub fn toggle_thread_expand(&mut self) {
@@ -822,55 +1007,95 @@ impl App {
         }
     }
 
+    pub fn open_attachment(&mut self, db: &MailDb) {
+        if self.detail_attachments.is_empty() {
+            return;
+        }
+        let att = &self.detail_attachments[self.selected_attachment];
+        let data = match db.get_attachment_data(att.id) {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                self.status_msg = "Attachment data not found".to_string();
+                return;
+            }
+            Err(e) => {
+                self.status_msg = format!("Error: {}", e);
+                return;
+            }
+        };
+
+        let tmp_dir = PathBuf::from(format!("/tmp/jamail_open_{}", att.id));
+        if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+            self.status_msg = format!("Failed to create temp dir: {}", e);
+            return;
+        }
+        let path = tmp_dir.join(&att.filename);
+        if let Err(e) = std::fs::write(&path, &data) {
+            self.status_msg = format!("Failed to write temp file: {}", e);
+            return;
+        }
+
+        match std::process::Command::new("xdg-open")
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => {
+                self.status_msg = format!("Opening {}", att.filename);
+            }
+            Err(e) => {
+                self.status_msg = format!("Failed to open: {}", e);
+            }
+        }
+    }
+
     pub fn update_image_preview(&mut self, db: &MailDb) {
         if self.detail_mode != DetailMode::Attachments || self.detail_attachments.is_empty() {
             self.image_preview = None;
             self.image_preview_id = None;
+            self.text_preview = None;
+            self.text_preview_id = None;
             return;
         }
 
         let att = &self.detail_attachments[self.selected_attachment];
-
-        if self.image_preview_id == Some(att.id) {
-            return;
-        }
-
-        if !att.mime_type.starts_with("image/") {
-            self.image_preview = None;
-            self.image_preview_id = None;
-            return;
-        }
-
         let att_id = att.id;
 
-        let picker = match &self.image_picker {
-            Some(p) => p,
-            None => {
-                self.image_preview = None;
-                self.image_preview_id = None;
-                return;
-            }
-        };
+        // Skip if already previewing this attachment
+        if self.image_preview_id == Some(att_id) || self.text_preview_id == Some(att_id) {
+            return;
+        }
+
+        // Clear both previews
+        self.image_preview = None;
+        self.image_preview_id = None;
+        self.text_preview = None;
+        self.text_preview_id = None;
+
+        let mime_type = att.mime_type.clone();
+        let filename = att.filename.clone();
 
         let data = match db.get_attachment_data(att_id) {
             Ok(Some(d)) => d,
-            _ => {
-                self.image_preview = None;
-                self.image_preview_id = None;
-                return;
-            }
+            _ => return,
         };
 
-        match image::load_from_memory(&data) {
-            Ok(img) => {
-                self.image_preview = Some(picker.new_resize_protocol(img));
-                self.image_preview_id = Some(att_id);
-            }
-            Err(_) => {
-                self.image_preview = None;
-                self.image_preview_id = None;
-                self.status_msg = "Failed to decode image".to_string();
-            }
+        // Try image preview first
+        if mime_type.starts_with("image/")
+            && let Some(picker) = &self.image_picker
+            && let Ok(img) = image::load_from_memory(&data)
+        {
+            self.image_preview = Some(picker.new_resize_protocol(img));
+            self.image_preview_id = Some(att_id);
+            return;
+        }
+
+        // Try text-based preview for non-image types
+        if let Some(text) = generate_text_preview(&data, &mime_type, &filename) {
+            self.text_preview = Some(text);
+            self.text_preview_id = Some(att_id);
         }
     }
 
@@ -1083,6 +1308,17 @@ impl App {
 
     pub fn rebuild_folder_tree(&mut self) {
         self.folder_tree.clear();
+        // Virtual folders at the top
+        self.folder_tree.push(FolderTreeRow::VirtualFolder {
+            label: "Drafts".to_string(),
+        });
+        self.folder_tree.push(FolderTreeRow::VirtualFolder {
+            label: "Sent".to_string(),
+        });
+        // Show "All Inboxes" when multiple accounts exist
+        if self.accounts.len() > 1 {
+            self.folder_tree.push(FolderTreeRow::GlobalInbox);
+        }
         for (name, _account) in &self.accounts {
             self.folder_tree
                 .push(FolderTreeRow::Account { name: name.clone() });
@@ -1114,14 +1350,23 @@ impl App {
                     }
                     self.rebuild_folder_tree();
                 }
-                FolderTreeRow::Folder { .. } | FolderTreeRow::Loading => {}
+                FolderTreeRow::GlobalInbox | FolderTreeRow::VirtualFolder { .. } | FolderTreeRow::Folder { .. } | FolderTreeRow::Loading => {}
             }
         }
     }
 
+    /// Returns Some(("*global*", "INBOX")) for global inbox,
+    /// Some(("*virtual*", "Drafts"|"Sent")) for virtual folders,
+    /// Some((account, folder)) for a specific folder, or None.
     pub fn folder_tree_select(&mut self) -> Option<(String, String)> {
         if let Some(row) = self.folder_tree.get(self.folder_tree_selected) {
             match row {
+                FolderTreeRow::GlobalInbox => {
+                    Some(("*global*".to_string(), "INBOX".to_string()))
+                }
+                FolderTreeRow::VirtualFolder { label } => {
+                    Some(("*virtual*".to_string(), label.clone()))
+                }
                 FolderTreeRow::Account { .. } => {
                     self.folder_tree_toggle_expand();
                     None
@@ -1151,25 +1396,75 @@ impl App {
 
     /// Get the short display name for the current folder (last path component).
     fn folder_short_name(&self) -> String {
-        folder_display_name(&self.current_folder)
+        if self.is_global_inbox {
+            "All".to_string()
+        } else if let Some(ref vf) = self.virtual_folder {
+            vf.clone()
+        } else {
+            folder_display_name(&self.current_folder)
+        }
+    }
+
+    /// Get the color for an account (from config or default palette).
+    fn account_color(&self, account_name: &str) -> Color {
+        // Check if account has an explicit color in config
+        if let Some((_, acc)) = self.accounts.iter().find(|(n, _)| n == account_name)
+            && let Some(ref hex) = acc.color
+            && let Some(c) = parse_hex_color(hex)
+        {
+            return c;
+        }
+        // Fall back to palette based on account index
+        let idx = self
+            .accounts
+            .iter()
+            .position(|(n, _)| n == account_name)
+            .unwrap_or(0);
+        theme::ACCOUNT_COLORS[idx % theme::ACCOUNT_COLORS.len()]
     }
 
     // ── Compose ────────────────────────────────────────────────────
 
-    fn build_from_address(&self) -> String {
+    fn build_sender_list(&self) -> Vec<String> {
         let account = self
             .accounts
             .iter()
             .find(|(n, _)| *n == self.current_account);
         if let Some((_, acc)) = account {
-            if let Some(ref name) = acc.display_name {
+            if let Some(ref senders) = acc.senders
+                && !senders.is_empty()
+            {
+                return senders.clone();
+            }
+            let addr = if let Some(ref name) = acc.display_name {
                 format!("{} <{}>", name, acc.email)
             } else {
                 acc.email.clone()
-            }
+            };
+            vec![addr]
         } else {
-            String::new()
+            Vec::new()
         }
+    }
+
+    pub fn cycle_sender_forward(&mut self) {
+        if self.compose_senders.len() <= 1 {
+            return;
+        }
+        self.compose_sender_index = (self.compose_sender_index + 1) % self.compose_senders.len();
+        self.compose_from = self.compose_senders[self.compose_sender_index].clone();
+    }
+
+    pub fn cycle_sender_backward(&mut self) {
+        if self.compose_senders.len() <= 1 {
+            return;
+        }
+        if self.compose_sender_index == 0 {
+            self.compose_sender_index = self.compose_senders.len() - 1;
+        } else {
+            self.compose_sender_index -= 1;
+        }
+        self.compose_from = self.compose_senders[self.compose_sender_index].clone();
     }
 
     fn clear_compose(&mut self) {
@@ -1186,6 +1481,7 @@ impl App {
         self.compose_reply_references = None;
         self.cleanup_forward_temps();
         self.compose_forward_email_id = None;
+        self.compose_draft_id = None;
         self.compose_suggestions.clear();
         self.compose_suggestion_selected = 0;
         self.compose_show_suggestions = false;
@@ -1195,7 +1491,9 @@ impl App {
         self.compose_previous_view = self.view.clone();
         self.clear_compose();
         self.compose_mode = ComposeMode::New;
-        self.compose_from = self.build_from_address();
+        self.compose_senders = self.build_sender_list();
+        self.compose_sender_index = 0;
+        self.compose_from = self.compose_senders.first().cloned().unwrap_or_default();
         self.compose_field = ComposeField::To;
         self.compose_known_addresses = db.get_known_addresses().unwrap_or_default();
         self.view = ViewMode::Compose;
@@ -1215,7 +1513,9 @@ impl App {
         self.compose_previous_view = self.view.clone();
         self.clear_compose();
         self.compose_mode = ComposeMode::Reply;
-        self.compose_from = self.build_from_address();
+        self.compose_senders = self.build_sender_list();
+        self.compose_sender_index = 0;
+        self.compose_from = self.compose_senders.first().cloned().unwrap_or_default();
         self.compose_to = detail.from.clone();
 
         let normalized = normalize_subject(&detail.subject);
@@ -1271,7 +1571,9 @@ impl App {
         self.compose_previous_view = self.view.clone();
         self.clear_compose();
         self.compose_mode = ComposeMode::Forward;
-        self.compose_from = self.build_from_address();
+        self.compose_senders = self.build_sender_list();
+        self.compose_sender_index = 0;
+        self.compose_from = self.compose_senders.first().cloned().unwrap_or_default();
 
         let normalized = normalize_subject(&detail.subject);
         self.compose_subject = if normalized == detail.subject {
@@ -1561,6 +1863,7 @@ impl App {
     pub fn compose_next_field(&mut self) {
         self.compose_show_suggestions = false;
         self.compose_field = match self.compose_field {
+            ComposeField::From => ComposeField::To,
             ComposeField::To => ComposeField::Cc,
             ComposeField::Cc => ComposeField::Bcc,
             ComposeField::Bcc => ComposeField::Subject,
@@ -1573,7 +1876,14 @@ impl App {
     pub fn compose_prev_field(&mut self) {
         self.compose_show_suggestions = false;
         self.compose_field = match self.compose_field {
-            ComposeField::To => ComposeField::To,
+            ComposeField::From => ComposeField::From,
+            ComposeField::To => {
+                if self.compose_senders.len() > 1 {
+                    ComposeField::From
+                } else {
+                    ComposeField::To
+                }
+            }
             ComposeField::Cc => ComposeField::To,
             ComposeField::Bcc => ComposeField::Cc,
             ComposeField::Subject => ComposeField::Bcc,
@@ -1682,6 +1992,9 @@ impl App {
     // ── Rendering ───────────────────────────────────────────────────
 
     pub fn render(&mut self, frame: &mut Frame) {
+        if self.spinner_active {
+            self.spinner_tick = self.spinner_tick.wrapping_add(1);
+        }
         self.selectable_area = Rect::default();
         let area = frame.area();
 
@@ -1700,6 +2013,10 @@ impl App {
         }
 
         self.render_status_bar(frame, status_area);
+
+        if self.show_help {
+            self.render_help_overlay(frame, area);
+        }
     }
 
     fn render_list(&mut self, frame: &mut Frame, area: Rect) {
@@ -2055,11 +2372,12 @@ impl App {
             return;
         }
 
+        let acct_pip_w = if self.is_global_inbox { 2usize } else { 0 };
         let marker_w = 2usize;
         let sender_w = 20usize.min(width / 4);
         let rel_time_w = 14usize;
         let exact_time_w = 18usize;
-        let fixed_w = marker_w + sender_w + rel_time_w + exact_time_w + 3;
+        let fixed_w = acct_pip_w + marker_w + sender_w + rel_time_w + exact_time_w + 3;
         let subject_w = if width > fixed_w { width - fixed_w } else { 10 };
 
         let unread_marker = if email.is_unread { "●" } else { " " };
@@ -2072,7 +2390,16 @@ impl App {
         let rel_time = format!("{:>width$}", rel_time, width = rel_time_w);
         let exact_time = format!("{:>width$}", exact_time, width = exact_time_w);
 
-        let spans = vec![
+        let mut spans = Vec::new();
+
+        // Account color pip for global inbox
+        if self.is_global_inbox {
+            let color = self.account_color(&email.account);
+            spans.push(Span::styled("●", Style::default().fg(color).bg(bg)));
+            spans.push(Span::styled(" ", Style::default().bg(bg)));
+        }
+
+        spans.extend([
             Span::styled(
                 unread_marker,
                 if email.is_unread {
@@ -2111,7 +2438,7 @@ impl App {
             Span::styled(rel_time, theme::style_time_relative().bg(bg)),
             Span::styled(" ", Style::default().bg(bg)),
             Span::styled(exact_time, theme::style_time_exact().bg(bg)),
-        ];
+        ]);
 
         let line = Line::from(spans);
         frame.render_widget(Paragraph::new(line), area);
@@ -2311,6 +2638,24 @@ impl App {
                     ),
                 ]));
 
+                // Show account badge in global inbox mode
+                if self.is_global_inbox
+                    && let Some(email) = self.selected_email()
+                {
+                    let acct = email.account.clone();
+                    let color = self.account_color(&acct);
+                    lines.push(Line::from(vec![
+                        Span::styled("Account: ", theme::style_detail_header_label()),
+                        Span::styled(
+                            format!(" {} ", acct),
+                            Style::default()
+                                .fg(Color::Rgb(18, 18, 24))
+                                .bg(color)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
+
                 if let Some((pos, total)) = self.detail_thread_info() {
                     lines.push(Line::from(vec![
                         Span::styled("Thread:  ", theme::style_detail_header_label()),
@@ -2401,8 +2746,11 @@ impl App {
 
                 let show_image =
                     self.detail_mode == DetailMode::Attachments && self.image_preview.is_some();
+                let show_text_preview = self.detail_mode == DetailMode::Attachments
+                    && self.text_preview.is_some()
+                    && !show_image;
 
-                if !show_image {
+                if !show_image && !show_text_preview {
                     let text_body = content.text_body.clone();
                     for (line_idx, line_text) in text_body.lines().enumerate() {
                         lines.push(render_body_line(
@@ -2412,6 +2760,23 @@ impl App {
                             &self.detail_links,
                             self.selected_link,
                         ));
+                    }
+                }
+                if show_text_preview
+                    && let Some(preview_text) = &self.text_preview
+                {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "── Preview ──",
+                        Style::default()
+                            .fg(theme::MODE_INDICATOR)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    for line_text in preview_text.lines().take(200) {
+                        lines.push(Line::from(Span::styled(
+                            line_text.to_string(),
+                            theme::style_detail_body(),
+                        )));
                     }
                 }
             }
@@ -2588,6 +2953,29 @@ impl App {
 
             let row = &self.folder_tree[row_idx];
             match row {
+                FolderTreeRow::GlobalInbox => {
+                    let is_current = self.is_global_inbox;
+                    let marker = if is_current { "● " } else { "  " };
+                    let display = format!("{}All Inboxes", marker);
+                    let style = Style::default()
+                        .fg(theme::HELP_TITLE)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD);
+                    frame.render_widget(Paragraph::new(display).style(style), row_area);
+                }
+                FolderTreeRow::VirtualFolder { label } => {
+                    let is_current = self.virtual_folder.as_deref() == Some(label.as_str());
+                    let marker = if is_current { "● " } else { "  " };
+                    let icon = if label == "Drafts" { "✎ " } else { "➤ " };
+                    let display = format!("{}{}{}", marker, icon, label);
+                    let fg = if label == "Drafts" {
+                        theme::MODE_INDICATOR
+                    } else {
+                        theme::COMPOSE_FIELD_ACTIVE
+                    };
+                    let style = Style::default().fg(fg).bg(bg);
+                    frame.render_widget(Paragraph::new(display).style(style), row_area);
+                }
                 FolderTreeRow::Account { name } => {
                     let is_expanded = self.folder_tree_expanded.contains(name);
                     let arrow = if is_expanded { "▼ " } else { "▶ " };
@@ -2671,14 +3059,45 @@ impl App {
         let w = inner.width as usize;
         let label_w = 9; // "Subject: " length
 
-        // From (read-only, dim)
+        // From
         if y < inner.y + inner.height {
-            let line = Line::from(vec![
-                Span::styled("From:    ", Style::default().fg(theme::FG_DIM)),
-                Span::styled(&self.compose_from, Style::default().fg(theme::FG_DIM)),
-            ]);
+            let is_from_active = self.compose_field == ComposeField::From;
+            let has_multiple = self.compose_senders.len() > 1;
+            let label_style = if is_from_active {
+                Style::default().fg(theme::COMPOSE_FIELD_ACTIVE)
+            } else {
+                Style::default().fg(theme::FG_DIM)
+            };
+            let value_style = if is_from_active {
+                Style::default().fg(theme::COMPOSE_CURSOR)
+            } else {
+                Style::default().fg(theme::FG_DIM)
+            };
+            let mut spans = vec![
+                Span::styled("From:    ", label_style),
+                Span::styled(&self.compose_from, value_style),
+            ];
+            if has_multiple {
+                let indicator = format!(
+                    " [{}/{}]",
+                    self.compose_sender_index + 1,
+                    self.compose_senders.len()
+                );
+                if is_from_active {
+                    spans.push(Span::styled(
+                        indicator,
+                        Style::default().fg(theme::MODE_INDICATOR),
+                    ));
+                    spans.push(Span::styled(
+                        " ←→",
+                        Style::default().fg(theme::FG_DIM),
+                    ));
+                } else {
+                    spans.push(Span::styled(indicator, Style::default().fg(theme::FG_DIM)));
+                }
+            }
             frame.render_widget(
-                Paragraph::new(line).style(Style::default().bg(theme::BG)),
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG)),
                 Rect::new(inner.x, y, inner.width, 1),
             );
             y += 1;
@@ -3019,88 +3438,235 @@ impl App {
         }
     }
 
+    fn help_bindings(&self) -> Vec<(&str, &str)> {
+        match self.view {
+            ViewMode::FolderSelect => vec![
+                ("↑/↓", "Navigate folders"),
+                ("Tab", "Expand/collapse account"),
+                ("→/Enter", "Select folder"),
+                ("←/Esc", "Back to list"),
+                ("q", "Quit"),
+                ("?", "Toggle this help"),
+            ],
+            ViewMode::List => {
+                let mut keys = vec![
+                    ("↑/↓", "Navigate emails"),
+                    ("→/Enter", "Open email"),
+                    ("←", "Open folder selector"),
+                    ("PgUp/PgDn", "Page up/down"),
+                    ("Home/g", "Go to top"),
+                    ("End/G", "Go to bottom"),
+                ];
+                if self.thread_mode {
+                    keys.extend_from_slice(&[
+                        ("Tab/l", "Expand/collapse thread"),
+                        ("Space", "Jump to next thread"),
+                        ("Shift+Tab", "Jump to prev thread"),
+                        ("t", "Switch to flat view"),
+                    ]);
+                } else {
+                    keys.push(("t", "Switch to threaded view"));
+                }
+                keys.extend_from_slice(&[
+                    ("n", "Compose new email"),
+                    ("/", "Search"),
+                    ("F", "Folder selector"),
+                    ("q", "Quit"),
+                    ("?", "Toggle this help"),
+                ]);
+                keys
+            }
+            ViewMode::Detail => {
+                let mut keys = vec![];
+                match self.detail_mode {
+                    DetailMode::Text => {
+                        keys.extend_from_slice(&[
+                            ("←/Esc", "Back to list"),
+                            ("↑/↓", "Scroll"),
+                            ("Space/PgDn", "Page down"),
+                            ("PgUp", "Page up"),
+                            ("Home/End", "Top/bottom"),
+                            ("Shift+←", "Previous email"),
+                            ("Shift+→", "Next email"),
+                            ("Shift+PgUp", "Prev in thread"),
+                            ("Shift+PgDn", "Next in thread"),
+                        ]);
+                    }
+                    DetailMode::Attachments => {
+                        keys.extend_from_slice(&[
+                            ("Esc", "Back to text mode"),
+                            ("↑/↓/←/→", "Select attachment"),
+                            ("Enter", "Open with xdg-open"),
+                            ("s", "Save to ~/Downloads"),
+                        ]);
+                    }
+                    DetailMode::Links => {
+                        keys.extend_from_slice(&[
+                            ("Esc", "Back to text mode"),
+                            ("↑/↓/←/→", "Select link"),
+                            ("Enter", "Open in browser"),
+                        ]);
+                    }
+                }
+                keys.extend_from_slice(&[
+                    ("/", "Cycle mode (text/att/links)"),
+                    ("n", "Compose new email"),
+                    ("r", "Reply"),
+                    ("f", "Forward"),
+                    ("h", "Toggle raw headers"),
+                    ("v", "Open HTML in browser"),
+                    ("q", "Quit"),
+                    ("?", "Toggle this help"),
+                ]);
+                keys
+            }
+            ViewMode::Search => vec![
+                ("←/Esc", "Back to list"),
+                ("→/Enter", "Search / open result"),
+                ("↑/↓", "Navigate results"),
+                ("Backspace", "Delete character"),
+                ("?", "Toggle this help"),
+            ],
+            ViewMode::Compose => {
+                let mut keys = vec![
+                    ("Ctrl+Enter", "Send message"),
+                    ("Ctrl+S", "Save draft"),
+                    ("Esc", "Cancel compose"),
+                    ("Tab", "Next field"),
+                    ("Shift+Tab", "Previous field"),
+                    ("Ctrl+A", "Attach file"),
+                    ("Ctrl+D", "Remove last attachment"),
+                ];
+                if self.compose_senders.len() > 1 {
+                    keys.push(("←/→ on From", "Cycle sender identity"));
+                }
+                if self.compose_field == ComposeField::FileBrowser {
+                    keys.extend_from_slice(&[
+                        ("↑/↓", "Navigate files"),
+                        ("Enter", "Select file / enter dir"),
+                        ("Backspace", "Parent directory"),
+                        (".", "Toggle hidden files"),
+                    ]);
+                }
+                keys
+            }
+        }
+    }
+
+    fn render_help_overlay(&self, frame: &mut Frame, area: Rect) {
+        let bindings = self.help_bindings();
+        let max_key_w = bindings.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+        let max_desc_w = bindings.iter().map(|(_, d)| d.len()).max().unwrap_or(0);
+        let popup_w = (max_key_w + max_desc_w + 7).min(area.width as usize);
+        let popup_h = (bindings.len() + 2).min(area.height as usize);
+        let x = area.x + (area.width.saturating_sub(popup_w as u16)) / 2;
+        let y = area.y + (area.height.saturating_sub(popup_h as u16)) / 2;
+        let popup_area = Rect::new(x, y, popup_w as u16, popup_h as u16);
+
+        frame.render_widget(Clear, popup_area);
+
+        let title = match self.view {
+            ViewMode::FolderSelect => " Help: Folders ",
+            ViewMode::List => " Help: List ",
+            ViewMode::Detail => " Help: Detail ",
+            ViewMode::Search => " Help: Search ",
+            ViewMode::Compose => " Help: Compose ",
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::HELP_BORDER))
+            .title(title)
+            .title_style(
+                Style::default()
+                    .fg(theme::HELP_TITLE)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .style(Style::default().bg(theme::HELP_BG));
+        let inner = block.inner(popup_area);
+        frame.render_widget(block, popup_area);
+
+        let visible_height = inner.height as usize;
+        let scroll = self.help_scroll.min(bindings.len().saturating_sub(visible_height));
+
+        for (i, (key, desc)) in bindings.iter().enumerate().skip(scroll).take(visible_height) {
+            let row_y = inner.y + (i - scroll) as u16;
+            if row_y >= inner.y + inner.height {
+                break;
+            }
+            let padded_key = format!("{:>width$}", key, width = max_key_w);
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" {} ", padded_key),
+                    Style::default()
+                        .fg(theme::HELP_KEY)
+                        .bg(theme::HELP_BG)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {}", desc),
+                    Style::default().fg(theme::HELP_DESC).bg(theme::HELP_BG),
+                ),
+            ]);
+            frame.render_widget(
+                Paragraph::new(line),
+                Rect::new(inner.x, row_y, inner.width, 1),
+            );
+        }
+    }
+
+    fn spinner_prefix(&self) -> String {
+        if self.spinner_active {
+            let c = SPINNER_FRAMES[self.spinner_tick % SPINNER_FRAMES.len()];
+            format!("{} ", c)
+        } else {
+            String::new()
+        }
+    }
+
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
         let (keys, info) = match self.view {
             ViewMode::FolderSelect => (
-                vec![
-                    ("↑↓", "navigate"),
-                    ("Tab/Enter", "expand"),
-                    ("Enter", "select"),
-                    ("Esc", "back"),
-                    ("q", "quit"),
-                ],
+                vec![("?", "help")],
                 format!(" {}/{}", self.current_account, self.current_folder),
             ),
             ViewMode::List => {
-                let mut keys = vec![("↑↓", "navigate"), ("Enter", "open")];
-                if self.thread_mode {
-                    keys.push(("Space", "expand"));
-                    keys.push(("Tab", "next thread"));
-                    keys.push(("t", "flat"));
-                } else {
-                    keys.push(("t", "threaded"));
-                }
-                keys.push(("F", "folders"));
-                keys.push(("/", "search"));
-                keys.push(("q", "quit"));
+                let keys = vec![("?", "help")];
 
+                let status_display = if !self.status_msg.is_empty() {
+                    format!("{}{}", self.spinner_prefix(), self.status_msg)
+                } else if self.spinner_active {
+                    format!("{}syncing", self.spinner_prefix())
+                } else {
+                    "jamail".to_string()
+                };
+                let folder_label = if self.is_global_inbox {
+                    "All Inboxes".to_string()
+                } else if let Some(ref vf) = self.virtual_folder {
+                    vf.clone()
+                } else {
+                    format!("{}/{}", self.current_account, self.current_folder)
+                };
                 let info = if self.thread_mode {
                     let thread_count = self.threaded_view.threads.len();
                     format!(
-                        " {}/{}  {} threads, {} emails | {}",
-                        self.current_account,
-                        self.current_folder,
+                        " {}  {} threads, {} emails | {}",
+                        folder_label,
                         thread_count,
                         self.emails.len(),
-                        if self.status_msg.is_empty() {
-                            "jamail"
-                        } else {
-                            &self.status_msg
-                        }
+                        status_display,
                     )
                 } else {
                     format!(
-                        " {}/{}  {} emails | {}",
-                        self.current_account,
-                        self.current_folder,
+                        " {}  {} emails | {}",
+                        folder_label,
                         self.emails.len(),
-                        if self.status_msg.is_empty() {
-                            "jamail"
-                        } else {
-                            &self.status_msg
-                        }
+                        status_display,
                     )
                 };
                 (keys, info)
             }
             ViewMode::Detail => {
-                let esc_hint = if self.detail_mode != DetailMode::Text {
-                    "text"
-                } else {
-                    "back"
-                };
-                let mut keys: Vec<(&str, &str)> = vec![("Esc", esc_hint)];
-                match self.detail_mode {
-                    DetailMode::Text => {
-                        keys.push(("↑↓", "scroll"));
-                        keys.push(("←→", "prev/next"));
-                    }
-                    DetailMode::Attachments => {
-                        keys.push(("↑↓←→", "select"));
-                        keys.push(("s", "save"));
-                    }
-                    DetailMode::Links => {
-                        keys.push(("↑↓←→", "select"));
-                        keys.push(("Enter", "open"));
-                    }
-                }
-                if self.detail_thread_info().is_some() {
-                    keys.push(("n/p", "thread"));
-                }
-                keys.push(("/", "mode"));
-                keys.push(("h", "headers"));
-                keys.push(("v", "browser"));
-                keys.push(("q", "quit"));
+                let keys = vec![("?", "help")];
                 let info = if self.show_raw_headers {
                     " Raw headers".to_string()
                 } else {
@@ -3113,11 +3679,7 @@ impl App {
                 (keys, info)
             }
             ViewMode::Search => (
-                vec![
-                    ("Esc", "back"),
-                    ("Enter", "search/open"),
-                    ("↑↓", "navigate"),
-                ],
+                vec![("?", "help")],
                 format!(" {} results", self.search_results.len()),
             ),
             ViewMode::Compose => {
@@ -3131,9 +3693,15 @@ impl App {
                     ],
                     ComposeField::Body => vec![
                         ("C-Enter", "send"),
+                        ("C-s", "draft"),
                         ("C-a", "attach"),
                         ("C-d", "rm attach"),
                         ("S-Tab", "prev field"),
+                        ("Esc", "cancel"),
+                    ],
+                    ComposeField::From => vec![
+                        ("←→", "change sender"),
+                        ("Tab", "next"),
                         ("Esc", "cancel"),
                     ],
                     _ => vec![
@@ -3184,7 +3752,69 @@ impl App {
     }
 }
 
+fn generate_text_preview(data: &[u8], mime_type: &str, filename: &str) -> Option<String> {
+    use std::process::Command;
+
+    // Direct text display for text/* types
+    if mime_type.starts_with("text/") {
+        let text = String::from_utf8_lossy(data);
+        return Some(text.chars().take(5000).collect());
+    }
+
+    // For other types, write to temp file and try external tools
+    let tmp_path = format!("/tmp/jamail_preview_{}", std::process::id());
+    let tmp_file = format!("{}/{}", tmp_path, filename);
+    std::fs::create_dir_all(&tmp_path).ok()?;
+    std::fs::write(&tmp_file, data).ok()?;
+
+    let output = match mime_type {
+        "application/pdf" => Command::new("pdftotext")
+            .args(["-l", "3", &tmp_file, "-"])
+            .output()
+            .ok(),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        | "application/msword" => Command::new("pandoc")
+            .args(["--to", "plain", &tmp_file])
+            .output()
+            .ok()
+            .or_else(|| Command::new("docx2txt").arg(&tmp_file).output().ok()),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        | "application/vnd.ms-excel"
+        | "text/csv" => Command::new("pandoc")
+            .args(["--to", "plain", &tmp_file])
+            .output()
+            .ok(),
+        _ => None,
+    };
+
+    let _ = std::fs::remove_dir_all(&tmp_path);
+
+    output.and_then(|o| {
+        if o.status.success() {
+            let text = String::from_utf8_lossy(&o.stdout).into_owned();
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(text.chars().take(5000).collect())
+            }
+        } else {
+            None
+        }
+    })
+}
+
 /// Get the display name for a folder (last path component).
+fn parse_hex_color(hex: &str) -> Option<Color> {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color::Rgb(r, g, b))
+}
+
 fn folder_display_name(folder: &str) -> String {
     // Handle common delimiters: / and .
     if let Some(pos) = folder.rfind('/') {

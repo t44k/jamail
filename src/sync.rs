@@ -26,6 +26,7 @@ pub enum SyncEvent {
 pub struct SyncControl {
     pub current_folder: RwLock<String>,
     pub shutdown: AtomicBool,
+    pub force_reconnect: AtomicBool,
     pub folder_filter: RwLock<Vec<String>>,
     pub mark_seen_queue: Mutex<Vec<MarkSeenRequest>>,
 }
@@ -35,6 +36,7 @@ impl SyncControl {
         Self {
             current_folder: RwLock::new(initial_folder.to_string()),
             shutdown: AtomicBool::new(false),
+            force_reconnect: AtomicBool::new(false),
             folder_filter: RwLock::new(vec![initial_folder.to_string()]),
             mark_seen_queue: Mutex::new(Vec::new()),
         }
@@ -56,6 +58,8 @@ fn sync_loop(
     control: Arc<SyncControl>,
     tx: Sender<SyncEvent>,
 ) {
+    let mut quick_reconnect = false;
+
     loop {
         if control.shutdown.load(Ordering::Relaxed) {
             return;
@@ -208,6 +212,13 @@ fn sync_loop(
                 }
             }
 
+            // Check force_reconnect before IDLE
+            if control.force_reconnect.swap(false, Ordering::Relaxed) {
+                let _ = tx.send(SyncEvent::Error("Reconnecting after wake".to_string()));
+                quick_reconnect = true;
+                break;
+            }
+
             // SELECT the current folder for IDLE
             let current = control
                 .current_folder
@@ -221,10 +232,28 @@ fn sync_loop(
             }
 
             // IDLE waits for new mail or 60s timeout
+            let before_idle = std::time::Instant::now();
             client.wait_for_changes(Duration::from_secs(60));
+
+            // If IDLE returned after much longer than the timeout, sleep/wake likely occurred
+            if before_idle.elapsed() > Duration::from_secs(90) {
+                let _ = tx.send(SyncEvent::Error("Reconnecting after sleep".to_string()));
+                quick_reconnect = true;
+                break;
+            }
+
+            // Check force_reconnect after IDLE
+            if control.force_reconnect.swap(false, Ordering::Relaxed) {
+                let _ = tx.send(SyncEvent::Error("Reconnecting after wake".to_string()));
+                quick_reconnect = true;
+                break;
+            }
         }
 
-        // Connection lost — wait before reconnecting
-        thread::sleep(Duration::from_secs(5));
+        // Connection lost — wait before reconnecting (skip delay after wake detection)
+        if !quick_reconnect {
+            thread::sleep(Duration::from_secs(5));
+        }
+        quick_reconnect = false;
     }
 }

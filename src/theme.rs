@@ -47,12 +47,31 @@ pub const STATUS_BG: Color = Color::Rgb(30, 32, 44);
 pub const STATUS_FG: Color = Color::Rgb(140, 140, 160);
 pub const STATUS_KEY: Color = Color::Rgb(200, 160, 80);
 
+// Help overlay
+pub const HELP_BG: Color = Color::Rgb(28, 30, 42);
+pub const HELP_BORDER: Color = Color::Rgb(100, 140, 200);
+pub const HELP_KEY: Color = Color::Rgb(200, 160, 80);
+pub const HELP_DESC: Color = Color::Rgb(180, 180, 195);
+pub const HELP_TITLE: Color = Color::Rgb(130, 170, 255);
+
 // Compose view
 pub const COMPOSE_BORDER: Color = Color::Rgb(100, 140, 200);
 pub const COMPOSE_FIELD_ACTIVE: Color = Color::Rgb(80, 200, 120);
 pub const COMPOSE_CURSOR: Color = Color::Rgb(200, 200, 220);
 pub const COMPOSE_QUOTE: Color = Color::Rgb(100, 140, 180);
 pub const COMPOSE_DROPDOWN_BG: Color = Color::Rgb(35, 38, 52);
+
+// Account colors for global inbox
+pub const ACCOUNT_COLORS: &[Color] = &[
+    Color::Rgb(130, 170, 255), // Blue
+    Color::Rgb(200, 130, 255), // Purple
+    Color::Rgb(80, 200, 120),  // Green
+    Color::Rgb(255, 180, 80),  // Orange
+    Color::Rgb(255, 120, 120), // Red
+    Color::Rgb(100, 220, 220), // Cyan
+    Color::Rgb(255, 160, 200), // Pink
+    Color::Rgb(200, 200, 100), // Yellow
+];
 
 // Styles
 pub fn style_selected() -> Style {
