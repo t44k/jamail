@@ -617,28 +617,7 @@ fn mime_to_extension(mime: &str) -> &str {
 }
 
 pub fn html_to_text(html: &str) -> String {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    let mut child = match Command::new("w3m")
-        .args(["-T", "text/html", "-dump", "-cols", "120"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return strip_html_tags(html),
-    };
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(html.as_bytes());
-    }
-
-    match child.wait_with_output() {
-        Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
-        Err(_) => strip_html_tags(html),
-    }
+    html2text::from_read(html.as_bytes(), 120).unwrap_or_else(|_| strip_html_tags(html))
 }
 
 fn strip_html_tags(html: &str) -> String {
