@@ -14,9 +14,10 @@ use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
         MouseButton, MouseEventKind,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement},
 };
 use ratatui::prelude::*;
 use ratatui_image::picker::Picker;
@@ -71,11 +72,27 @@ fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+
+    // Enable keyboard enhancement if the terminal supports it (kitty protocol).
+    // This makes Ctrl+Enter distinguishable from plain Enter.
+    let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
+    if keyboard_enhanced {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        );
+    }
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     // Detect terminal graphics protocol for image previews
     let picker = Picker::from_query_stdio().ok();
+
+    // Create the persistent send queue (background worker thread).
+    let send_queue = smtp::SendQueue::new();
 
     // Run app
     let mut app = App::new(
@@ -85,6 +102,8 @@ fn main() -> Result<()> {
         default_name.clone(),
         current_folder,
     );
+    // Share the queue's counters with App so the status bar can read them.
+    app.send_counters = std::sync::Arc::clone(&send_queue.counters);
 
     // Populate cached folders
     if !cached_folders.is_empty() {
@@ -99,9 +118,13 @@ fn main() -> Result<()> {
         sync_rx,
         &sync_control,
         &accounts,
+        send_queue,
     );
 
     // Restore terminal
+    if keyboard_enhanced {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -125,6 +148,7 @@ fn run_app(
     sync_rx: mpsc::Receiver<sync::SyncEvent>,
     sync_control: &Arc<sync::SyncControl>,
     accounts: &[(String, config::JamailAccount)],
+    send_queue: smtp::SendQueue,
 ) -> Result<()> {
     // Track time between loop iterations to detect sleep/wake
     let mut last_loop_time = Instant::now();
@@ -203,24 +227,22 @@ fn run_app(
             }
         }
 
-        // Check for SMTP send result
-        if let Some(rx) = &app.send_result_rx
-            && let Ok(result) = rx.try_recv()
-        {
-            app.send_result_rx = None;
-            app.spinner_active = false;
-            match result {
-                Ok(draft_id) => {
+        // Drain completed send-queue results.
+        while let Ok(result) = send_queue.result_rx.try_recv() {
+            match result.error {
+                None => {
                     // Mark draft as sent in DB
-                    if let Some(id) = draft_id {
+                    if let Some(id) = result.draft_id {
                         let _ = db.mark_draft_sent(id);
                     }
-                    app.compose_draft_id = None;
-                    app.status_msg = "Message sent!".to_string();
-                    app.status_sticky = true;
-                    app.cleanup_forward_temps();
+                    app.last_send_error = None;
+                    if !app.status_sticky {
+                        app.status_msg = "Message sent!".to_string();
+                        app.status_sticky = true;
+                    }
                 }
-                Err(e) => {
+                Some(e) => {
+                    app.last_send_error = Some(e.clone());
                     app.status_msg = format!("Send failed: {}", e);
                     app.status_sticky = true;
                 }
@@ -370,6 +392,13 @@ fn run_app(
                             .size()
                             .map(|s| s.height.saturating_sub(2) as usize)
                             .unwrap_or(20);
+                        // Ctrl+D: delete selected draft (only in Drafts folder)
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('d')
+                            && app.virtual_folder.as_deref() == Some("Drafts")
+                        {
+                            app.delete_selected_draft(db);
+                        } else {
                         match key.code {
                             KeyCode::Char('q') => {
                                 app.should_quit = true;
@@ -400,6 +429,7 @@ fn run_app(
                             KeyCode::Char('n') => app.enter_compose_new(db),
                             _ => {}
                         }
+                        } // end Ctrl+D branch
                     }
                     ViewMode::Detail => {
                         let page = terminal
@@ -525,9 +555,9 @@ fn run_app(
                         let modifiers = key.modifiers;
                         let is_ctrl = modifiers.contains(KeyModifiers::CONTROL);
 
-                        // Ctrl+Enter to send
-                        if is_ctrl && key.code == KeyCode::Enter {
-                            handle_compose_send(app, db, accounts);
+                        // Ctrl+X to send (Ctrl+Enter is not reliably detectable on most terminals)
+                        if is_ctrl && key.code == KeyCode::Char('x') {
+                            handle_compose_send(app, db, accounts, &send_queue);
                             continue;
                         }
 
@@ -802,6 +832,7 @@ fn handle_compose_send(
     app: &mut App,
     db: &db::MailDb,
     accounts: &[(String, config::JamailAccount)],
+    send_queue: &smtp::SendQueue,
 ) {
     // Look up SMTP config for current account
     let smtp_config = accounts
@@ -847,26 +878,22 @@ fn handle_compose_send(
     app.save_compose_as_draft(db);
     let draft_id = app.compose_draft_id;
 
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = smtp::send_email(
-            &smtp_config,
-            &from,
-            &to,
-            &cc,
-            &bcc,
-            &subject,
-            &body,
-            &attachments,
-            reply_msg_id.as_deref(),
-            reply_refs.as_deref(),
-        );
-        let _ = tx.send(result.map(|_| draft_id).map_err(|e| e.to_string()));
+    send_queue.enqueue(smtp::SendJob {
+        smtp_config,
+        from,
+        to,
+        cc,
+        bcc,
+        subject,
+        body,
+        attachments,
+        in_reply_to: reply_msg_id,
+        references: reply_refs,
+        draft_id,
     });
 
-    app.send_result_rx = Some(rx);
-    app.spinner_active = true;
-    app.status_msg = "Sending...".to_string();
+    app.status_msg = "Queued for sending".to_string();
+    app.status_sticky = true;
     app.view = app.compose_previous_view.clone();
 }
 

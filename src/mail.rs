@@ -163,12 +163,15 @@ impl MailClient {
             return Ok(0);
         }
 
-        // Pre-filter UIDs already in the database
-        let uids_to_fetch: Vec<u32> = new_uids
+        // Pre-filter UIDs already in the database, sorted descending so the
+        // newest messages (highest UIDs) are fetched first.  This lets the UI
+        // show recent mail before the full history has been downloaded.
+        let mut uids_to_fetch: Vec<u32> = new_uids
             .iter()
             .copied()
             .filter(|&uid| !db.has_email(account, folder, uid))
             .collect();
+        uids_to_fetch.sort_unstable_by(|a, b| b.cmp(a)); // descending → newest first
 
         let total = new_uids.len();
         let mut fetched = 0;
@@ -224,10 +227,11 @@ impl MailClient {
                     }
                     // sub_processed dropped here — frees attachment data
                 }
-                // Update sync_state to the highest UID in this batch
-                if let Some(&max_uid) = chunk.iter().max() {
-                    db.set_sync_state(account, folder, server_uidvalidity, max_uid)?;
-                }
+                // Do NOT update sync_state here.  Because we process newest-first
+                // (highest UIDs first), writing chunk max into sync_state would
+                // record a high last_uid before older messages have been stored.
+                // On a crash the older messages would be permanently skipped.
+                // The final sync_state update below (after all batches) is safe.
                 Ok(batch_stored)
             })();
 

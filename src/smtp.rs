@@ -1,13 +1,113 @@
 use crate::config::SmtpConfig;
 use anyhow::{Context, Result};
-use lettre::message::{Mailbox, MultiPart, SinglePart, header::ContentType};
+use lettre::message::{header::ContentType, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
 
 pub struct ComposeAttachment {
     pub path: std::path::PathBuf,
     pub filename: String,
     pub size: u64,
+}
+
+/// A single queued outgoing email.
+pub struct SendJob {
+    pub smtp_config: SmtpConfig,
+    pub from: String,
+    pub to: String,
+    pub cc: String,
+    pub bcc: String,
+    pub subject: String,
+    pub body: String,
+    pub attachments: Vec<ComposeAttachment>,
+    pub in_reply_to: Option<String>,
+    pub references: Option<String>,
+    /// Draft ID to mark as sent on success.
+    pub draft_id: Option<i64>,
+}
+
+/// Result returned from the send worker for each completed job.
+pub struct SendResult {
+    pub draft_id: Option<i64>,
+    pub error: Option<String>,
+}
+
+/// Shared send-queue counters visible to the UI.
+pub struct SendCounters {
+    /// Number of messages currently in-flight or waiting.
+    pub pending: AtomicUsize,
+    /// Cumulative send errors since startup (never reset automatically).
+    pub errors: AtomicUsize,
+}
+
+impl SendCounters {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            pending: AtomicUsize::new(0),
+            errors: AtomicUsize::new(0),
+        })
+    }
+}
+
+/// A handle for enqueuing outgoing emails.
+///
+/// Spawns one background worker thread that processes jobs serially.
+/// Completed results are delivered via `result_rx`.
+pub struct SendQueue {
+    pub job_tx: mpsc::Sender<SendJob>,
+    pub result_rx: mpsc::Receiver<SendResult>,
+    pub counters: Arc<SendCounters>,
+}
+
+impl SendQueue {
+    pub fn new() -> Self {
+        let (job_tx, job_rx) = mpsc::channel::<SendJob>();
+        let (result_tx, result_rx) = mpsc::channel::<SendResult>();
+        let counters = SendCounters::new();
+        let counters_bg = Arc::clone(&counters);
+
+        std::thread::spawn(move || {
+            while let Ok(job) = job_rx.recv() {
+                let result = send_email(
+                    &job.smtp_config,
+                    &job.from,
+                    &job.to,
+                    &job.cc,
+                    &job.bcc,
+                    &job.subject,
+                    &job.body,
+                    &job.attachments,
+                    job.in_reply_to.as_deref(),
+                    job.references.as_deref(),
+                );
+                // Decrement pending regardless of outcome.
+                counters_bg.pending.fetch_sub(1, Ordering::Relaxed);
+                let error = result.err().map(|e| e.to_string());
+                if error.is_some() {
+                    counters_bg.errors.fetch_add(1, Ordering::Relaxed);
+                }
+                let _ = result_tx.send(SendResult {
+                    draft_id: job.draft_id,
+                    error,
+                });
+            }
+        });
+
+        Self {
+            job_tx,
+            result_rx,
+            counters,
+        }
+    }
+
+    /// Enqueue a send job. Increments `pending` before returning.
+    pub fn enqueue(&self, job: SendJob) {
+        self.counters.pending.fetch_add(1, Ordering::Relaxed);
+        let _ = self.job_tx.send(job);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

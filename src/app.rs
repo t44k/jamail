@@ -121,7 +121,10 @@ pub struct App {
     pub help_scroll: usize,
     pub spinner_active: bool,
     pub spinner_tick: usize,
-    pub send_result_rx: Option<std::sync::mpsc::Receiver<Result<Option<i64>, String>>>,
+    /// Shared counters from the send queue (pending + cumulative errors).
+    pub send_counters: std::sync::Arc<crate::smtp::SendCounters>,
+    /// Last send error message to show in status bar.
+    pub last_send_error: Option<String>,
     pub search_query: String,
     pub search_results: Vec<Email>,
     pub search_selected: usize,
@@ -228,7 +231,8 @@ impl App {
             help_scroll: 0,
             spinner_active: false,
             spinner_tick: 0,
-            send_result_rx: None,
+            send_counters: crate::smtp::SendCounters::new(),
+            last_send_error: None,
             search_query: String::new(),
             search_results: Vec::new(),
             search_selected: 0,
@@ -625,6 +629,32 @@ impl App {
         // Load known addresses for autocomplete
         if let Ok(addrs) = db.get_known_addresses() {
             self.compose_known_addresses = addrs;
+        }
+    }
+
+    pub fn delete_selected_draft(&mut self, db: &MailDb) {
+        if self.virtual_folder.as_deref() != Some("Drafts") {
+            return;
+        }
+        if self.selected >= self.local_messages.len() {
+            return;
+        }
+        let draft_id = self.local_messages[self.selected].id;
+        match db.delete_draft(draft_id) {
+            Ok(_) => {
+                self.status_msg = "Draft deleted".to_string();
+                self.status_sticky = true;
+                // Reload the drafts list
+                self.load_virtual_folder(db, "Drafts");
+                // Keep selection in bounds
+                if self.selected > 0 && self.selected >= self.local_messages.len() {
+                    self.selected = self.local_messages.len().saturating_sub(1);
+                }
+            }
+            Err(e) => {
+                self.status_msg = format!("Failed to delete draft: {}", e);
+                self.status_sticky = true;
+            }
         }
     }
 
@@ -3624,13 +3654,22 @@ impl App {
     }
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
+        use std::sync::atomic::Ordering;
+
+        let pending = self.send_counters.pending.load(Ordering::Relaxed);
+        let errors = self.send_counters.errors.load(Ordering::Relaxed);
+
         let (keys, info) = match self.view {
             ViewMode::FolderSelect => (
                 vec![("?", "help")],
                 format!(" {}/{}", self.current_account, self.current_folder),
             ),
             ViewMode::List => {
-                let keys = vec![("?", "help")];
+                let keys = if self.virtual_folder.as_deref() == Some("Drafts") {
+                    vec![("?", "help"), ("C-d", "delete draft")]
+                } else {
+                    vec![("?", "help")]
+                };
 
                 let status_display = if !self.status_msg.is_empty() {
                     format!("{}{}", self.spinner_prefix(), self.status_msg)
@@ -3692,7 +3731,7 @@ impl App {
                         ("Esc", "cancel"),
                     ],
                     ComposeField::Body => vec![
-                        ("C-Enter", "send"),
+                        ("C-x", "send"),
                         ("C-s", "draft"),
                         ("C-a", "attach"),
                         ("C-d", "rm attach"),
@@ -3705,7 +3744,7 @@ impl App {
                         ("Esc", "cancel"),
                     ],
                     _ => vec![
-                        ("C-Enter", "send"),
+                        ("C-x", "send"),
                         ("Tab", "next"),
                         ("S-Tab", "prev"),
                         ("C-a", "attach"),
@@ -3728,6 +3767,7 @@ impl App {
             }
         };
 
+        // Build left-side key-hint spans.
         let mut spans = Vec::new();
         for (i, (key, desc)) in keys.iter().enumerate() {
             if i > 0 {
@@ -3743,9 +3783,33 @@ impl App {
             ));
         }
 
+        // Build right-side send-queue indicator spans (may be empty).
+        let mut right_spans: Vec<Span> = Vec::new();
+        if pending > 0 {
+            right_spans.push(Span::styled(
+                format!(" ↑{} sending ", pending),
+                Style::default()
+                    .fg(theme::ATTACHMENT_COLOR)
+                    .bg(theme::BG_HEADER),
+            ));
+        }
+        if errors > 0 {
+            right_spans.push(Span::styled(
+                format!(" {}✗ ", errors),
+                Style::default()
+                    .fg(Color::Rgb(220, 60, 60))
+                    .bg(theme::BG_HEADER),
+            ));
+        }
+
         let keys_width: usize = spans.iter().map(|s| s.content.len()).sum();
-        let padding = (area.width as usize).saturating_sub(keys_width + info.len());
+        let right_indicator_width: usize = right_spans.iter().map(|s| s.content.len()).sum();
+        let info_len = info.len();
+        // Total right side = indicator + info; padding fills the gap.
+        let padding = (area.width as usize)
+            .saturating_sub(keys_width + right_indicator_width + info_len);
         spans.push(Span::styled(" ".repeat(padding), theme::style_status_bar()));
+        spans.extend(right_spans);
         spans.push(Span::styled(info, theme::style_status_bar()));
 
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
