@@ -24,6 +24,21 @@ cargo install --path .
 
 Requires Rust edition 2024 (nightly or stable 1.85+).
 
+### Build dependencies
+
+jamail links against the system OpenSSL (via `native-tls`, used for IMAP and SMTP TLS), so
+`pkg-config` and the OpenSSL development headers must be present before `cargo build`. On
+Debian/Ubuntu:
+
+```bash
+sudo apt-get install -y pkg-config libssl-dev
+```
+
+Equivalents: `sudo dnf install pkg-config openssl-devel` (Fedora/RHEL),
+`sudo pacman -S pkgconf openssl` (Arch), `sudo apk add pkgconf openssl-dev` (Alpine).
+Without them the build fails in `openssl-sys` with a "could not find system library
+'openssl'" error.
+
 ### Optional dependencies
 
 | Tool | Purpose | Without it |

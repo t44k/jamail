@@ -236,10 +236,10 @@ fn run_app(
                         let _ = db.mark_draft_sent(id);
                     }
                     app.last_send_error = None;
-                    if !app.status_sticky {
-                        app.status_msg = "Message sent!".to_string();
-                        app.status_sticky = true;
-                    }
+                    // Always overwrite: the sticky "Queued for sending" message set when
+                    // the job was enqueued must be replaced by the send outcome.
+                    app.status_msg = "Message sent!".to_string();
+                    app.status_sticky = true;
                 }
                 Some(e) => {
                     app.last_send_error = Some(e.clone());
