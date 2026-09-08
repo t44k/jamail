@@ -1,6 +1,6 @@
 use crate::db::{AttachmentMeta, MailDb};
 use crate::mail::{
-    Email, EmailContent, FolderInfo, normalize_subject, open_in_browser, relative_time,
+    Email, EmailContent, FolderInfo, normalize_subject, open_in_browser, open_url, relative_time,
 };
 use crate::smtp::ComposeAttachment;
 use crate::theme;
@@ -62,9 +62,19 @@ pub enum DetailMode {
     Links,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LinkKind {
+    Web,
+    Email,
+}
+
 pub struct LinkInfo {
+    /// Activation target: a full `https://...` URL for `Web`, or a bare
+    /// address (no `mailto:` prefix) for `Email`.
     pub url: String,
-    /// For <a href> tags: display as "LinkText [url]" instead of raw HTML
+    pub kind: LinkKind,
+    /// Shortened, human-readable label shown in the body in place of the raw match.
+    /// The full href is always preserved in `url`, never truncated.
     pub display_text: Option<String>,
     pub line: usize,
     pub col_start: usize,
@@ -1194,15 +1204,39 @@ impl App {
         }
     }
 
-    pub fn open_selected_link(&self) {
-        if let Some(link) = self.detail_links.get(self.selected_link) {
-            let _ = std::process::Command::new("xdg-open")
-                .arg(&link.url)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
+    pub fn open_selected_link(&mut self, db: &MailDb) {
+        let Some(link) = self.detail_links.get(self.selected_link) else {
+            return;
+        };
+        match link.kind {
+            LinkKind::Email => {
+                let address = link.url.clone();
+                self.enter_compose_new_with_to(db, &address);
+            }
+            LinkKind::Web => {
+                let url = link.url.clone();
+                match open_url(&url) {
+                    Ok(()) => {
+                        self.status_msg = format!("Opening {}", url);
+                    }
+                    Err(e) => {
+                        self.status_msg = format!("Failed to open: {}", e);
+                    }
+                }
+            }
         }
+    }
+
+    /// The full URL/address Ctrl+C should copy for the current detail view
+    /// state, or `None` if nothing link-related is selected (in which case
+    /// Ctrl+C is left as a no-op here, preserving prior behavior).
+    pub fn ctrl_c_copy_target(&self) -> Option<&str> {
+        if self.detail_mode == DetailMode::Attachments {
+            return None;
+        }
+        self.detail_links
+            .get(self.selected_link)
+            .map(|link| link.url.as_str())
     }
 
     pub fn prev_in_list(&mut self, db: &MailDb) {
@@ -1527,6 +1561,14 @@ impl App {
         self.compose_field = ComposeField::To;
         self.compose_known_addresses = db.get_known_addresses().unwrap_or_default();
         self.view = ViewMode::Compose;
+    }
+
+    /// Same as `enter_compose_new`, but with the To field prefilled (e.g. from
+    /// an activated email link) and focus moved past it to Subject.
+    pub fn enter_compose_new_with_to(&mut self, db: &MailDb, to: &str) {
+        self.enter_compose_new(db);
+        self.compose_to = to.to_string();
+        self.compose_field = ComposeField::Subject;
     }
 
     pub fn enter_reply(&mut self, db: &MailDb) {
@@ -2614,7 +2656,7 @@ impl App {
         self.selectable_area = inner;
         frame.render_widget(detail_block, area);
 
-        let show_link_preview = self.detail_mode == DetailMode::Links
+        let show_link_preview = self.detail_mode != DetailMode::Attachments
             && !self.detail_links.is_empty()
             && !self.show_raw_headers;
         let (body_inner, link_preview_area) = if show_link_preview {
@@ -3516,6 +3558,9 @@ impl App {
                             ("Space/PgDn", "Page down"),
                             ("PgUp", "Page up"),
                             ("Home/End", "Top/bottom"),
+                            ("Shift+↑/↓", "Select link"),
+                            ("Enter", "Open link / compose to address"),
+                            ("Ctrl+C", "Copy selected link/address"),
                             ("Shift+←", "Previous email"),
                             ("Shift+→", "Next email"),
                             ("Shift+PgUp", "Prev in thread"),
@@ -3534,7 +3579,8 @@ impl App {
                         keys.extend_from_slice(&[
                             ("Esc", "Back to text mode"),
                             ("↑/↓/←/→", "Select link"),
-                            ("Enter", "Open in browser"),
+                            ("Enter", "Open link / compose to address"),
+                            ("Ctrl+C", "Copy selected link/address"),
                         ]);
                     }
                 }
@@ -3933,6 +3979,19 @@ fn dedup_filename(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     dir.join(format!("{}.dup", name))
 }
 
+/// Max display width (in terminal columns) for a link label; the full URL is
+/// always kept in `LinkInfo.url` regardless of how short the label is.
+const LINK_LABEL_MAX_WIDTH: usize = 60;
+
+/// Collapses internal whitespace (anchor text can span wrapped HTML) and
+/// truncates to `max_width` display columns. Unicode-safe: truncation happens
+/// on `char` boundaries via `truncate_str`, so multi-byte/wide characters are
+/// never split.
+fn shorten_link_label(text: &str, max_width: usize) -> String {
+    let normalized: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_str(&normalized, max_width)
+}
+
 fn extract_links(text: &str) -> Vec<LinkInfo> {
     let re_anchor =
         Regex::new(r#"(?i)<a\s[^>]*?href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#).unwrap();
@@ -3943,6 +4002,12 @@ fn extract_links(text: &str) -> Vec<LinkInfo> {
     ).unwrap();
     let re_bare = Regex::new(
         r"\b(?:[a-zA-Z0-9](?:[-a-zA-Z0-9]*[a-zA-Z0-9])?\.)+(?:com|org|net|edu|gov|io|co|me|hu|de|uk|fr|nl|it|es|pl|se|no|fi|dk|at|ch|be|cz|sk|info|dev|app|xyz|ai|cc|tv|ru|jp|br|au|ca)\b(?:/[^\s<>\[\]()\x{0022}']*[^\s<>\[\]()\x{0022}'.,;:!?\-])?"
+    ).unwrap();
+    // Runs before re_bare (but after re_url/re_www) so "foo@example.com" claims
+    // its whole span before the bare-domain regex can carve out "example.com"
+    // alone and misclassify the address as a truncated web link.
+    let re_email = Regex::new(
+        r"\b[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+\b"
     ).unwrap();
 
     let overlaps = |start: usize, end: usize, ranges: &[(usize, usize)]| -> bool {
@@ -3957,19 +4022,39 @@ fn extract_links(text: &str) -> Vec<LinkInfo> {
             let full_match = caps.get(0).unwrap();
             let url_raw = caps[1].to_string();
             let link_text = caps[2].to_string();
-            if url_raw.starts_with("mailto:")
-                || url_raw.starts_with("tel:")
-                || url_raw.starts_with("javascript:")
-            {
-                continue;
-            }
-            let url = ensure_protocol(&url_raw);
-            let display = format!("{} [{}]", link_text.trim(), url);
             let start = full_match.start();
             let end = full_match.end();
+
+            if url_raw.starts_with("tel:") || url_raw.starts_with("javascript:") {
+                // Still mark the span used so a domain-like substring inside
+                // the href isn't picked up as a separate bare-URL/domain match below.
+                used_ranges.push((start, end));
+                continue;
+            }
+
+            let (kind, url) = if let Some(addr) = url_raw.strip_prefix("mailto:") {
+                let addr = addr.split('?').next().unwrap_or("").trim().to_string();
+                if addr.is_empty() || !addr.contains('@') {
+                    used_ranges.push((start, end));
+                    continue;
+                }
+                (LinkKind::Email, addr)
+            } else {
+                (LinkKind::Web, ensure_protocol(&url_raw))
+            };
+
+            let text_trimmed = link_text.trim();
+            let label =
+                if text_trimmed.is_empty() || text_trimmed == url_raw.trim() || text_trimmed == url
+                {
+                    shorten_link_label(&url, LINK_LABEL_MAX_WIDTH)
+                } else {
+                    shorten_link_label(text_trimmed, LINK_LABEL_MAX_WIDTH)
+                };
             links.push(LinkInfo {
                 url,
-                display_text: Some(display),
+                kind,
+                display_text: Some(label),
                 line: line_idx,
                 col_start: start,
                 col_end: end,
@@ -3979,9 +4064,12 @@ fn extract_links(text: &str) -> Vec<LinkInfo> {
 
         for m in re_url.find_iter(line_text) {
             if !overlaps(m.start(), m.end(), &used_ranges) {
+                let url = m.as_str().to_string();
+                let label = shorten_link_label(&url, LINK_LABEL_MAX_WIDTH);
                 links.push(LinkInfo {
-                    url: m.as_str().to_string(),
-                    display_text: None,
+                    url,
+                    kind: LinkKind::Web,
+                    display_text: Some(label),
                     line: line_idx,
                     col_start: m.start(),
                     col_end: m.end(),
@@ -3992,9 +4080,28 @@ fn extract_links(text: &str) -> Vec<LinkInfo> {
 
         for m in re_www.find_iter(line_text) {
             if !overlaps(m.start(), m.end(), &used_ranges) {
+                let raw = m.as_str();
+                let label = shorten_link_label(raw, LINK_LABEL_MAX_WIDTH);
                 links.push(LinkInfo {
-                    url: format!("https://{}", m.as_str()),
-                    display_text: None,
+                    url: format!("https://{}", raw),
+                    kind: LinkKind::Web,
+                    display_text: Some(label),
+                    line: line_idx,
+                    col_start: m.start(),
+                    col_end: m.end(),
+                });
+                used_ranges.push((m.start(), m.end()));
+            }
+        }
+
+        for m in re_email.find_iter(line_text) {
+            if !overlaps(m.start(), m.end(), &used_ranges) {
+                let addr = m.as_str().to_string();
+                let label = shorten_link_label(&addr, LINK_LABEL_MAX_WIDTH);
+                links.push(LinkInfo {
+                    url: addr,
+                    kind: LinkKind::Email,
+                    display_text: Some(label),
                     line: line_idx,
                     col_start: m.start(),
                     col_end: m.end(),
@@ -4005,9 +4112,12 @@ fn extract_links(text: &str) -> Vec<LinkInfo> {
 
         for m in re_bare.find_iter(line_text) {
             if !overlaps(m.start(), m.end(), &used_ranges) {
+                let raw = m.as_str();
+                let label = shorten_link_label(raw, LINK_LABEL_MAX_WIDTH);
                 links.push(LinkInfo {
-                    url: format!("https://{}", m.as_str()),
-                    display_text: None,
+                    url: format!("https://{}", raw),
+                    kind: LinkKind::Web,
+                    display_text: Some(label),
                     line: line_idx,
                     col_start: m.start(),
                     col_end: m.end(),
@@ -4064,7 +4174,7 @@ fn render_body_line<'a>(
             line_text[link.col_start.min(line_text.len())..link.col_end.min(line_text.len())]
                 .to_string()
         };
-        let style = if mode == DetailMode::Links && *link_global_idx == selected_link {
+        let style = if mode != DetailMode::Attachments && *link_global_idx == selected_link {
             theme::style_link_selected()
         } else {
             theme::style_link()
@@ -4114,4 +4224,350 @@ fn truncate_str(s: &str, max_width: usize) -> String {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    // --- shorten_link_label: readable labels, Unicode-safe, full URL untouched ---
+
+    #[test]
+    fn shorten_link_label_passes_short_text_through_unchanged() {
+        assert_eq!(shorten_link_label("example.com/x", 60), "example.com/x");
+    }
+
+    #[test]
+    fn shorten_link_label_collapses_internal_whitespace() {
+        assert_eq!(
+            shorten_link_label("click\n   here   please", 60),
+            "click here please"
+        );
+    }
+
+    #[test]
+    fn shorten_link_label_truncates_long_ascii_with_ellipsis() {
+        let long = "https://example.com/".to_string() + &"a".repeat(200);
+        let label = shorten_link_label(&long, 20);
+        assert!(UnicodeWidthStr::width(label.as_str()) <= 20);
+        assert!(label.ends_with('…'));
+        assert!(label.starts_with("https://"));
+    }
+
+    #[test]
+    fn shorten_link_label_truncates_wide_unicode_without_panicking() {
+        // CJK characters are double-width; naive byte truncation would panic
+        // or split a codepoint. Width-based truncation must stay within budget.
+        let text = "点击这里查看更多详情和完整的内容说明文字".repeat(3);
+        let label = shorten_link_label(&text, 20);
+        assert!(UnicodeWidthStr::width(label.as_str()) <= 20);
+        // Every char in the result must be a valid, whole character (String
+        // guarantees this, but assert it round-trips through chars() cleanly).
+        assert_eq!(label.chars().collect::<String>(), label);
+    }
+
+    #[test]
+    fn shorten_link_label_handles_emoji_and_combining_marks() {
+        let text = "🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀 rocket launch café".to_string();
+        let label = shorten_link_label(&text, 10);
+        assert!(UnicodeWidthStr::width(label.as_str()) <= 10);
+    }
+
+    // --- extract_links: label shortening + exact url retention ---
+
+    #[test]
+    fn anchor_link_uses_trimmed_text_as_label_not_url_suffix() {
+        let html = r#"<a href="https://example.com/very/long/path?x=1">Click here</a>"#;
+        let links = extract_links(html);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, "https://example.com/very/long/path?x=1");
+        let label = links[0].display_text.as_deref().unwrap();
+        assert_eq!(label, "Click here");
+        assert!(!label.contains('['));
+    }
+
+    #[test]
+    fn anchor_link_without_protocol_gets_https_prefix_in_url_only() {
+        let html = r#"<a href="example.com/signup">Sign up</a>"#;
+        let links = extract_links(html);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, "https://example.com/signup");
+        assert_eq!(links[0].display_text.as_deref(), Some("Sign up"));
+    }
+
+    #[test]
+    fn anchor_link_with_text_equal_to_href_falls_back_to_shortened_url() {
+        let long_url = "https://example.com/".to_string() + &"segment/".repeat(20);
+        let html = format!(r#"<a href="{0}">{0}</a>"#, long_url);
+        let links = extract_links(&html);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, long_url);
+        let label = links[0].display_text.as_deref().unwrap();
+        assert!(UnicodeWidthStr::width(label) <= LINK_LABEL_MAX_WIDTH);
+        assert!(label.starts_with("https://example.com"));
+    }
+
+    #[test]
+    fn anchor_link_suppresses_overlapping_bare_url_in_visible_text() {
+        // The anchor's visible text is itself a URL; the bare-URL regex would
+        // match it too, so this must produce exactly one link, not two.
+        let html = r#"<a href="https://example.com/path">https://example.com/path</a>"#;
+        let links = extract_links(html);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, "https://example.com/path");
+    }
+
+    #[test]
+    fn tel_and_javascript_hrefs_are_skipped_mailto_becomes_an_email_link() {
+        let html = r#"<a href="mailto:a@b.com">mail</a> <a href="tel:+123">call</a> <a href="javascript:alert(1)">js</a>"#;
+        let links = extract_links(html);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].kind, LinkKind::Email);
+        assert_eq!(links[0].url, "a@b.com");
+        assert_eq!(links[0].display_text.as_deref(), Some("mail"));
+    }
+
+    #[test]
+    fn bare_https_url_keeps_exact_url_with_shortened_label() {
+        let long_url = "https://example.com/path/to/".to_string() + &"x".repeat(100);
+        let text = format!("Check this out: {}", long_url);
+        let links = extract_links(&text);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, long_url);
+        let label = links[0].display_text.as_deref().unwrap();
+        assert!(UnicodeWidthStr::width(label) <= LINK_LABEL_MAX_WIDTH);
+    }
+
+    #[test]
+    fn www_link_gets_https_prefix_and_label_from_raw_match() {
+        let text = "visit www.example.com/promo for details";
+        let links = extract_links(text);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, "https://www.example.com/promo");
+        assert_eq!(
+            links[0].display_text.as_deref(),
+            Some("www.example.com/promo")
+        );
+    }
+
+    #[test]
+    fn bare_domain_link_gets_https_prefix() {
+        let text = "see example.com for more";
+        let links = extract_links(text);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, "https://example.com");
+    }
+
+    #[test]
+    fn links_are_sorted_deterministically_by_line_then_column() {
+        let text = "second https://b.com first https://a.com\nthird https://c.com";
+        let links = extract_links(text);
+        assert_eq!(links.len(), 3);
+        assert_eq!(links[0].url, "https://b.com");
+        assert_eq!(links[1].url, "https://a.com");
+        assert_eq!(links[2].url, "https://c.com");
+        assert_eq!(links[0].line, 0);
+        assert_eq!(links[1].line, 0);
+        assert!(links[0].col_start < links[1].col_start);
+        assert_eq!(links[2].line, 1);
+    }
+
+    // --- link navigation: deterministic wraparound (Shift+Up/Down plumbing) ---
+
+    fn test_link(url: &str) -> LinkInfo {
+        LinkInfo {
+            url: url.to_string(),
+            kind: LinkKind::Web,
+            display_text: Some(url.to_string()),
+            line: 0,
+            col_start: 0,
+            col_end: 0,
+        }
+    }
+
+    fn test_app() -> App {
+        App::new(vec![], None, vec![], String::new(), String::new())
+    }
+
+    #[test]
+    fn next_link_wraps_from_last_to_first() {
+        let mut app = test_app();
+        app.detail_links = vec![test_link("a"), test_link("b"), test_link("c")];
+        app.selected_link = 2;
+        app.next_link();
+        assert_eq!(app.selected_link, 0);
+    }
+
+    #[test]
+    fn prev_link_wraps_from_first_to_last() {
+        let mut app = test_app();
+        app.detail_links = vec![test_link("a"), test_link("b"), test_link("c")];
+        app.selected_link = 0;
+        app.prev_link();
+        assert_eq!(app.selected_link, 2);
+    }
+
+    #[test]
+    fn next_link_advances_to_the_correct_url_for_activation() {
+        let mut app = test_app();
+        app.detail_links = vec![test_link("a"), test_link("b"), test_link("c")];
+        app.selected_link = 0;
+        app.next_link();
+        assert_eq!(app.detail_links[app.selected_link].url, "b");
+        app.next_link();
+        assert_eq!(app.detail_links[app.selected_link].url, "c");
+    }
+
+    #[test]
+    fn link_navigation_on_empty_list_is_a_safe_no_op() {
+        let mut app = test_app();
+        assert!(app.detail_links.is_empty());
+        app.next_link();
+        assert_eq!(app.selected_link, 0);
+        app.prev_link();
+        assert_eq!(app.selected_link, 0);
+    }
+
+    // --- email link recognition: kind=Email, full address retained, low false-positive risk ---
+
+    fn test_email_link(address: &str) -> LinkInfo {
+        LinkInfo {
+            url: address.to_string(),
+            kind: LinkKind::Email,
+            display_text: Some(address.to_string()),
+            line: 0,
+            col_start: 0,
+            col_end: 0,
+        }
+    }
+
+    #[test]
+    fn bare_email_address_is_recognized_with_full_address_retained() {
+        let text = "Reach out to jane.doe+list@example.co.uk for details";
+        let links = extract_links(text);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].kind, LinkKind::Email);
+        assert_eq!(links[0].url, "jane.doe+list@example.co.uk");
+    }
+
+    #[test]
+    fn email_trailing_sentence_punctuation_is_excluded() {
+        let text = "Email me at foo@bar.com.";
+        let links = extract_links(text);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, "foo@bar.com");
+    }
+
+    #[test]
+    fn email_inside_a_url_is_not_double_counted() {
+        // The '@' lands inside a full URL match; the URL must win the whole
+        // span, not get split into a bare-domain link plus a separate email.
+        let text = "See http://user@example.com/path for the demo";
+        let links = extract_links(text);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].kind, LinkKind::Web);
+        assert_eq!(links[0].url, "http://user@example.com/path");
+    }
+
+    #[test]
+    fn at_mention_without_domain_is_not_misclassified_as_email() {
+        let text = "cc @alice and @bob on this";
+        let links = extract_links(text);
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn version_like_text_is_not_misclassified_as_email() {
+        let text = "build 1.2@3 failed";
+        let links = extract_links(text);
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn multiple_emails_and_a_url_are_all_recognized_and_ordered() {
+        let text = "a@b.com then https://example.com then c@d.org";
+        let links = extract_links(text);
+        assert_eq!(links.len(), 3);
+        assert_eq!(links[0].url, "a@b.com");
+        assert_eq!(links[0].kind, LinkKind::Email);
+        assert_eq!(links[1].url, "https://example.com");
+        assert_eq!(links[1].kind, LinkKind::Web);
+        assert_eq!(links[2].url, "c@d.org");
+        assert_eq!(links[2].kind, LinkKind::Email);
+    }
+
+    #[test]
+    fn mailto_href_strips_query_string_from_address() {
+        let html = r#"<a href="mailto:a@b.com?subject=Hi">email us</a>"#;
+        let links = extract_links(html);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].kind, LinkKind::Email);
+        assert_eq!(links[0].url, "a@b.com");
+    }
+
+    // --- Enter on a selected email link opens the composer, not a browser ---
+
+    #[test]
+    fn open_selected_link_on_email_kind_enters_compose_with_prefilled_to() {
+        let mut app = test_app();
+        let db = MailDb::open_in_memory().expect("in-memory db");
+        app.detail_links = vec![test_email_link("person@example.com")];
+        app.selected_link = 0;
+        app.open_selected_link(&db);
+        assert!(matches!(app.view, ViewMode::Compose));
+        assert_eq!(app.compose_to, "person@example.com");
+        assert!(matches!(app.compose_field, ComposeField::Subject));
+        assert!(matches!(app.compose_mode, ComposeMode::New));
+    }
+
+    #[test]
+    fn enter_compose_new_with_to_prefills_recipient_and_focuses_subject() {
+        let mut app = test_app();
+        let db = MailDb::open_in_memory().expect("in-memory db");
+        app.enter_compose_new_with_to(&db, "person@example.com");
+        assert!(matches!(app.view, ViewMode::Compose));
+        assert_eq!(app.compose_to, "person@example.com");
+        assert!(matches!(app.compose_field, ComposeField::Subject));
+    }
+
+    // --- Ctrl+C copies the full selected link target; non-link Ctrl+C stays inert ---
+
+    #[test]
+    fn ctrl_c_copy_target_returns_full_web_url_when_selected() {
+        let mut app = test_app();
+        app.detail_links = vec![test_link("https://example.com/very/long/path")];
+        app.selected_link = 0;
+        assert_eq!(
+            app.ctrl_c_copy_target(),
+            Some("https://example.com/very/long/path")
+        );
+    }
+
+    #[test]
+    fn ctrl_c_copy_target_returns_full_email_address_when_selected() {
+        let mut app = test_app();
+        app.detail_links = vec![test_email_link("person@example.com")];
+        app.selected_link = 0;
+        assert_eq!(app.ctrl_c_copy_target(), Some("person@example.com"));
+    }
+
+    #[test]
+    fn ctrl_c_copy_target_is_none_without_a_selected_link_regression() {
+        // Non-link content (e.g. a mouse-selected passage of body text) has
+        // its own copy path; the keyboard shortcut must stay a no-op here so
+        // that existing Ctrl+C-adjacent behavior is undisturbed.
+        let app = test_app();
+        assert!(app.detail_links.is_empty());
+        assert_eq!(app.ctrl_c_copy_target(), None);
+    }
+
+    #[test]
+    fn ctrl_c_copy_target_is_none_in_attachments_mode_even_with_links_present() {
+        let mut app = test_app();
+        app.detail_links = vec![test_link("https://example.com")];
+        app.selected_link = 0;
+        app.detail_mode = DetailMode::Attachments;
+        assert_eq!(app.ctrl_c_copy_target(), None);
+    }
 }

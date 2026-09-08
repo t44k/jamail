@@ -838,8 +838,17 @@ pub fn normalize_subject(subject: &str) -> String {
 pub fn open_in_browser(html: &str) -> Result<()> {
     let path = "/tmp/jamail_preview.html";
     std::fs::write(path, html).context("Failed to write HTML to /tmp")?;
+    open_url(path)
+}
+
+/// Opens a URL (or local path) with the user's default handler via `xdg-open`.
+/// Shared by link activation and `open_in_browser` so there is one xdg-open call site.
+pub fn open_url(url: &str) -> Result<()> {
     std::process::Command::new("xdg-open")
-        .arg(path)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .context("Failed to open browser")?;
     Ok(())

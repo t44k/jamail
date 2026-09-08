@@ -449,7 +449,13 @@ fn run_app(
                                 }
                             }
                             KeyCode::Down => match app.detail_mode {
-                                DetailMode::Text => app.scroll_detail_down(),
+                                DetailMode::Text => {
+                                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                        app.next_link();
+                                    } else {
+                                        app.scroll_detail_down();
+                                    }
+                                }
                                 DetailMode::Attachments => {
                                     app.next_attachment();
                                     app.update_image_preview(db);
@@ -457,7 +463,13 @@ fn run_app(
                                 DetailMode::Links => app.next_link(),
                             },
                             KeyCode::Up => match app.detail_mode {
-                                DetailMode::Text => app.scroll_detail_up(),
+                                DetailMode::Text => {
+                                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                        app.prev_link();
+                                    } else {
+                                        app.scroll_detail_up();
+                                    }
+                                }
                                 DetailMode::Attachments => {
                                     app.prev_attachment();
                                     app.update_image_preview(db);
@@ -494,9 +506,13 @@ fn run_app(
                                 DetailMode::Links => app.next_link(),
                             },
                             KeyCode::Enter => match app.detail_mode {
-                                DetailMode::Links => app.open_selected_link(),
+                                DetailMode::Links => app.open_selected_link(db),
                                 DetailMode::Attachments => app.open_attachment(db),
-                                DetailMode::Text => {}
+                                DetailMode::Text => {
+                                    if !app.detail_links.is_empty() {
+                                        app.open_selected_link(db);
+                                    }
+                                }
                             },
                             KeyCode::Char('s') => {
                                 if app.detail_mode == DetailMode::Attachments {
@@ -531,6 +547,13 @@ fn run_app(
                             KeyCode::Char('f') => app.enter_forward(db),
                             KeyCode::Char('h') => app.toggle_raw_headers(),
                             KeyCode::Char('v') => app.open_in_browser(),
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                if let Some(target) = app.ctrl_c_copy_target() {
+                                    let target = target.to_string();
+                                    copy_to_clipboard(&target);
+                                    app.status_msg = format!("Copied {}", target);
+                                }
+                            }
                             _ => {}
                         }
                     }

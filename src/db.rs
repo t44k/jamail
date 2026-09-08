@@ -167,6 +167,13 @@ impl MailDb {
         Ok(Self { conn })
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
+        create_schema(&conn)?;
+        Ok(Self { conn })
+    }
+
     pub fn begin_tx(&self) -> Result<()> {
         self.conn.execute_batch("BEGIN")?;
         Ok(())
