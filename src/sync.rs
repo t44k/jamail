@@ -13,6 +13,27 @@ pub struct MarkSeenRequest {
     pub uid: u32,
 }
 
+/// Which local-message flow an `UploadRequest` belongs to. Both share the
+/// same upload machinery (APPEND to a configured IMAP folder); the kind is
+/// only used to route the completion event back to the right UI state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadKind {
+    Sent,
+    Draft,
+}
+
+/// A request to APPEND a raw message to a remote folder — used for
+/// uploading a copy of a sent message, or a newly-saved draft, to the
+/// account's configured `sent_folder`/`draft_folder`.
+pub struct UploadRequest {
+    pub kind: UploadKind,
+    /// The `local_messages.id` this upload is for, so the result can be
+    /// applied back to the right row.
+    pub local_id: i64,
+    pub folder: String,
+    pub raw_message: Vec<u8>,
+}
+
 pub enum SyncEvent {
     Syncing(String),
     Progress(String, usize, usize),
@@ -21,6 +42,8 @@ pub enum SyncEvent {
     Error(String),
     FoldersLoaded(Vec<FolderInfo>),
     FlagsChanged(String),
+    UploadComplete(UploadKind, i64),
+    UploadError(UploadKind, i64, String),
 }
 
 pub struct SyncControl {
@@ -29,6 +52,7 @@ pub struct SyncControl {
     pub force_reconnect: AtomicBool,
     pub folder_filter: RwLock<Vec<String>>,
     pub mark_seen_queue: Mutex<Vec<MarkSeenRequest>>,
+    pub upload_queue: Mutex<Vec<UploadRequest>>,
 }
 
 impl SyncControl {
@@ -39,6 +63,7 @@ impl SyncControl {
             force_reconnect: AtomicBool::new(false),
             folder_filter: RwLock::new(vec![initial_folder.to_string()]),
             mark_seen_queue: Mutex::new(Vec::new()),
+            upload_queue: Mutex::new(Vec::new()),
         }
     }
 }
@@ -99,33 +124,25 @@ fn sync_loop(
             Ok(folders) => {
                 let _ = db.store_folders(&account_name, &folders);
 
-                // Apply folder filter from config, prioritizing INBOX first
-                let filtered: Vec<String> = if let Some(ref filter) = account.folders {
-                    // Use config ordering, keep only folders that exist on server
-                    let server_names: std::collections::HashSet<&str> =
-                        folders.iter().map(|f| f.name.as_str()).collect();
-                    filter
+                // Apply the account's configured folder order deterministically
+                // (see `mail::order_folders`); when unconfigured, skip Gmail's
+                // huge/duplicate special folders before falling back to the
+                // default INBOX-first alphabetical order.
+                let sync_source: Vec<FolderInfo> = if account.folders.is_none() {
+                    let skip = ["[Gmail]/All Mail", "[Gmail]/Spam", "[Gmail]/Important"];
+                    folders
                         .iter()
-                        .filter(|f| server_names.contains(f.as_str()))
+                        .filter(|f| !skip.contains(&f.name.as_str()))
                         .cloned()
                         .collect()
                 } else {
-                    // No explicit filter: skip [Gmail]/All Mail and [Gmail]/Spam
-                    // (they're huge and duplicate content from other folders)
-                    let skip = ["[Gmail]/All Mail", "[Gmail]/Spam", "[Gmail]/Important"];
-                    // Put INBOX first, then the rest alphabetically
-                    let mut names: Vec<String> = folders
-                        .iter()
-                        .map(|f| f.name.clone())
-                        .filter(|n| !skip.contains(&n.as_str()))
-                        .collect();
-                    names.sort();
-                    if let Some(pos) = names.iter().position(|n| n == "INBOX") {
-                        let inbox = names.remove(pos);
-                        names.insert(0, inbox);
-                    }
-                    names
+                    folders.clone()
                 };
+                let filtered: Vec<String> =
+                    crate::mail::order_folders(account.folders.as_deref(), &sync_source)
+                        .into_iter()
+                        .map(|f| f.name)
+                        .collect();
 
                 if let Ok(mut ff) = control.folder_filter.write() {
                     *ff = filtered;
@@ -207,6 +224,31 @@ fn sync_loop(
                         {
                             let _ =
                                 tx.send(SyncEvent::Error(format!("Mark seen {}: {}", folder, e)));
+                        }
+                    }
+                }
+            }
+
+            // Drain pending Sent/Draft uploads and APPEND them on the server.
+            if let Ok(mut queue) = control.upload_queue.lock() {
+                let requests: Vec<UploadRequest> = queue.drain(..).collect();
+                drop(queue);
+
+                for req in requests {
+                    let flags: &[imap::types::Flag<'_>] = match req.kind {
+                        UploadKind::Sent => &[imap::types::Flag::Seen],
+                        UploadKind::Draft => &[imap::types::Flag::Draft, imap::types::Flag::Seen],
+                    };
+                    match client.append_message(&req.folder, &req.raw_message, flags) {
+                        Ok(()) => {
+                            let _ = tx.send(SyncEvent::UploadComplete(req.kind, req.local_id));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(SyncEvent::UploadError(
+                                req.kind,
+                                req.local_id,
+                                e.to_string(),
+                            ));
                         }
                     }
                 }

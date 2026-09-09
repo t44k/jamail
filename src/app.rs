@@ -573,12 +573,13 @@ impl App {
                                 m.subject.clone()
                             },
                             date,
-                            is_unread: m.status == "draft",
+                            is_unread: m.status != crate::db::STATUS_SENT,
                             preview: truncate_str(&m.to_addr, 80),
                             message_id: String::new(),
                             in_reply_to: m.in_reply_to.clone(),
                             references: m.refs.clone(),
                             has_attachments: false,
+                            status_label: crate::db::local_message_status_label(m),
                         }
                     })
                     .collect();
@@ -668,10 +669,15 @@ impl App {
         }
     }
 
-    pub fn save_compose_as_draft(&mut self, db: &MailDb) {
+    /// Save the current compose state as a local draft. Returns `true` when
+    /// this created a brand-new draft row (as opposed to updating one that
+    /// already existed) — callers use this to decide whether to kick off a
+    /// remote Drafts-folder upload, which only happens once per draft.
+    pub fn save_compose_as_draft(&mut self, db: &MailDb) -> bool {
         let body = self.compose_body.join("\n");
         let in_reply_to = self.compose_reply_message_id.as_deref().unwrap_or("");
         let refs = self.compose_reply_references.as_deref().unwrap_or("");
+        let was_new = self.compose_draft_id.is_none();
 
         let result = if let Some(draft_id) = self.compose_draft_id {
             db.update_draft(
@@ -703,11 +709,109 @@ impl App {
                 self.compose_draft_id = Some(id);
                 self.status_msg = "Draft saved".to_string();
                 self.status_sticky = true;
+                was_new
             }
             Err(e) => {
                 self.status_msg = format!("Failed to save draft: {}", e);
                 self.status_sticky = true;
+                false
             }
+        }
+    }
+
+    /// If a remote `draft_folder` is configured for the current account,
+    /// mark the just-saved draft as pending upload and build the
+    /// `UploadRequest` for the sync thread to APPEND. Returns `None` when
+    /// the account has no draft folder configured (the default/disabled
+    /// state) or when there's no saved draft to upload yet.
+    pub fn enqueue_draft_upload(&self, db: &MailDb) -> Option<crate::sync::UploadRequest> {
+        let folder = self.current_draft_folder()?;
+        let id = self.compose_draft_id?;
+        let raw = crate::smtp::build_draft_raw(
+            &self.compose_from,
+            &self.compose_to,
+            &self.compose_cc,
+            &self.compose_bcc,
+            &self.compose_subject,
+            &self.compose_body_text(),
+        );
+        let _ = db.set_upload_pending(id);
+        Some(crate::sync::UploadRequest {
+            kind: crate::sync::UploadKind::Draft,
+            local_id: id,
+            folder,
+            raw_message: raw,
+        })
+    }
+
+    /// Apply the outcome of a completed background send job: update the
+    /// draft's local status (sent / send_error), refresh the visible
+    /// Drafts/Sent list if showing one, and set the global status message.
+    /// Returns an `UploadRequest` to enqueue on the sync thread when the
+    /// account is configured with a `sent_folder`.
+    pub fn handle_send_result(
+        &mut self,
+        db: &MailDb,
+        result: crate::smtp::SendResult,
+    ) -> Option<crate::sync::UploadRequest> {
+        let mut upload = None;
+        match result.error {
+            None => {
+                if let Some(id) = result.draft_id {
+                    let _ = db.mark_draft_sent(id);
+                    if let Some(folder) = result.sent_folder {
+                        let _ = db.set_upload_pending(id);
+                        upload = Some(crate::sync::UploadRequest {
+                            kind: crate::sync::UploadKind::Sent,
+                            local_id: id,
+                            folder,
+                            raw_message: result.raw_message.unwrap_or_default(),
+                        });
+                    }
+                }
+                self.last_send_error = None;
+                // Always overwrite: the sticky "Queued for sending" message set
+                // when the job was enqueued must be replaced by the outcome.
+                self.status_msg = "Message sent!".to_string();
+                self.status_sticky = true;
+            }
+            Some(e) => {
+                if let Some(id) = result.draft_id {
+                    let _ = db.mark_draft_send_error(id, &e);
+                }
+                self.last_send_error = Some(e.clone());
+                self.status_msg = format!("Send failed: {}", e);
+                self.status_sticky = true;
+            }
+        }
+        self.refresh_virtual_folder_if_shown(db);
+        upload
+    }
+
+    /// Apply the outcome of a completed Sent/Draft folder upload (from the
+    /// sync thread's `UploadComplete`/`UploadError` events) to the local
+    /// message's upload status, and refresh the visible list if needed.
+    pub fn handle_upload_event(
+        &mut self,
+        db: &MailDb,
+        _kind: crate::sync::UploadKind,
+        local_id: i64,
+        error: Option<String>,
+    ) {
+        match error {
+            None => {
+                let _ = db.set_upload_success(local_id);
+            }
+            Some(e) => {
+                let _ = db.set_upload_error(local_id, &e);
+            }
+        }
+        self.refresh_virtual_folder_if_shown(db);
+    }
+
+    fn refresh_virtual_folder_if_shown(&mut self, db: &MailDb) {
+        if let Some(vf) = self.virtual_folder.clone() {
+            self.load_virtual_folder(db, &vf);
         }
     }
 
@@ -1383,14 +1487,18 @@ impl App {
         if self.accounts.len() > 1 {
             self.folder_tree.push(FolderTreeRow::GlobalInbox);
         }
-        for (name, _account) in &self.accounts {
+        for (name, account) in &self.accounts {
             self.folder_tree
                 .push(FolderTreeRow::Account { name: name.clone() });
             if self.folder_tree_expanded.contains(name) {
-                let folders = self.account_folders.get(name).cloned().unwrap_or_default();
-                if folders.is_empty() {
+                let raw = self.account_folders.get(name).cloned().unwrap_or_default();
+                if raw.is_empty() {
                     self.folder_tree.push(FolderTreeRow::Loading);
                 } else {
+                    // Deterministic order: the account's configured `folders`
+                    // list (if any), else INBOX-first alphabetical — matches
+                    // what the sync thread actually syncs, in the same order.
+                    let folders = crate::mail::order_folders(account.folders.as_deref(), &raw);
                     for folder in folders {
                         self.folder_tree.push(FolderTreeRow::Folder {
                             account_name: name.clone(),
@@ -1414,7 +1522,10 @@ impl App {
                     }
                     self.rebuild_folder_tree();
                 }
-                FolderTreeRow::GlobalInbox | FolderTreeRow::VirtualFolder { .. } | FolderTreeRow::Folder { .. } | FolderTreeRow::Loading => {}
+                FolderTreeRow::GlobalInbox
+                | FolderTreeRow::VirtualFolder { .. }
+                | FolderTreeRow::Folder { .. }
+                | FolderTreeRow::Loading => {}
             }
         }
     }
@@ -1425,9 +1536,7 @@ impl App {
     pub fn folder_tree_select(&mut self) -> Option<(String, String)> {
         if let Some(row) = self.folder_tree.get(self.folder_tree_selected) {
             match row {
-                FolderTreeRow::GlobalInbox => {
-                    Some(("*global*".to_string(), "INBOX".to_string()))
-                }
+                FolderTreeRow::GlobalInbox => Some(("*global*".to_string(), "INBOX".to_string())),
                 FolderTreeRow::VirtualFolder { label } => {
                     Some(("*virtual*".to_string(), label.clone()))
                 }
@@ -1529,6 +1638,46 @@ impl App {
             self.compose_sender_index -= 1;
         }
         self.compose_from = self.compose_senders[self.compose_sender_index].clone();
+    }
+
+    /// Whether `compose_from` is one of the account's configured sender
+    /// identities. The From field can only ever be *set* by cycling through
+    /// `compose_senders`, but this is checked again right before enqueueing
+    /// a send so a stale/corrupted compose state can never dispatch mail
+    /// from an address the account isn't configured to send as.
+    pub fn compose_from_is_valid(&self) -> bool {
+        self.compose_senders.iter().any(|s| s == &self.compose_from)
+    }
+
+    fn current_account_config(&self) -> Option<&crate::config::JamailAccount> {
+        self.accounts
+            .iter()
+            .find(|(n, _)| n == &self.current_account)
+            .map(|(_, a)| a)
+    }
+
+    /// The current account's configured remote Sent-folder upload
+    /// destination, or `None` when uploading is disabled (unset, the
+    /// default).
+    pub fn current_sent_folder(&self) -> Option<String> {
+        self.current_account_config()
+            .and_then(|a| a.sent_folder.clone())
+    }
+
+    /// The current account's configured remote Drafts-folder upload
+    /// destination, or `None` when uploading is disabled (unset, the
+    /// default).
+    pub fn current_draft_folder(&self) -> Option<String> {
+        self.current_account_config()
+            .and_then(|a| a.draft_folder.clone())
+    }
+
+    /// Whether new mail arriving in `folder` should trigger a desktop
+    /// notification for the current account.
+    pub fn should_notify_for_folder(&self, folder: &str) -> bool {
+        self.current_account_config()
+            .map(|a| crate::notify::should_notify(a.notify_folders.as_deref(), folder))
+            .unwrap_or(false)
     }
 
     fn clear_compose(&mut self) {
@@ -2346,6 +2495,14 @@ impl App {
             Span::styled(exact_time, theme::style_time_exact().bg(bg)),
         ]);
 
+        if let Some(label) = &thread.newest_status_label {
+            spans.push(Span::styled("  ", Style::default().bg(bg)));
+            spans.push(Span::styled(
+                label.clone(),
+                theme::style_status_label(label).bg(bg),
+            ));
+        }
+
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
@@ -2392,7 +2549,7 @@ impl App {
         let rel_time = format!("{:>width$}", rel_time, width = rel_time_w);
         let exact_time = format!("{:>width$}", exact_time, width = exact_time_w);
 
-        let spans = vec![
+        let mut spans = vec![
             Span::styled(
                 unread_marker,
                 if email.is_unread {
@@ -2424,6 +2581,14 @@ impl App {
             Span::styled(" ", Style::default().bg(bg)),
             Span::styled(exact_time, theme::style_time_exact().bg(bg)),
         ];
+
+        if let Some(label) = &email.status_label {
+            spans.push(Span::styled("  ", Style::default().bg(bg)));
+            spans.push(Span::styled(
+                label.clone(),
+                theme::style_status_label(label).bg(bg),
+            ));
+        }
 
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
@@ -2511,6 +2676,17 @@ impl App {
             Span::styled(" ", Style::default().bg(bg)),
             Span::styled(exact_time, theme::style_time_exact().bg(bg)),
         ]);
+
+        // In-flight/error indicator for local Drafts/Sent rows (never set on
+        // real IMAP-synced emails) so a sending/uploading message — or one
+        // that failed — never silently disappears from the list.
+        if let Some(label) = &email.status_label {
+            spans.push(Span::styled("  ", Style::default().bg(bg)));
+            spans.push(Span::styled(
+                label.clone(),
+                theme::style_status_label(label).bg(bg),
+            ));
+        }
 
         let line = Line::from(spans);
         frame.render_widget(Paragraph::new(line), area);
@@ -2834,9 +3010,7 @@ impl App {
                         ));
                     }
                 }
-                if show_text_preview
-                    && let Some(preview_text) = &self.text_preview
-                {
+                if show_text_preview && let Some(preview_text) = &self.text_preview {
                     lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
                         "── Preview ──",
@@ -3160,10 +3334,7 @@ impl App {
                         indicator,
                         Style::default().fg(theme::MODE_INDICATOR),
                     ));
-                    spans.push(Span::styled(
-                        " ←→",
-                        Style::default().fg(theme::FG_DIM),
-                    ));
+                    spans.push(Span::styled(" ←→", Style::default().fg(theme::FG_DIM)));
                 } else {
                     spans.push(Span::styled(indicator, Style::default().fg(theme::FG_DIM)));
                 }
@@ -3662,9 +3833,16 @@ impl App {
         frame.render_widget(block, popup_area);
 
         let visible_height = inner.height as usize;
-        let scroll = self.help_scroll.min(bindings.len().saturating_sub(visible_height));
+        let scroll = self
+            .help_scroll
+            .min(bindings.len().saturating_sub(visible_height));
 
-        for (i, (key, desc)) in bindings.iter().enumerate().skip(scroll).take(visible_height) {
+        for (i, (key, desc)) in bindings
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(visible_height)
+        {
             let row_y = inner.y + (i - scroll) as u16;
             if row_y >= inner.y + inner.height {
                 break;
@@ -3784,11 +3962,9 @@ impl App {
                         ("S-Tab", "prev field"),
                         ("Esc", "cancel"),
                     ],
-                    ComposeField::From => vec![
-                        ("←→", "change sender"),
-                        ("Tab", "next"),
-                        ("Esc", "cancel"),
-                    ],
+                    ComposeField::From => {
+                        vec![("←→", "change sender"), ("Tab", "next"), ("Esc", "cancel")]
+                    }
                     _ => vec![
                         ("C-x", "send"),
                         ("Tab", "next"),
@@ -3852,8 +4028,8 @@ impl App {
         let right_indicator_width: usize = right_spans.iter().map(|s| s.content.len()).sum();
         let info_len = info.len();
         // Total right side = indicator + info; padding fills the gap.
-        let padding = (area.width as usize)
-            .saturating_sub(keys_width + right_indicator_width + info_len);
+        let padding =
+            (area.width as usize).saturating_sub(keys_width + right_indicator_width + info_len);
         spans.push(Span::styled(" ".repeat(padding), theme::style_status_bar()));
         spans.extend(right_spans);
         spans.push(Span::styled(info, theme::style_status_bar()));
@@ -4569,5 +4745,345 @@ mod tests {
         app.selected_link = 0;
         app.detail_mode = DetailMode::Attachments;
         assert_eq!(app.ctrl_c_copy_target(), None);
+    }
+
+    // --- multiple sender addresses: config-driven, cycled, validated at send time ---
+
+    fn test_imap_config() -> crate::config::ImapConfig {
+        crate::config::ImapConfig {
+            host: "imap.example.com".to_string(),
+            port: 993,
+            login: "alice@example.com".to_string(),
+            auth: crate::config::AuthConfig {
+                auth_type: "password".to_string(),
+                value: "secret".to_string(),
+            },
+        }
+    }
+
+    fn test_account(email: &str) -> crate::config::JamailAccount {
+        crate::config::JamailAccount {
+            default: false,
+            email: email.to_string(),
+            display_name: None,
+            imap: test_imap_config(),
+            smtp: None,
+            folders: None,
+            senders: None,
+            sent_folder: None,
+            draft_folder: None,
+            notify_folders: None,
+            color: None,
+        }
+    }
+
+    fn app_with_account(account: crate::config::JamailAccount) -> App {
+        let mut app = App::new(
+            vec![],
+            None,
+            vec![("personal".to_string(), account)],
+            "personal".to_string(),
+            "INBOX".to_string(),
+        );
+        app.current_account = "personal".to_string();
+        app
+    }
+
+    #[test]
+    fn build_sender_list_falls_back_to_single_identity_without_senders_config() {
+        let mut acc = test_account("alice@example.com");
+        acc.display_name = Some("Alice Smith".to_string());
+        let mut app = app_with_account(acc);
+        let db = MailDb::open_in_memory().unwrap();
+        app.enter_compose_new(&db);
+        assert_eq!(app.compose_senders, vec!["Alice Smith <alice@example.com>"]);
+        assert_eq!(app.compose_from, "Alice Smith <alice@example.com>");
+    }
+
+    #[test]
+    fn build_sender_list_uses_configured_senders_when_present() {
+        let mut acc = test_account("alice@corp.com");
+        acc.senders = Some(vec![
+            "Alice Smith <alice@corp.com>".to_string(),
+            "Alice (Support) <support@corp.com>".to_string(),
+        ]);
+        let mut app = app_with_account(acc);
+        let db = MailDb::open_in_memory().unwrap();
+        app.enter_compose_new(&db);
+        assert_eq!(
+            app.compose_senders,
+            vec![
+                "Alice Smith <alice@corp.com>".to_string(),
+                "Alice (Support) <support@corp.com>".to_string(),
+            ]
+        );
+        assert_eq!(app.compose_from, "Alice Smith <alice@corp.com>");
+    }
+
+    #[test]
+    fn cycle_sender_forward_and_backward_wrap_around() {
+        let mut acc = test_account("alice@corp.com");
+        acc.senders = Some(vec!["a@corp.com".to_string(), "b@corp.com".to_string()]);
+        let mut app = app_with_account(acc);
+        let db = MailDb::open_in_memory().unwrap();
+        app.enter_compose_new(&db);
+        assert_eq!(app.compose_from, "a@corp.com");
+
+        app.cycle_sender_forward();
+        assert_eq!(app.compose_from, "b@corp.com");
+        app.cycle_sender_forward();
+        assert_eq!(app.compose_from, "a@corp.com"); // wrapped
+
+        app.cycle_sender_backward();
+        assert_eq!(app.compose_from, "b@corp.com"); // wrapped the other way
+    }
+
+    #[test]
+    fn compose_from_is_valid_checks_against_configured_senders() {
+        let mut acc = test_account("alice@corp.com");
+        acc.senders = Some(vec!["a@corp.com".to_string(), "b@corp.com".to_string()]);
+        let mut app = app_with_account(acc);
+        let db = MailDb::open_in_memory().unwrap();
+        app.enter_compose_new(&db);
+        assert!(app.compose_from_is_valid());
+
+        app.compose_from = "attacker@evil.com".to_string();
+        assert!(!app.compose_from_is_valid());
+    }
+
+    // --- deterministic per-account folder display order ---
+
+    fn folder_info(name: &str) -> FolderInfo {
+        FolderInfo {
+            name: name.to_string(),
+            delimiter: "/".to_string(),
+        }
+    }
+
+    #[test]
+    fn folder_tree_respects_configured_order_over_raw_cache_order() {
+        let mut acc = test_account("alice@corp.com");
+        acc.folders = Some(vec!["Sent".to_string(), "INBOX".to_string()]);
+        let mut app = app_with_account(acc);
+        app.account_folders.insert(
+            "personal".to_string(),
+            vec![
+                folder_info("INBOX"),
+                folder_info("Archive"),
+                folder_info("Sent"),
+            ],
+        );
+        app.folder_tree_expanded.insert("personal".to_string());
+        app.rebuild_folder_tree();
+
+        let names: Vec<String> = app
+            .folder_tree
+            .iter()
+            .filter_map(|row| match row {
+                FolderTreeRow::Folder { folder, .. } => Some(folder.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["Sent", "INBOX"]);
+    }
+
+    #[test]
+    fn folder_tree_defaults_to_inbox_first_alphabetical_when_unconfigured() {
+        let acc = test_account("alice@corp.com");
+        let mut app = app_with_account(acc);
+        app.account_folders.insert(
+            "personal".to_string(),
+            vec![
+                folder_info("Zeta"),
+                folder_info("Archive"),
+                folder_info("INBOX"),
+            ],
+        );
+        app.folder_tree_expanded.insert("personal".to_string());
+        app.rebuild_folder_tree();
+
+        let names: Vec<String> = app
+            .folder_tree
+            .iter()
+            .filter_map(|row| match row {
+                FolderTreeRow::Folder { folder, .. } => Some(folder.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["INBOX", "Archive", "Zeta"]);
+    }
+
+    // --- remote sent/draft upload folders: explicit unset/disabled behavior ---
+
+    #[test]
+    fn current_sent_and_draft_folders_are_none_when_unconfigured() {
+        let app = app_with_account(test_account("alice@corp.com"));
+        assert_eq!(app.current_sent_folder(), None);
+        assert_eq!(app.current_draft_folder(), None);
+    }
+
+    #[test]
+    fn current_sent_and_draft_folders_are_independently_readable() {
+        let mut acc = test_account("alice@corp.com");
+        acc.sent_folder = Some("Sent".to_string());
+        let app = app_with_account(acc);
+        assert_eq!(app.current_sent_folder(), Some("Sent".to_string()));
+        assert_eq!(app.current_draft_folder(), None);
+    }
+
+    #[test]
+    fn enqueue_draft_upload_is_disabled_by_default() {
+        let app = app_with_account(test_account("alice@corp.com"));
+        let db = MailDb::open_in_memory().unwrap();
+        assert!(app.enqueue_draft_upload(&db).is_none());
+    }
+
+    #[test]
+    fn enqueue_draft_upload_builds_request_and_marks_pending_when_configured() {
+        let mut acc = test_account("alice@corp.com");
+        acc.draft_folder = Some("Drafts".to_string());
+        let mut app = app_with_account(acc);
+        let db = MailDb::open_in_memory().unwrap();
+        app.enter_compose_new(&db);
+        app.compose_to = "bob@example.com".to_string();
+        app.compose_subject = "Hi".to_string();
+        app.save_compose_as_draft(&db);
+
+        let upload = app.enqueue_draft_upload(&db).expect("upload request");
+        assert_eq!(upload.folder, "Drafts");
+        assert_eq!(upload.local_id, app.compose_draft_id.unwrap());
+        assert!(matches!(upload.kind, crate::sync::UploadKind::Draft));
+        let raw = String::from_utf8(upload.raw_message).unwrap();
+        assert!(raw.contains("To: bob@example.com"));
+
+        let draft = db
+            .get_draft(app.compose_draft_id.unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(draft.upload_status, crate::db::UPLOAD_PENDING);
+    }
+
+    // --- async send/upload state transitions ---
+
+    fn saved_draft_id(app: &mut App, db: &MailDb) -> i64 {
+        app.enter_compose_new(db);
+        app.compose_to = "bob@example.com".to_string();
+        app.save_compose_as_draft(db);
+        app.compose_draft_id.unwrap()
+    }
+
+    #[test]
+    fn handle_send_result_success_marks_sent_and_skips_upload_when_unconfigured() {
+        let mut app = app_with_account(test_account("alice@corp.com"));
+        let db = MailDb::open_in_memory().unwrap();
+        let id = saved_draft_id(&mut app, &db);
+
+        let upload = app.handle_send_result(
+            &db,
+            crate::smtp::SendResult {
+                draft_id: Some(id),
+                error: None,
+                sent_folder: None,
+                raw_message: Some(b"raw".to_vec()),
+            },
+        );
+        assert!(upload.is_none());
+        let sent = db.get_sent("personal").unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].id, id);
+        assert_eq!(app.status_msg, "Message sent!");
+    }
+
+    #[test]
+    fn handle_send_result_success_enqueues_upload_when_sent_folder_configured() {
+        let mut app = app_with_account(test_account("alice@corp.com"));
+        let db = MailDb::open_in_memory().unwrap();
+        let id = saved_draft_id(&mut app, &db);
+
+        let upload = app
+            .handle_send_result(
+                &db,
+                crate::smtp::SendResult {
+                    draft_id: Some(id),
+                    error: None,
+                    sent_folder: Some("Sent".to_string()),
+                    raw_message: Some(b"raw-bytes".to_vec()),
+                },
+            )
+            .expect("upload request");
+        assert_eq!(upload.folder, "Sent");
+        assert_eq!(upload.local_id, id);
+        assert_eq!(upload.raw_message, b"raw-bytes".to_vec());
+        assert!(matches!(upload.kind, crate::sync::UploadKind::Sent));
+
+        let sent = db.get_sent("personal").unwrap();
+        assert_eq!(sent[0].upload_status, crate::db::UPLOAD_PENDING);
+    }
+
+    #[test]
+    fn handle_send_result_failure_keeps_draft_visible_with_error_not_silently_dropped() {
+        let mut app = app_with_account(test_account("alice@corp.com"));
+        let db = MailDb::open_in_memory().unwrap();
+        let id = saved_draft_id(&mut app, &db);
+
+        let upload = app.handle_send_result(
+            &db,
+            crate::smtp::SendResult {
+                draft_id: Some(id),
+                error: Some("connection refused".to_string()),
+                sent_folder: Some("Sent".to_string()),
+                raw_message: None,
+            },
+        );
+        assert!(upload.is_none());
+        // Still appears in Drafts — not silently dropped — with the error attached.
+        let drafts = db.get_drafts("personal").unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].status, crate::db::STATUS_SEND_ERROR);
+        assert_eq!(drafts[0].error.as_deref(), Some("connection refused"));
+        assert!(app.status_msg.contains("connection refused"));
+    }
+
+    #[test]
+    fn handle_upload_event_success_and_error_update_upload_status() {
+        let mut app = app_with_account(test_account("alice@corp.com"));
+        let db = MailDb::open_in_memory().unwrap();
+        let id = saved_draft_id(&mut app, &db);
+        db.mark_draft_sent(id).unwrap();
+        db.set_upload_pending(id).unwrap();
+
+        app.handle_upload_event(&db, crate::sync::UploadKind::Sent, id, None);
+        let sent = db.get_sent("personal").unwrap();
+        assert_eq!(sent[0].upload_status, crate::db::UPLOAD_UPLOADED);
+
+        app.handle_upload_event(
+            &db,
+            crate::sync::UploadKind::Sent,
+            id,
+            Some("mailbox does not exist".to_string()),
+        );
+        let sent = db.get_sent("personal").unwrap();
+        assert_eq!(sent[0].upload_status, crate::db::UPLOAD_ERROR);
+        assert_eq!(
+            sent[0].upload_error.as_deref(),
+            Some("mailbox does not exist")
+        );
+    }
+
+    // --- notification-trigger folders ---
+
+    #[test]
+    fn should_notify_for_folder_is_disabled_by_default() {
+        let app = app_with_account(test_account("alice@corp.com"));
+        assert!(!app.should_notify_for_folder("INBOX"));
+    }
+
+    #[test]
+    fn should_notify_for_folder_matches_configured_list_only() {
+        let mut acc = test_account("alice@corp.com");
+        acc.notify_folders = Some(vec!["INBOX".to_string()]);
+        let app = app_with_account(acc);
+        assert!(app.should_notify_for_folder("INBOX"));
+        assert!(!app.should_notify_for_folder("Archive"));
     }
 }

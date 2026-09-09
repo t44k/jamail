@@ -19,7 +19,7 @@ cargo clippy             # lint
 cargo fmt                # format
 ```
 
-No tests exist yet. `cargo test` runs but there are zero test cases.
+Unit tests live inline in each module under `#[cfg(test)]` (`cargo test`). They cover pure logic (config parsing, folder ordering, notification triggers, draft raw-message building, status-label text) and DB/App state transitions via `MailDb::open_in_memory()` and a `test_app()` helper — not TUI rendering or live IMAP/SMTP.
 
 ## Architecture
 
@@ -48,12 +48,13 @@ Both threads open their own `MailDb` connection. SQLite WAL mode allows concurre
 - **main.rs** — Terminal setup/teardown, event loop dispatch, account/folder switching, compose key dispatch, SMTP send handler, mouse text extraction, clipboard copy
 - **app.rs** — All UI state and rendering (ViewMode::FolderSelect/List/Detail/Search/Compose), folder tree, vertical folder label, mouse selection tracking, compose view (body editor, autocomplete, file browser)
 - **mail.rs** — IMAP protocol: connect, list_folders, sync_folder (incremental via UIDVALIDITY), MIME parsing, IMAP IDLE, date parsing, HTML→text conversion (via w3m subprocess)
-- **db.rs** — SQLite schema (v2: account+folder scoped), zstd compression/decompression, FTS5 search, schema migration, CRUD operations, known-address extraction for autocomplete
-- **sync.rs** — Background thread lifecycle: SyncControl, multi-folder sync loop, SyncEvent enum
-- **config.rs** — YAML config deserialization (JamailConfig, JamailAccount, ImapConfig, AuthConfig, SmtpConfig)
-- **smtp.rs** — SMTP email sending via `lettre` (blocking transport, STARTTLS/implicit TLS, plain text and multipart with attachments)
-- **theme.rs** — Color palette and style constants (dark theme, all RGB values, compose view colors)
-- **thread.rs** — Email threading via Message-ID/In-Reply-To/References + subject-based fallback
+- **db.rs** — SQLite schema (v4: account+folder scoped; `local_messages` tracks draft/sending/send_error/sent status plus independent upload_status/upload_error for remote Sent/Draft folder uploads), zstd compression/decompression, FTS5 search, schema migration, CRUD operations, known-address extraction for autocomplete
+- **sync.rs** — Background thread lifecycle: SyncControl (current_folder, folder_filter, mark_seen_queue, upload_queue), multi-folder sync loop, SyncEvent enum (includes UploadComplete/UploadError for Sent/Draft folder APPENDs)
+- **config.rs** — YAML config deserialization (JamailConfig, JamailAccount, ImapConfig, AuthConfig, SmtpConfig). `JamailAccount` also carries `senders` (multiple From identities), `sent_folder`/`draft_folder` (remote upload destinations, each independently `Option<String>` — unset disables upload), and `notify_folders` (desktop-notification trigger folders) — all optional and backward-compatible
+- **smtp.rs** — SMTP email sending via `lettre` (blocking transport, STARTTLS/implicit TLS, plain text and multipart with attachments); `send_email` returns the raw sent bytes for Sent-folder upload; `build_draft_raw` builds a tolerant (empty-recipients-OK) raw message for Draft-folder upload
+- **notify.rs** — Best-effort desktop notification (`notify-send`) + sound (`canberra-gtk-play`/`paplay`/`pw-play`, tried in order) for accounts with `notify_folders` configured; no-ops silently when the tools aren't installed, same pattern as clipboard copy
+- **theme.rs** — Color palette and style constants (dark theme, all RGB values, compose view colors, Sent/Draft status badge colors)
+- **thread.rs** — Email threading via Message-ID/In-Reply-To/References + subject-based fallback; caches `newest_status_label` from the newest email for thread-summary row rendering
 
 ### Key Design Decisions
 
@@ -74,6 +75,11 @@ Both threads open their own `MailDb` connection. SQLite WAL mode allows concurre
 - **Threads store indices, not clones** — `Thread.email_indices: Vec<usize>` references into `App.emails`. Summary data (`newest_from`, `has_attachments`) is cached on the Thread struct to avoid lookups during rendering. `build_threads()` takes `&[Email]`.
 - **Parallel email processing** — `sync_folder` uses `std::thread::scope` to run `process_raw_email` calls concurrently (w3m subprocesses). Capped at `PROCESS_PARALLELISM` (8) concurrent threads per sub-batch to limit peak memory from attachment data.
 - **SQLite memory limits** — `PRAGMA cache_size = -4000` (4MB cap per connection), `PRAGMA mmap_size = 0` (no memory-mapped I/O).
+- **Multiple sender identities** — `accounts.<name>.senders` (optional) lists "From" identities cycled via Left/Right on the compose From field. `App.compose_senders` is always rebuilt from config at compose-entry time, so the From field can only ever hold a configured value; `compose_from_is_valid()` re-checks this immediately before a send is enqueued.
+- **Folder display order matches sync order** — `mail::order_folders()` is the single source of truth for both what the sync thread syncs (`SyncControl.folder_filter`) and what the folder selector shows (`App.rebuild_folder_tree`), keyed off the same `accounts.<name>.folders` config. Unconfigured: INBOX first, then alphabetical (deterministic default, since IMAP LIST order and DB-cache order aren't guaranteed to agree or stay stable).
+- **Remote Sent/Draft folder upload is opt-in and one-shot** — `sent_folder`/`draft_folder` are independent `Option<String>` keys; unset means "local cache only" (no APPEND attempted). A sent message is uploaded once (after a successful SMTP send); a draft is uploaded once, on its *first* explicit `Ctrl+S` save only — later edits update the local cache but do not re-upload, so there's no remote delete/replace-on-update logic to track a remote UID. Uploads go through `SyncControl.upload_queue`, drained by the sync thread (which already owns a live IMAP connection) alongside `mark_seen_queue`; results come back as `SyncEvent::UploadComplete`/`UploadError`.
+- **Sent/Draft in-flight state never disappears silently** — `local_messages.status` includes `sending` and `send_error` (not just `draft`/`sent`), and `get_drafts()` includes all three non-`sent` states so a message stays visible (with a "Sending…"/"Send failed: ..." badge) through the whole send lifecycle. `upload_status`/`upload_error` track the independent Sent/Draft-folder upload outcome the same way. `Email.status_label` (set only for local Drafts/Sent rows) carries the badge text into both the flat and threaded list renderers.
+- **Desktop notifications** — `notify_folders` (optional, per account) lists folders that trigger a `notify-send` desktop notification + best-effort sound (`canberra-gtk-play`/`paplay`/`pw-play`) on new mail, mirroring the existing external-tool-with-graceful-fallback pattern (w3m, xdg-open, wl-copy/xclip/xsel). Unset means no notifications. Fires once per `FolderComplete` sync event (not per message), so an initial full backfill sync produces one notification with the total count rather than one per message.
 
 ### Adding Keyboard Shortcuts
 
