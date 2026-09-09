@@ -138,11 +138,14 @@ fn sync_loop(
                 } else {
                     folders.clone()
                 };
-                let filtered: Vec<String> =
-                    crate::mail::order_folders(account.folders.as_deref(), &sync_source)
-                        .into_iter()
-                        .map(|f| f.name)
-                        .collect();
+                let filtered: Vec<String> = crate::mail::order_folders(
+                    account.folders.as_deref(),
+                    &sync_source,
+                    account.show_unlisted_folders,
+                )
+                .into_iter()
+                .map(|f| f.name)
+                .collect();
 
                 if let Ok(mut ff) = control.folder_filter.write() {
                     *ff = filtered;

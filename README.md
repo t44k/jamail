@@ -113,6 +113,7 @@ accounts:
 | `accounts.<name>.imap.auth.type` | Yes | `password` or `command` |
 | `accounts.<name>.imap.auth.value` | Yes | Literal password, or shell command that outputs it |
 | `accounts.<name>.folders` | No | Ordered list of folders to sync **and** to show in the folder selector (`F`). Omitted: all server folders are synced/shown, deterministically ordered INBOX-first then alphabetical (instead of whatever order the server/cache happens to return) |
+| `accounts.<name>.show_unlisted_folders` | No | When `folders` is set, also sync/show remote folders not listed there, appended after the configured ones (INBOX-first, then alphabetical). Omitted (default `false`): only the folders listed in `folders` are synced/shown. No effect if `folders` is unset |
 | `accounts.<name>.senders` | No | Additional "From" identities, cycled with `Left`/`Right` on the From field in compose. Omitted: falls back to a single identity built from `display_name`/`email`. The selected sender is always validated against this list before sending |
 | `accounts.<name>.sent_folder` | No | IMAP folder to upload a copy of successfully-sent messages to. Omitted (default): sent messages stay in the local cache only — nothing is uploaded |
 | `accounts.<name>.draft_folder` | No | IMAP folder to upload a newly-created draft to (on its first explicit save with `Ctrl+S`). Omitted (default): drafts stay in the local cache only — nothing is uploaded |

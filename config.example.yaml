@@ -53,6 +53,12 @@ accounts:
       - Sent
       - Drafts
       - Archive
+    # Optional: when `folders` is set above, also sync/show remote folders
+    # that aren't listed there, appended after the configured ones in
+    # deterministic order (INBOX-first, then alphabetical). Has no effect
+    # if `folders` is unset. Default: false (only the folders listed above
+    # are synced/shown).
+    show_unlisted_folders: false
     # Optional: additional "From" identities to cycle through at compose
     # time (Left/Right on the From field). Without this, compose uses a
     # single identity built from display_name/email.

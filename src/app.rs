@@ -1468,13 +1468,44 @@ impl App {
         // Auto-expand the current account so folders are visible immediately
         self.folder_tree_expanded
             .insert(self.current_account.clone());
+        // Cursor position is restored by rebuild_folder_tree() itself: it
+        // keeps whatever row was selected last time (if that row still
+        // exists after the rebuild), falling back to the first row
+        // otherwise. On the very first call ever (folder_tree still empty),
+        // that naturally resolves to the first row.
         self.rebuild_folder_tree();
-        self.folder_tree_selected = 0;
         self.folder_tree_scroll = 0;
         self.view = ViewMode::FolderSelect;
     }
 
+    /// Stable identity for a folder-tree row, independent of its position in
+    /// the list. Used to relocate the cursor's row after a rebuild
+    /// (expand/collapse toggle, async folder-list refresh, reordering) even
+    /// though its index may have changed. `Loading` has no stable identity —
+    /// it's a transient placeholder — so it never matches.
+    fn folder_tree_row_key(row: &FolderTreeRow) -> Option<(String, String)> {
+        match row {
+            FolderTreeRow::GlobalInbox => Some(("*global*".to_string(), "INBOX".to_string())),
+            FolderTreeRow::VirtualFolder { label } => {
+                Some(("*virtual*".to_string(), label.clone()))
+            }
+            FolderTreeRow::Account { name } => Some(("*account*".to_string(), name.clone())),
+            FolderTreeRow::Folder {
+                account_name,
+                folder,
+            } => Some((account_name.clone(), folder.name.clone())),
+            FolderTreeRow::Loading => None,
+        }
+    }
+
     pub fn rebuild_folder_tree(&mut self) {
+        // Remember which row was selected (by identity, not index) so the
+        // cursor can be restored to the same folder after the rebuild.
+        let previous_selection = self
+            .folder_tree
+            .get(self.folder_tree_selected)
+            .and_then(Self::folder_tree_row_key);
+
         self.folder_tree.clear();
         // Virtual folders at the top
         self.folder_tree.push(FolderTreeRow::VirtualFolder {
@@ -1498,7 +1529,11 @@ impl App {
                     // Deterministic order: the account's configured `folders`
                     // list (if any), else INBOX-first alphabetical — matches
                     // what the sync thread actually syncs, in the same order.
-                    let folders = crate::mail::order_folders(account.folders.as_deref(), &raw);
+                    let folders = crate::mail::order_folders(
+                        account.folders.as_deref(),
+                        &raw,
+                        account.show_unlisted_folders,
+                    );
                     for folder in folders {
                         self.folder_tree.push(FolderTreeRow::Folder {
                             account_name: name.clone(),
@@ -1508,6 +1543,16 @@ impl App {
                 }
             }
         }
+
+        // Restore the cursor to the same folder if it's still present after
+        // the rebuild; otherwise fall back to the first visible row.
+        self.folder_tree_selected = previous_selection
+            .and_then(|key| {
+                self.folder_tree
+                    .iter()
+                    .position(|row| Self::folder_tree_row_key(row).as_ref() == Some(&key))
+            })
+            .unwrap_or(0);
     }
 
     pub fn folder_tree_toggle_expand(&mut self) {
@@ -4769,6 +4814,7 @@ mod tests {
             imap: test_imap_config(),
             smtp: None,
             folders: None,
+            show_unlisted_folders: false,
             senders: None,
             sent_folder: None,
             draft_folder: None,
@@ -4911,6 +4957,222 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["INBOX", "Archive", "Zeta"]);
+    }
+
+    // --- folder-selection cursor restoration across tree rebuilds ---
+
+    fn folder_row_name(row: &FolderTreeRow) -> Option<&str> {
+        match row {
+            FolderTreeRow::Folder { folder, .. } => Some(folder.name.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn folder_tree_cursor_restores_to_same_folder_after_reorder_refresh() {
+        // Unconfigured (alphabetical, INBOX-first) so a newly-arrived folder
+        // can shift everything after it without changing what's selected.
+        let acc = test_account("alice@corp.com");
+        let mut app = app_with_account(acc);
+        app.account_folders.insert(
+            "personal".to_string(),
+            vec![
+                folder_info("INBOX"),
+                folder_info("Sent"),
+                folder_info("Zeta"),
+            ],
+        );
+        app.folder_tree_expanded.insert("personal".to_string());
+        app.rebuild_folder_tree();
+
+        let zeta_idx_before = app
+            .folder_tree
+            .iter()
+            .position(|row| folder_row_name(row) == Some("Zeta"))
+            .expect("Zeta row present");
+        app.folder_tree_selected = zeta_idx_before;
+
+        // A new folder ("Alpha") arrives, sorting ahead of "Zeta" and
+        // shifting its index.
+        app.account_folders.insert(
+            "personal".to_string(),
+            vec![
+                folder_info("INBOX"),
+                folder_info("Alpha"),
+                folder_info("Sent"),
+                folder_info("Zeta"),
+            ],
+        );
+        app.rebuild_folder_tree();
+
+        let zeta_idx_after = app
+            .folder_tree
+            .iter()
+            .position(|row| folder_row_name(row) == Some("Zeta"))
+            .expect("Zeta row still present");
+        assert_ne!(
+            zeta_idx_before, zeta_idx_after,
+            "test setup should actually shift Zeta's index"
+        );
+        assert_eq!(app.folder_tree_selected, zeta_idx_after);
+        assert_eq!(
+            folder_row_name(&app.folder_tree[app.folder_tree_selected]),
+            Some("Zeta")
+        );
+    }
+
+    #[test]
+    fn folder_tree_cursor_falls_back_to_first_row_when_selected_folder_disappears() {
+        let acc = test_account("alice@corp.com");
+        let mut app = app_with_account(acc);
+        app.account_folders.insert(
+            "personal".to_string(),
+            vec![
+                folder_info("INBOX"),
+                folder_info("Sent"),
+                folder_info("Zeta"),
+            ],
+        );
+        app.folder_tree_expanded.insert("personal".to_string());
+        app.rebuild_folder_tree();
+
+        let zeta_idx = app
+            .folder_tree
+            .iter()
+            .position(|row| folder_row_name(row) == Some("Zeta"))
+            .expect("Zeta row present");
+        app.folder_tree_selected = zeta_idx;
+
+        // "Zeta" is gone on the next refresh.
+        app.account_folders.insert(
+            "personal".to_string(),
+            vec![folder_info("INBOX"), folder_info("Sent")],
+        );
+        app.rebuild_folder_tree();
+
+        assert!(
+            !app.folder_tree
+                .iter()
+                .any(|row| folder_row_name(row) == Some("Zeta"))
+        );
+        // Sensible fallback: the first (visible) row.
+        assert_eq!(app.folder_tree_selected, 0);
+    }
+
+    #[test]
+    fn folder_tree_cursor_stays_on_account_row_across_expand_collapse_toggle() {
+        let acc = test_account("alice@corp.com");
+        let mut app = app_with_account(acc);
+        app.account_folders.insert(
+            "personal".to_string(),
+            vec![folder_info("INBOX"), folder_info("Sent")],
+        );
+        app.folder_tree_expanded.insert("personal".to_string());
+        app.rebuild_folder_tree();
+
+        let account_idx = app
+            .folder_tree
+            .iter()
+            .position(|row| matches!(row, FolderTreeRow::Account { name } if name == "personal"))
+            .expect("account row present");
+        app.folder_tree_selected = account_idx;
+
+        // Collapse: folder rows disappear, but the account row itself must
+        // still be found and re-selected.
+        app.folder_tree_toggle_expand();
+        assert!(
+            matches!(&app.folder_tree[app.folder_tree_selected], FolderTreeRow::Account { name } if name == "personal")
+        );
+        assert!(!app.folder_tree_expanded.contains("personal"));
+
+        // Expand again: same account row should still be the selection.
+        app.folder_tree_toggle_expand();
+        assert!(
+            matches!(&app.folder_tree[app.folder_tree_selected], FolderTreeRow::Account { name } if name == "personal")
+        );
+        assert!(app.folder_tree_expanded.contains("personal"));
+    }
+
+    #[test]
+    fn enter_folder_select_restores_previous_cursor_when_reopened() {
+        let acc = test_account("alice@corp.com");
+        let mut app = app_with_account(acc);
+        app.account_folders.insert(
+            "personal".to_string(),
+            vec![folder_info("INBOX"), folder_info("Sent")],
+        );
+        app.enter_folder_select();
+
+        let sent_idx = app
+            .folder_tree
+            .iter()
+            .position(|row| folder_row_name(row) == Some("Sent"))
+            .expect("Sent row present");
+        app.folder_tree_selected = sent_idx;
+
+        // Leave the folder selector for another view, then reopen it.
+        app.view = ViewMode::List;
+        app.enter_folder_select();
+
+        assert!(matches!(app.view, ViewMode::FolderSelect));
+        assert_eq!(app.folder_tree_selected, sent_idx);
+        assert_eq!(
+            folder_row_name(&app.folder_tree[app.folder_tree_selected]),
+            Some("Sent")
+        );
+    }
+
+    #[test]
+    fn enter_folder_select_falls_back_to_first_row_on_very_first_open() {
+        let acc = test_account("alice@corp.com");
+        let mut app = app_with_account(acc);
+        app.account_folders.insert(
+            "personal".to_string(),
+            vec![folder_info("INBOX"), folder_info("Sent")],
+        );
+        assert!(app.folder_tree.is_empty());
+        app.enter_folder_select();
+        assert_eq!(app.folder_tree_selected, 0);
+    }
+
+    #[test]
+    fn folder_tree_navigation_stays_in_bounds_after_cursor_restoration() {
+        let acc = test_account("alice@corp.com");
+        let mut app = app_with_account(acc);
+        app.account_folders.insert(
+            "personal".to_string(),
+            vec![
+                folder_info("INBOX"),
+                folder_info("Sent"),
+                folder_info("Zeta"),
+            ],
+        );
+        app.folder_tree_expanded.insert("personal".to_string());
+        app.rebuild_folder_tree();
+
+        let zeta_idx = app
+            .folder_tree
+            .iter()
+            .position(|row| folder_row_name(row) == Some("Zeta"))
+            .expect("Zeta row present");
+        app.folder_tree_selected = zeta_idx;
+        app.rebuild_folder_tree(); // restores to the same (last) row
+        let last = app.folder_tree.len() - 1;
+        assert_eq!(app.folder_tree_selected, last);
+
+        // Already at the end: one more "down" must not move past it.
+        app.folder_tree_down();
+        assert_eq!(app.folder_tree_selected, last);
+
+        // Walk all the way up to the first row.
+        for _ in 0..app.folder_tree.len() {
+            app.folder_tree_up();
+        }
+        assert_eq!(app.folder_tree_selected, 0);
+
+        // Already at the start: one more "up" must not underflow.
+        app.folder_tree_up();
+        assert_eq!(app.folder_tree_selected, 0);
     }
 
     // --- remote sent/draft upload folders: explicit unset/disabled behavior ---
