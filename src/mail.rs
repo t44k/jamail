@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local, NaiveDateTime};
 use imap::Connection;
 use mailparse::{DispositionType, MailHeaderMap, parse_mail};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -47,7 +48,10 @@ pub struct EmailContent {
     pub raw_headers: String,
 }
 
-#[derive(Clone, Debug)]
+/// Also used as the wire representation of a folder in the `jamaild`/`jamail`
+/// IPC protocol's `FoldersLoaded` event (see `ipc` module docs) — hence the
+/// `Serialize`/`Deserialize` derives.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FolderInfo {
     pub name: String,
     pub delimiter: String,

@@ -2,12 +2,14 @@
 
 A terminal email client built with Rust. Connects to IMAP servers, caches everything locally in a compressed SQLite database, and provides instant full-text search.
 
+jamail ships as two binaries: **`jamaild`**, a background daemon that owns every account's IMAP connection and delivers desktop notifications (suitable for `systemd --user`, keeps working even with no terminal open), and **`jamail`**, the terminal UI, which talks to it over a small local IPC protocol. See [Architecture: jamaild + jamail](#architecture-jamaild--jamail) below.
+
 ## Features
 
-- **Multiple IMAP accounts** with configurable, deterministic folder filtering/ordering
+- **Multiple IMAP accounts**, all synced continuously by a background daemon, with configurable, deterministic folder filtering/ordering
 - **Compose, reply, and forward** emails via SMTP, with multiple sender identities per account
 - **Optional Sent/Draft folder upload** — keep a remote copy of sent mail and drafts, independently configurable, with clear in-flight/error indicators
-- **Desktop notifications** (+ unobtrusive sound) for configurable new-mail-trigger folders
+- **Desktop notifications** (+ unobtrusive sound) for configurable new-mail-trigger folders — delivered by the daemon, so they keep working whether or not the terminal UI is open
 - **Contact autocomplete** from known addresses in your mail cache
 - **File attachments** via built-in file browser
 - **Local SQLite cache** with zstd compression — emails are available offline and load instantly
@@ -40,6 +42,57 @@ Equivalents: `sudo dnf install pkg-config openssl-devel` (Fedora/RHEL),
 `sudo pacman -S pkgconf openssl` (Arch), `sudo apk add pkgconf openssl-dev` (Alpine).
 Without them the build fails in `openssl-sys` with a "could not find system library
 'openssl'" error.
+
+`cargo install --path .` installs both `jamail` and `jamaild` (to `~/.cargo/bin` by
+default).
+
+## Architecture: jamaild + jamail
+
+- **`jamaild`** is a background daemon. On start it loads `config.yaml` and begins
+  syncing *every* configured account concurrently over IMAP (not just whichever one
+  you're currently looking at) — that's what lets it keep noticing new mail and
+  firing desktop notifications even when no `jamail` terminal is open. It listens on
+  a Unix domain socket (see below) and writes to the same local SQLite cache
+  `jamail` reads from.
+- **`jamail`** is the terminal UI. It reads the cache directly and talks to
+  `jamaild` over that socket for anything that needs a live IMAP session:
+  which folder to prioritize for IMAP IDLE, marking messages seen, and
+  Sent/Draft folder uploads.
+- If you just run `jamail` and no `jamaild` is reachable, `jamail` spawns one for
+  you automatically (detached, so it outlives the terminal). This means a bare
+  `jamail` still "just works" with no extra setup — the daemon is the one thing
+  actually talking to your mail server, `jamail` is a disposable view onto it.
+- For notifications that work even when you never open `jamail` at all, run
+  `jamaild` as a persistent `systemd --user` service instead of relying on
+  auto-start: see [`contrib/systemd/jamaild.service`](contrib/systemd/jamaild.service).
+
+  ```bash
+  mkdir -p ~/.config/systemd/user
+  cp contrib/systemd/jamaild.service ~/.config/systemd/user/
+  systemctl --user daemon-reload
+  systemctl --user enable --now jamaild
+  ```
+
+  The unit's `ExecStart` assumes `cargo install --path .`'s default location
+  (`~/.cargo/bin/jamaild`) — edit it if you installed elsewhere (`which jamaild`).
+  `systemctl --user stop jamaild` (or plain `Ctrl+C` on a foreground `jamaild`)
+  shuts it down gracefully: every account's sync loop stops and the socket file
+  is removed before it exits.
+
+### Socket path
+
+`jamaild` listens on, and `jamail` connects to, in this order:
+
+1. the `JAMAIL_SOCKET` environment variable, if set;
+2. `accounts.daemon.socket_path` in `config.yaml`, if set;
+3. `$XDG_RUNTIME_DIR/jamail/jamaild.sock` (the normal case under any modern
+   Linux desktop or systemd --user session);
+4. `/tmp/jamail-<uid>/jamaild.sock` if `XDG_RUNTIME_DIR` isn't set.
+
+The socket's containing directory is created `0700` and the socket file itself is
+`chmod`'d `0600` right after binding — only your own user can connect, the same
+trust model as `ssh-agent`/`gpg-agent`. The full wire protocol (framing, versioning,
+error semantics) is documented in `src/ipc.rs`.
 
 ### Optional dependencies
 
@@ -124,6 +177,7 @@ accounts:
 | `accounts.<name>.smtp.auth.type` | No | `password` or `command` (same as IMAP auth) |
 | `accounts.<name>.smtp.auth.value` | No | Literal password, or shell command that outputs it |
 | `accounts.<name>.smtp.starttls` | No | `true` for STARTTLS (default), `false` for implicit TLS |
+| `daemon.socket_path` | No | Override the `jamaild`/`jamail` IPC socket path (see [Socket path](#socket-path)). Omitted (default): `$XDG_RUNTIME_DIR/jamail/jamaild.sock` |
 
 Auth type `command` runs the value as a shell command and reads the password from stdout. Works with `pass`, `gpg`, `secret-tool`, etc.
 
@@ -149,13 +203,19 @@ Drafts are uploaded once, on their first explicit save — later edits update th
 
 Set `notify_folders` on an account to get a desktop notification + short sound when new mail arrives in one of those folders. This uses `notify-send` (works across Wayland compositors, including Hyprland/Omarchy setups) for the notification and tries `canberra-gtk-play`, then `paplay`, then `pw-play` for the sound. If none of those are installed, notifications/sound are silently skipped — no error, no crash.
 
+Notification delivery is entirely `jamaild`'s responsibility: it decides whether to
+notify and fires the notification itself, for every configured account, regardless
+of whether `jamail` is open or which account/folder it's showing. Run `jamaild` as a
+`systemd --user` service (see above) to get notifications with no terminal open at
+all.
+
 ## Usage
 
 ```bash
 jamail
 ```
 
-The database is stored at `~/.local/share/jamail/mail.db` and acts as a cache — delete it anytime to force a full re-sync.
+The database is stored at `~/.local/share/jamail/mail.db` and acts as a cache — delete it anytime to force a full re-sync. `jamail` auto-starts a `jamaild` if none is reachable; see [Architecture: jamaild + jamail](#architecture-jamaild--jamail) for the recommended `systemd --user` setup instead.
 
 ### Keyboard shortcuts
 

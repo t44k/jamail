@@ -15,6 +15,12 @@ pub struct ComposeAttachment {
 
 /// A single queued outgoing email.
 pub struct SendJob {
+    /// Which configured account this send belongs to — captured at enqueue
+    /// time (not re-read from "the current account" later) so a
+    /// Sent-folder upload always targets the account the message was
+    /// actually sent from, even if the user has since switched accounts in
+    /// the UI while this job was in flight on the background send thread.
+    pub account: String,
     pub smtp_config: SmtpConfig,
     pub from: String,
     pub to: String,
@@ -34,6 +40,8 @@ pub struct SendJob {
 
 /// Result returned from the send worker for each completed job.
 pub struct SendResult {
+    /// Echoed back from the job (see `SendJob::account`).
+    pub account: String,
     pub draft_id: Option<i64>,
     pub error: Option<String>,
     /// Echoed back from the job so the caller can enqueue a Sent-folder
@@ -71,6 +79,12 @@ pub struct SendQueue {
     pub counters: Arc<SendCounters>,
 }
 
+impl Default for SendQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SendQueue {
     pub fn new() -> Self {
         let (job_tx, job_rx) = mpsc::channel::<SendJob>();
@@ -102,6 +116,7 @@ impl SendQueue {
                     counters_bg.errors.fetch_add(1, Ordering::Relaxed);
                 }
                 let _ = result_tx.send(SendResult {
+                    account: job.account,
                     draft_id: job.draft_id,
                     error,
                     sent_folder,
