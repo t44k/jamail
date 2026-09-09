@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local, NaiveDateTime};
 use imap::Connection;
 use mailparse::{DispositionType, MailHeaderMap, parse_mail};
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::config::JamailAccount;
@@ -406,18 +407,52 @@ impl MailClient {
 /// Order (and, when a filter is configured, restrict) `available` folders
 /// for both sync and UI display, so the two stay deterministic and consistent.
 ///
-/// - `configured` is `account.folders` from config: when `Some`, only the
-///   named folders are kept, in exactly the given order (folders that don't
-///   exist on the server are silently dropped).
+/// - `configured` is `account.folders` from config: when `Some`, the named
+///   folders are kept in exactly the given order (folders that don't exist
+///   on the server are silently dropped; repeated names are deduplicated —
+///   each folder appears once, at its first position in the list).
+/// - `show_unlisted` is `account.show_unlisted_folders`. When `configured`
+///   is `Some` and this is `true`, remote folders not named in `configured`
+///   are appended after the configured ones, in the same deterministic
+///   order used for the unconfigured case (INBOX-first, then alphabetical).
+///   When `false` (the default), only the configured folders are returned —
+///   unchanged from prior behavior. Has no effect when `configured` is
+///   `None` (everything is already included in that case).
 /// - When `configured` is `None`, folders are sorted alphabetically with
 ///   `INBOX` pinned first — a stable default instead of whatever order the
 ///   IMAP server (or a cache query) happens to return.
-pub fn order_folders(configured: Option<&[String]>, available: &[FolderInfo]) -> Vec<FolderInfo> {
+pub fn order_folders(
+    configured: Option<&[String]>,
+    available: &[FolderInfo],
+    show_unlisted: bool,
+) -> Vec<FolderInfo> {
     if let Some(names) = configured {
-        return names
-            .iter()
-            .filter_map(|name| available.iter().find(|f| &f.name == name).cloned())
-            .collect();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut ordered: Vec<FolderInfo> = Vec::new();
+        for name in names {
+            if !seen.insert(name.as_str()) {
+                continue; // duplicate entry in the configured list
+            }
+            if let Some(folder) = available.iter().find(|f| &f.name == name) {
+                ordered.push(folder.clone());
+            }
+        }
+
+        if show_unlisted {
+            let mut extra: Vec<FolderInfo> = available
+                .iter()
+                .filter(|f| !seen.contains(f.name.as_str()))
+                .cloned()
+                .collect();
+            extra.sort_by(|a, b| a.name.cmp(&b.name));
+            if let Some(pos) = extra.iter().position(|f| f.name == "INBOX") {
+                let inbox = extra.remove(pos);
+                extra.insert(0, inbox);
+            }
+            ordered.extend(extra);
+        }
+
+        return ordered;
     }
 
     let mut sorted: Vec<FolderInfo> = available.to_vec();
@@ -914,7 +949,7 @@ mod tests {
     #[test]
     fn order_folders_with_no_config_sorts_alphabetically_with_inbox_first() {
         let available = vec![folder("Sent"), folder("Archive"), folder("INBOX")];
-        let ordered = order_folders(None, &available);
+        let ordered = order_folders(None, &available, false);
         let names: Vec<&str> = ordered.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["INBOX", "Archive", "Sent"]);
     }
@@ -923,7 +958,7 @@ mod tests {
     fn order_folders_with_config_uses_exact_configured_order() {
         let available = vec![folder("INBOX"), folder("Archive"), folder("Sent")];
         let configured = vec!["Sent".to_string(), "INBOX".to_string()];
-        let ordered = order_folders(Some(&configured), &available);
+        let ordered = order_folders(Some(&configured), &available, false);
         let names: Vec<&str> = ordered.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["Sent", "INBOX"]);
     }
@@ -932,7 +967,7 @@ mod tests {
     fn order_folders_drops_configured_names_absent_from_server() {
         let available = vec![folder("INBOX")];
         let configured = vec!["INBOX".to_string(), "Nonexistent".to_string()];
-        let ordered = order_folders(Some(&configured), &available);
+        let ordered = order_folders(Some(&configured), &available, false);
         let names: Vec<&str> = ordered.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["INBOX"]);
     }
@@ -943,7 +978,7 @@ mod tests {
         // existing sync-filter behavior rather than falling back to "all".
         let available = vec![folder("INBOX"), folder("Archive")];
         let configured: Vec<String> = vec![];
-        let ordered = order_folders(Some(&configured), &available);
+        let ordered = order_folders(Some(&configured), &available, false);
         assert!(ordered.is_empty());
     }
 
@@ -952,14 +987,86 @@ mod tests {
         let a = vec![folder("Zeta"), folder("Alpha"), folder("INBOX")];
         let b = vec![folder("Alpha"), folder("INBOX"), folder("Zeta")];
         assert_eq!(
-            order_folders(None, &a)
+            order_folders(None, &a, false)
                 .iter()
                 .map(|f| f.name.clone())
                 .collect::<Vec<_>>(),
-            order_folders(None, &b)
+            order_folders(None, &b, false)
                 .iter()
                 .map(|f| f.name.clone())
                 .collect::<Vec<_>>(),
         );
+    }
+
+    // --- show_unlisted_folders: append remote folders not in the configured list ---
+
+    #[test]
+    fn order_folders_disabled_ignores_unlisted_remote_folders() {
+        // show_unlisted=false must behave exactly like before: only the
+        // configured folders come back, nothing extra appended.
+        let available = vec![folder("INBOX"), folder("Archive"), folder("Sent")];
+        let configured = vec!["INBOX".to_string()];
+        let ordered = order_folders(Some(&configured), &available, false);
+        let names: Vec<&str> = ordered.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["INBOX"]);
+    }
+
+    #[test]
+    fn order_folders_enabled_appends_unlisted_folders_after_configured_ones() {
+        let available = vec![
+            folder("INBOX"),
+            folder("Archive"),
+            folder("Sent"),
+            folder("Projects"),
+        ];
+        let configured = vec!["Sent".to_string(), "INBOX".to_string()];
+        let ordered = order_folders(Some(&configured), &available, true);
+        let names: Vec<&str> = ordered.iter().map(|f| f.name.as_str()).collect();
+        // Configured order preserved first, then the rest INBOX-first/alphabetical
+        // (INBOX is already accounted for above, so just alphabetical remains).
+        assert_eq!(names, vec!["Sent", "INBOX", "Archive", "Projects"]);
+    }
+
+    #[test]
+    fn order_folders_enabled_deduplicates_repeated_configured_names() {
+        let available = vec![folder("INBOX"), folder("Sent"), folder("Archive")];
+        let configured = vec!["INBOX".to_string(), "INBOX".to_string(), "Sent".to_string()];
+        let ordered = order_folders(Some(&configured), &available, true);
+        let names: Vec<&str> = ordered.iter().map(|f| f.name.as_str()).collect();
+        // INBOX appears once (at its first configured position), then Sent,
+        // then the one remaining unlisted folder.
+        assert_eq!(names, vec!["INBOX", "Sent", "Archive"]);
+    }
+
+    #[test]
+    fn order_folders_enabled_still_drops_missing_configured_names() {
+        // A configured name absent from the server is dropped from the
+        // configured section, and does not spuriously appear in the
+        // appended "unlisted" section either.
+        let available = vec![folder("INBOX"), folder("Archive")];
+        let configured = vec!["INBOX".to_string(), "Nonexistent".to_string()];
+        let ordered = order_folders(Some(&configured), &available, true);
+        let names: Vec<&str> = ordered.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["INBOX", "Archive"]);
+    }
+
+    #[test]
+    fn order_folders_enabled_with_no_unlisted_remote_folders_is_a_no_op() {
+        let available = vec![folder("INBOX"), folder("Sent")];
+        let configured = vec!["INBOX".to_string(), "Sent".to_string()];
+        let ordered = order_folders(Some(&configured), &available, true);
+        let names: Vec<&str> = ordered.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["INBOX", "Sent"]);
+    }
+
+    #[test]
+    fn order_folders_show_unlisted_has_no_effect_when_unconfigured() {
+        let available = vec![folder("Sent"), folder("Archive"), folder("INBOX")];
+        let with_flag = order_folders(None, &available, true);
+        let without_flag = order_folders(None, &available, false);
+        let names_with: Vec<&str> = with_flag.iter().map(|f| f.name.as_str()).collect();
+        let names_without: Vec<&str> = without_flag.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names_with, names_without);
+        assert_eq!(names_with, vec!["INBOX", "Archive", "Sent"]);
     }
 }

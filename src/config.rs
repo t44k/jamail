@@ -21,6 +21,14 @@ pub struct JamailAccount {
     /// Unset: all server folders are synced/shown (deterministic default
     /// order: INBOX first, then alphabetical).
     pub folders: Option<Vec<String>>,
+    /// When `folders` is set, also sync/show remote folders that aren't
+    /// listed there, appended after the configured ones in deterministic
+    /// order (INBOX-first, then alphabetical). Default `false`: only the
+    /// folders explicitly listed in `folders` are synced/shown. Has no
+    /// effect when `folders` is unset — everything is already shown/synced
+    /// in that case.
+    #[serde(default)]
+    pub show_unlisted_folders: bool,
     /// Additional "From" identities selectable at compose time (cycled with
     /// Left/Right on the From field). Unset: falls back to a single identity
     /// built from `display_name`/`email`.
@@ -153,6 +161,44 @@ mod tests {
         assert!(acc.notify_folders.is_none());
         assert!(acc.smtp.is_none());
         assert!(!acc.default);
+        assert!(!acc.show_unlisted_folders);
+    }
+
+    #[test]
+    fn show_unlisted_folders_defaults_to_false_when_folders_is_configured() {
+        // A config that sets `folders` but doesn't mention the new key must
+        // still default to false (only the listed folders are synced/shown).
+        let cfg = parse(
+            "accounts:\n\
+             \x20 work:\n\
+             \x20   email: alice@corp.com\n\
+             \x20   folders: [INBOX, Sent]\n\
+             \x20   imap:\n\
+             \x20     host: imap.corp.com\n\
+             \x20     port: 993\n\
+             \x20     login: alice@corp.com\n\
+             \x20     auth: {type: password, value: secret}\n",
+        );
+        let (_, acc) = cfg.default_account().unwrap();
+        assert!(!acc.show_unlisted_folders);
+    }
+
+    #[test]
+    fn show_unlisted_folders_parses_when_explicitly_enabled() {
+        let cfg = parse(
+            "accounts:\n\
+             \x20 work:\n\
+             \x20   email: alice@corp.com\n\
+             \x20   folders: [INBOX, Sent]\n\
+             \x20   show_unlisted_folders: true\n\
+             \x20   imap:\n\
+             \x20     host: imap.corp.com\n\
+             \x20     port: 993\n\
+             \x20     login: alice@corp.com\n\
+             \x20     auth: {type: password, value: secret}\n",
+        );
+        let (_, acc) = cfg.default_account().unwrap();
+        assert!(acc.show_unlisted_folders);
     }
 
     #[test]
@@ -246,6 +292,7 @@ mod tests {
 
         let work = &cfg.accounts["work"];
         assert!(work.senders.as_ref().is_some_and(|s| s.len() > 1));
+        assert!(!work.show_unlisted_folders);
         assert_eq!(work.sent_folder.as_deref(), Some("Sent"));
         assert_eq!(work.draft_folder.as_deref(), Some("Drafts"));
         assert_eq!(
