@@ -1,11 +1,11 @@
 use crate::config::SmtpConfig;
 use anyhow::{Context, Result};
-use lettre::message::{header::ContentType, Mailbox, MultiPart, SinglePart};
+use lettre::message::{Mailbox, MultiPart, SinglePart, header::ContentType};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 
 pub struct ComposeAttachment {
     pub path: std::path::PathBuf,
@@ -27,12 +27,21 @@ pub struct SendJob {
     pub references: Option<String>,
     /// Draft ID to mark as sent on success.
     pub draft_id: Option<i64>,
+    /// Remote IMAP folder to upload a copy of the sent message to, if the
+    /// account is configured for it (`accounts.<name>.sent_folder`).
+    pub sent_folder: Option<String>,
 }
 
 /// Result returned from the send worker for each completed job.
 pub struct SendResult {
     pub draft_id: Option<i64>,
     pub error: Option<String>,
+    /// Echoed back from the job so the caller can enqueue a Sent-folder
+    /// upload; `None` on failure even if the job requested one.
+    pub sent_folder: Option<String>,
+    /// The raw RFC-2822 bytes of the message that was actually sent, used
+    /// as the APPEND payload for the Sent-folder upload.
+    pub raw_message: Option<Vec<u8>>,
 }
 
 /// Shared send-queue counters visible to the UI.
@@ -85,13 +94,18 @@ impl SendQueue {
                 );
                 // Decrement pending regardless of outcome.
                 counters_bg.pending.fetch_sub(1, Ordering::Relaxed);
-                let error = result.err().map(|e| e.to_string());
+                let (error, raw_message, sent_folder) = match result {
+                    Ok(raw) => (None, Some(raw), job.sent_folder),
+                    Err(e) => (Some(e.to_string()), None, None),
+                };
                 if error.is_some() {
                     counters_bg.errors.fetch_add(1, Ordering::Relaxed);
                 }
                 let _ = result_tx.send(SendResult {
                     draft_id: job.draft_id,
                     error,
+                    sent_folder,
+                    raw_message,
                 });
             }
         });
@@ -122,7 +136,7 @@ pub fn send_email(
     attachments: &[ComposeAttachment],
     in_reply_to: Option<&str>,
     references: Option<&str>,
-) -> Result<()> {
+) -> Result<Vec<u8>> {
     let from_mailbox: Mailbox = from
         .parse()
         .with_context(|| format!("Invalid From address: {}", from))?;
@@ -209,7 +223,38 @@ pub fn send_email(
         .send(&message)
         .context("Failed to send email via SMTP")?;
 
-    Ok(())
+    Ok(message.formatted())
+}
+
+/// Build a raw RFC-2822-shaped message for uploading a draft to a remote
+/// Drafts folder. Unlike `send_email`, this tolerates empty To/Cc/Bcc
+/// (a draft in progress may not have recipients yet) since it never goes
+/// through an SMTP envelope — it's purely a client-side courtesy copy.
+pub fn build_draft_raw(
+    from: &str,
+    to: &str,
+    cc: &str,
+    bcc: &str,
+    subject: &str,
+    body: &str,
+) -> Vec<u8> {
+    let mut out = String::new();
+    out.push_str(&format!("From: {}\r\n", from));
+    if !to.trim().is_empty() {
+        out.push_str(&format!("To: {}\r\n", to));
+    }
+    if !cc.trim().is_empty() {
+        out.push_str(&format!("Cc: {}\r\n", cc));
+    }
+    if !bcc.trim().is_empty() {
+        out.push_str(&format!("Bcc: {}\r\n", bcc));
+    }
+    out.push_str(&format!("Subject: {}\r\n", subject));
+    out.push_str("MIME-Version: 1.0\r\n");
+    out.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    out.push_str("\r\n");
+    out.push_str(&body.replace("\r\n", "\n").replace('\n', "\r\n"));
+    out.into_bytes()
 }
 
 fn split_addresses(s: &str) -> Vec<String> {
@@ -226,5 +271,54 @@ pub fn format_attachment_size(size: u64) -> String {
         format!("{:.1} KB", size as f64 / 1024.0)
     } else {
         format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_draft_raw_omits_empty_recipient_headers() {
+        let raw = build_draft_raw("a@b.com", "", "", "", "Hi", "body text");
+        let text = String::from_utf8(raw).unwrap();
+        assert!(text.starts_with("From: a@b.com\r\n"));
+        assert!(!text.contains("To:"));
+        assert!(!text.contains("Cc:"));
+        assert!(!text.contains("Bcc:"));
+        assert!(text.contains("Subject: Hi\r\n"));
+        assert!(text.ends_with("body text"));
+    }
+
+    #[test]
+    fn build_draft_raw_includes_recipients_when_present() {
+        let raw = build_draft_raw(
+            "a@b.com",
+            "c@d.com",
+            "e@f.com",
+            "g@h.com",
+            "Subj",
+            "line1\nline2",
+        );
+        let text = String::from_utf8(raw).unwrap();
+        assert!(text.contains("To: c@d.com\r\n"));
+        assert!(text.contains("Cc: e@f.com\r\n"));
+        assert!(text.contains("Bcc: g@h.com\r\n"));
+        assert!(text.contains("line1\r\nline2"));
+    }
+
+    #[test]
+    fn split_addresses_trims_and_drops_empty_entries() {
+        assert_eq!(
+            split_addresses(" a@b.com ,  , c@d.com,"),
+            vec!["a@b.com".to_string(), "c@d.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn format_attachment_size_picks_appropriate_unit() {
+        assert_eq!(format_attachment_size(500), "500 B");
+        assert_eq!(format_attachment_size(2048), "2.0 KB");
+        assert_eq!(format_attachment_size(5 * 1024 * 1024), "5.0 MB");
     }
 }

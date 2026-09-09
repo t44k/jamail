@@ -22,6 +22,10 @@ pub struct Email {
     pub in_reply_to: String,
     pub references: String,
     pub has_attachments: bool,
+    /// Human-readable in-flight/error state for local Drafts/Sent rows
+    /// (e.g. "Sending…", "Send failed: ...", "Uploading…"). Always `None`
+    /// for real IMAP-synced emails.
+    pub status_label: Option<String>,
 }
 
 pub struct AttachmentData {
@@ -381,6 +385,48 @@ impl MailClient {
     pub fn logout(mut self) {
         let _ = self.session.logout();
     }
+
+    /// APPEND a raw RFC-2822 message to `folder` with the given flags.
+    /// Used to upload a copy of a sent message or a draft to the server.
+    pub fn append_message(
+        &mut self,
+        folder: &str,
+        raw_message: &[u8],
+        flags: &[imap::types::Flag<'_>],
+    ) -> Result<()> {
+        self.session
+            .append(folder, raw_message)
+            .flags(flags.iter().cloned())
+            .finish()
+            .with_context(|| format!("Failed to append message to {}", folder))?;
+        Ok(())
+    }
+}
+
+/// Order (and, when a filter is configured, restrict) `available` folders
+/// for both sync and UI display, so the two stay deterministic and consistent.
+///
+/// - `configured` is `account.folders` from config: when `Some`, only the
+///   named folders are kept, in exactly the given order (folders that don't
+///   exist on the server are silently dropped).
+/// - When `configured` is `None`, folders are sorted alphabetically with
+///   `INBOX` pinned first — a stable default instead of whatever order the
+///   IMAP server (or a cache query) happens to return.
+pub fn order_folders(configured: Option<&[String]>, available: &[FolderInfo]) -> Vec<FolderInfo> {
+    if let Some(names) = configured {
+        return names
+            .iter()
+            .filter_map(|name| available.iter().find(|f| &f.name == name).cloned())
+            .collect();
+    }
+
+    let mut sorted: Vec<FolderInfo> = available.to_vec();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    if let Some(pos) = sorted.iter().position(|f| f.name == "INBOX") {
+        let inbox = sorted.remove(pos);
+        sorted.insert(0, inbox);
+    }
+    sorted
 }
 
 /// Process a raw email body + flags into a structured ProcessedEmail.
@@ -852,4 +898,68 @@ pub fn open_url(url: &str) -> Result<()> {
         .spawn()
         .context("Failed to open browser")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn folder(name: &str) -> FolderInfo {
+        FolderInfo {
+            name: name.to_string(),
+            delimiter: "/".to_string(),
+        }
+    }
+
+    #[test]
+    fn order_folders_with_no_config_sorts_alphabetically_with_inbox_first() {
+        let available = vec![folder("Sent"), folder("Archive"), folder("INBOX")];
+        let ordered = order_folders(None, &available);
+        let names: Vec<&str> = ordered.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["INBOX", "Archive", "Sent"]);
+    }
+
+    #[test]
+    fn order_folders_with_config_uses_exact_configured_order() {
+        let available = vec![folder("INBOX"), folder("Archive"), folder("Sent")];
+        let configured = vec!["Sent".to_string(), "INBOX".to_string()];
+        let ordered = order_folders(Some(&configured), &available);
+        let names: Vec<&str> = ordered.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["Sent", "INBOX"]);
+    }
+
+    #[test]
+    fn order_folders_drops_configured_names_absent_from_server() {
+        let available = vec![folder("INBOX")];
+        let configured = vec!["INBOX".to_string(), "Nonexistent".to_string()];
+        let ordered = order_folders(Some(&configured), &available);
+        let names: Vec<&str> = ordered.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["INBOX"]);
+    }
+
+    #[test]
+    fn order_folders_with_empty_config_list_yields_no_folders() {
+        // An explicit empty list is respected literally, matching the
+        // existing sync-filter behavior rather than falling back to "all".
+        let available = vec![folder("INBOX"), folder("Archive")];
+        let configured: Vec<String> = vec![];
+        let ordered = order_folders(Some(&configured), &available);
+        assert!(ordered.is_empty());
+    }
+
+    #[test]
+    fn order_folders_default_is_deterministic_regardless_of_input_order() {
+        let a = vec![folder("Zeta"), folder("Alpha"), folder("INBOX")];
+        let b = vec![folder("Alpha"), folder("INBOX"), folder("Zeta")];
+        assert_eq!(
+            order_folders(None, &a)
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<_>>(),
+            order_folders(None, &b)
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
 }

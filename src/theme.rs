@@ -47,6 +47,11 @@ pub const STATUS_BG: Color = Color::Rgb(30, 32, 44);
 pub const STATUS_FG: Color = Color::Rgb(140, 140, 160);
 pub const STATUS_KEY: Color = Color::Rgb(200, 160, 80);
 
+// Sent/Draft in-flight state badges (list rows)
+pub const STATUS_ERROR: Color = Color::Rgb(240, 100, 100);
+pub const STATUS_PENDING: Color = Color::Rgb(200, 160, 80);
+pub const STATUS_SUCCESS: Color = Color::Rgb(80, 200, 120);
+
 // Help overlay
 pub const HELP_BG: Color = Color::Rgb(28, 30, 42);
 pub const HELP_BORDER: Color = Color::Rgb(100, 140, 200);
@@ -155,4 +160,19 @@ pub fn style_link_selected() -> Style {
         .fg(LINK_SELECTED)
         .bg(LINK_SELECTED_BG)
         .add_modifier(Modifier::UNDERLINED | Modifier::BOLD)
+}
+
+/// Style for a Sent/Draft list row's in-flight/error status badge, chosen
+/// by simple keyword sniffing of the label text (kept here rather than a
+/// separate enum so `db::local_message_status_label` can stay a plain
+/// string builder with no UI dependency).
+pub fn style_status_label(label: &str) -> Style {
+    let lower = label.to_lowercase();
+    if lower.contains("failed") {
+        Style::default().fg(STATUS_ERROR)
+    } else if lower.contains("uploaded") {
+        Style::default().fg(STATUS_SUCCESS)
+    } else {
+        Style::default().fg(STATUS_PENDING)
+    }
 }

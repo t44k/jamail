@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::mail::{AttachmentData, Email, EmailContent, FolderInfo};
 use chrono::{DateTime, Local, TimeZone};
 
-const CURRENT_SCHEMA_VERSION: i32 = 3;
+const CURRENT_SCHEMA_VERSION: i32 = 4;
 
 pub struct AttachmentMeta {
     pub id: i64,
@@ -67,7 +67,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS schema_version;
 
          CREATE TABLE schema_version (version INTEGER NOT NULL);
-         INSERT INTO schema_version VALUES (3);
+         INSERT INTO schema_version VALUES (4);
 
          CREATE TABLE folders (
              account   TEXT NOT NULL,
@@ -139,12 +139,27 @@ fn create_schema(conn: &Connection) -> Result<()> {
              in_reply_to     TEXT NOT NULL DEFAULT '',
              refs            TEXT NOT NULL DEFAULT '',
              created_at      TEXT NOT NULL,
-             sent_at         TEXT
+             sent_at         TEXT,
+             error           TEXT,
+             upload_status   TEXT NOT NULL DEFAULT 'none',
+             upload_error    TEXT
          );
          CREATE INDEX idx_local_messages_status ON local_messages(status, created_at DESC);",
     )?;
     Ok(())
 }
+
+/// Status values for `local_messages.status`.
+pub const STATUS_DRAFT: &str = "draft";
+pub const STATUS_SENDING: &str = "sending";
+pub const STATUS_SEND_ERROR: &str = "send_error";
+pub const STATUS_SENT: &str = "sent";
+
+/// Status values for `local_messages.upload_status`.
+pub const UPLOAD_NONE: &str = "none";
+pub const UPLOAD_PENDING: &str = "pending";
+pub const UPLOAD_UPLOADED: &str = "uploaded";
+pub const UPLOAD_ERROR: &str = "error";
 
 impl MailDb {
     pub fn open() -> Result<Self> {
@@ -395,6 +410,7 @@ impl MailDb {
                 in_reply_to,
                 references,
                 has_attachments,
+                status_label: None,
             })
         })?;
 
@@ -493,6 +509,7 @@ impl MailDb {
                 in_reply_to,
                 references,
                 has_attachments,
+                status_label: None,
             })
         })?;
 
@@ -552,6 +569,7 @@ impl MailDb {
                 in_reply_to,
                 references,
                 has_attachments,
+                status_label: None,
             })
         })?;
 
@@ -800,11 +818,59 @@ impl MailDb {
         Ok(())
     }
 
+    /// Mark a draft as actively being sent (in-flight). Keeps it visible in
+    /// the Drafts list — with a "Sending…" indicator — instead of it
+    /// silently disappearing while the background send worker runs.
+    pub fn mark_draft_sending(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE local_messages SET status=?2 WHERE id=?1",
+            params![id, STATUS_SENDING],
+        )?;
+        Ok(())
+    }
+
+    /// Record a failed send attempt. The message stays in the Drafts list
+    /// (not "sent") with the error text attached so it doesn't vanish.
+    pub fn mark_draft_send_error(&self, id: i64, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE local_messages SET status=?2, error=?3 WHERE id=?1",
+            params![id, STATUS_SEND_ERROR, error],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_draft_sent(&self, id: i64) -> Result<()> {
         let now = Local::now().to_rfc3339();
         self.conn.execute(
-            "UPDATE local_messages SET status='sent', sent_at=?2 WHERE id=?1",
-            params![id, now],
+            "UPDATE local_messages SET status=?2, sent_at=?3, error=NULL WHERE id=?1",
+            params![id, STATUS_SENT, now],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a local message as queued for upload to a remote Sent/Drafts
+    /// folder. Called right before an `UploadRequest` is handed to the sync
+    /// thread.
+    pub fn set_upload_pending(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE local_messages SET upload_status=?2, upload_error=NULL WHERE id=?1",
+            params![id, UPLOAD_PENDING],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_upload_success(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE local_messages SET upload_status=?2, upload_error=NULL WHERE id=?1",
+            params![id, UPLOAD_UPLOADED],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_upload_error(&self, id: i64, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE local_messages SET upload_status=?2, upload_error=?3 WHERE id=?1",
+            params![id, UPLOAD_ERROR, error],
         )?;
         Ok(())
     }
@@ -812,17 +878,20 @@ impl MailDb {
     #[allow(dead_code)]
     pub fn delete_draft(&self, id: i64) -> Result<()> {
         self.conn.execute(
-            "DELETE FROM local_messages WHERE id=?1 AND status='draft'",
+            "DELETE FROM local_messages WHERE id=?1 AND status IN ('draft','sending','send_error')",
             params![id],
         )?;
         Ok(())
     }
 
+    /// Drafts include in-flight ("sending") and failed ("send_error") rows
+    /// so an in-progress or errored send never silently disappears from the
+    /// Drafts list.
     pub fn get_drafts(&self, account: &str) -> Result<Vec<LocalMessage>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, account, status, from_addr, to_addr, cc, bcc, subject, body,
-                    in_reply_to, refs, created_at, sent_at
-             FROM local_messages WHERE status='draft' AND account=?1
+                    in_reply_to, refs, created_at, sent_at, error, upload_status, upload_error
+             FROM local_messages WHERE status IN ('draft','sending','send_error') AND account=?1
              ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![account], local_message_from_row)?;
@@ -836,7 +905,7 @@ impl MailDb {
     pub fn get_sent(&self, account: &str) -> Result<Vec<LocalMessage>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, account, status, from_addr, to_addr, cc, bcc, subject, body,
-                    in_reply_to, refs, created_at, sent_at
+                    in_reply_to, refs, created_at, sent_at, error, upload_status, upload_error
              FROM local_messages WHERE status='sent' AND account=?1
              ORDER BY sent_at DESC",
         )?;
@@ -852,7 +921,7 @@ impl MailDb {
     pub fn get_draft(&self, id: i64) -> Result<Option<LocalMessage>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, account, status, from_addr, to_addr, cc, bcc, subject, body,
-                    in_reply_to, refs, created_at, sent_at
+                    in_reply_to, refs, created_at, sent_at, error, upload_status, upload_error
              FROM local_messages WHERE id=?1",
         )?;
         let mut rows = stmt.query(params![id])?;
@@ -879,6 +948,43 @@ pub struct LocalMessage {
     pub refs: String,
     pub created_at: String,
     pub sent_at: Option<String>,
+    pub error: Option<String>,
+    pub upload_status: String,
+    pub upload_error: Option<String>,
+}
+
+/// Human-readable in-flight/error state for a Drafts/Sent list row, or
+/// `None` when there's nothing noteworthy to show beyond the plain
+/// draft/sent marker already conveyed by the row's unread styling.
+pub fn local_message_status_label(m: &LocalMessage) -> Option<String> {
+    match m.status.as_str() {
+        STATUS_SENDING => Some("Sending…".to_string()),
+        STATUS_SEND_ERROR => Some(format!(
+            "Send failed: {}",
+            m.error.as_deref().unwrap_or("unknown error")
+        )),
+        STATUS_SENT => match m.upload_status.as_str() {
+            UPLOAD_NONE => None,
+            UPLOAD_PENDING => Some("Uploading to Sent…".to_string()),
+            UPLOAD_UPLOADED => Some("Uploaded".to_string()),
+            UPLOAD_ERROR => Some(format!(
+                "Upload failed: {}",
+                m.upload_error.as_deref().unwrap_or("unknown error")
+            )),
+            _ => None,
+        },
+        STATUS_DRAFT => match m.upload_status.as_str() {
+            UPLOAD_NONE => None,
+            UPLOAD_PENDING => Some("Uploading draft…".to_string()),
+            UPLOAD_UPLOADED => Some("Draft uploaded".to_string()),
+            UPLOAD_ERROR => Some(format!(
+                "Draft upload failed: {}",
+                m.upload_error.as_deref().unwrap_or("unknown error")
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn local_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalMessage> {
@@ -896,5 +1002,146 @@ fn local_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalMess
         refs: row.get(10)?,
         created_at: row.get(11)?,
         sent_at: row.get(12)?,
+        error: row.get(13)?,
+        upload_status: row.get(14)?,
+        upload_error: row.get(15)?,
     })
+}
+
+#[cfg(test)]
+mod local_message_tests {
+    use super::*;
+
+    fn msg(status: &str, upload_status: &str) -> LocalMessage {
+        LocalMessage {
+            id: 1,
+            account: "personal".to_string(),
+            status: status.to_string(),
+            from_addr: "alice@example.com".to_string(),
+            to_addr: "bob@example.com".to_string(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: "Hi".to_string(),
+            body: "Hello".to_string(),
+            in_reply_to: String::new(),
+            refs: String::new(),
+            created_at: "2026-01-01T00:00:00+00:00".to_string(),
+            sent_at: None,
+            error: None,
+            upload_status: upload_status.to_string(),
+            upload_error: None,
+        }
+    }
+
+    #[test]
+    fn plain_draft_has_no_status_label() {
+        assert_eq!(
+            local_message_status_label(&msg(STATUS_DRAFT, UPLOAD_NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn sending_draft_shows_in_flight_label() {
+        assert_eq!(
+            local_message_status_label(&msg(STATUS_SENDING, UPLOAD_NONE)),
+            Some("Sending…".to_string())
+        );
+    }
+
+    #[test]
+    fn send_error_label_includes_error_text() {
+        let mut m = msg(STATUS_SEND_ERROR, UPLOAD_NONE);
+        m.error = Some("connection refused".to_string());
+        assert_eq!(
+            local_message_status_label(&m),
+            Some("Send failed: connection refused".to_string())
+        );
+    }
+
+    #[test]
+    fn sent_with_no_upload_configured_has_no_label() {
+        assert_eq!(
+            local_message_status_label(&msg(STATUS_SENT, UPLOAD_NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn sent_upload_pending_shows_uploading_label() {
+        assert_eq!(
+            local_message_status_label(&msg(STATUS_SENT, UPLOAD_PENDING)),
+            Some("Uploading to Sent…".to_string())
+        );
+    }
+
+    #[test]
+    fn sent_upload_error_includes_error_text() {
+        let mut m = msg(STATUS_SENT, UPLOAD_ERROR);
+        m.upload_error = Some("folder does not exist".to_string());
+        assert_eq!(
+            local_message_status_label(&m),
+            Some("Upload failed: folder does not exist".to_string())
+        );
+    }
+
+    #[test]
+    fn draft_upload_states_produce_distinct_labels() {
+        assert_eq!(
+            local_message_status_label(&msg(STATUS_DRAFT, UPLOAD_PENDING)),
+            Some("Uploading draft…".to_string())
+        );
+        assert_eq!(
+            local_message_status_label(&msg(STATUS_DRAFT, UPLOAD_UPLOADED)),
+            Some("Draft uploaded".to_string())
+        );
+    }
+
+    #[test]
+    fn drafts_query_includes_in_flight_and_errored_rows() {
+        let db = MailDb::open_in_memory().unwrap();
+        let id1 = db
+            .save_draft("personal", "a@b.com", "c@d.com", "", "", "s1", "b1", "", "")
+            .unwrap();
+        let id2 = db
+            .save_draft("personal", "a@b.com", "c@d.com", "", "", "s2", "b2", "", "")
+            .unwrap();
+        let id3 = db
+            .save_draft("personal", "a@b.com", "c@d.com", "", "", "s3", "b3", "", "")
+            .unwrap();
+        db.mark_draft_sending(id2).unwrap();
+        db.mark_draft_send_error(id3, "timeout").unwrap();
+
+        let drafts = db.get_drafts("personal").unwrap();
+        assert_eq!(drafts.len(), 3);
+
+        db.mark_draft_sent(id1).unwrap();
+        let drafts = db.get_drafts("personal").unwrap();
+        assert_eq!(drafts.len(), 2);
+        let sent = db.get_sent("personal").unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].id, id1);
+    }
+
+    #[test]
+    fn upload_status_round_trips_through_db() {
+        let db = MailDb::open_in_memory().unwrap();
+        let id = db
+            .save_draft("personal", "a@b.com", "c@d.com", "", "", "s", "b", "", "")
+            .unwrap();
+        db.mark_draft_sent(id).unwrap();
+        db.set_upload_pending(id).unwrap();
+        let sent = db.get_sent("personal").unwrap();
+        assert_eq!(sent[0].upload_status, UPLOAD_PENDING);
+
+        db.set_upload_error(id, "no such mailbox").unwrap();
+        let sent = db.get_sent("personal").unwrap();
+        assert_eq!(sent[0].upload_status, UPLOAD_ERROR);
+        assert_eq!(sent[0].upload_error.as_deref(), Some("no such mailbox"));
+
+        db.set_upload_success(id).unwrap();
+        let sent = db.get_sent("personal").unwrap();
+        assert_eq!(sent[0].upload_status, UPLOAD_UPLOADED);
+        assert_eq!(sent[0].upload_error, None);
+    }
 }

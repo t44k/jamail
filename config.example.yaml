@@ -44,13 +44,34 @@ accounts:
         type: command
         value: pass show email/work
       starttls: true
-    # Optional: only sync these folders, in this order.
-    # Without this, all folders are synced (except Gmail's All Mail/Spam).
+    # Optional: only sync these folders, in this order. This same order is
+    # also used for the folder selector (F) — without this, all folders are
+    # synced/shown (except Gmail's All Mail/Spam), INBOX first then
+    # alphabetical.
     folders:
       - INBOX
       - Sent
       - Drafts
       - Archive
+    # Optional: additional "From" identities to cycle through at compose
+    # time (Left/Right on the From field). Without this, compose uses a
+    # single identity built from display_name/email.
+    senders:
+      - Alice Smith <alice@corp.com>
+      - Alice (Support) <support@corp.com>
+    # Optional: upload a copy of sent messages / newly-saved drafts to these
+    # IMAP folders. Each is independently optional — unset (the default)
+    # means "don't upload"; sent/drafts still work normally, just cached
+    # locally only.
+    sent_folder: Sent
+    draft_folder: Drafts
+    # Optional: folders that trigger a desktop notification + unobtrusive
+    # sound when new mail arrives (uses notify-send, so it works across
+    # Wayland compositors including Hyprland/Omarchy setups; silently does
+    # nothing if notify-send/sound player aren't installed). Unset (the
+    # default) means no notifications for this account.
+    notify_folders:
+      - INBOX
 
   # Gmail example
   gmail:

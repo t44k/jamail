@@ -16,6 +16,9 @@ pub struct Thread {
     pub newest_from: String,
     /// Whether any email in this thread has attachments.
     pub has_attachments: bool,
+    /// Cached from the newest email's `status_label` (Drafts/Sent in-flight
+    /// state); `None` for real IMAP-synced threads.
+    pub newest_status_label: Option<String>,
 }
 
 #[derive(Clone)]
@@ -187,6 +190,7 @@ pub fn build_threads(emails: &[Email]) -> Vec<Thread> {
         let oldest = &emails[*indices.last().unwrap()];
         let newest_date = newest.date;
         let newest_from = newest.from.clone();
+        let newest_status_label = newest.status_label.clone();
         let unread_count = indices.iter().filter(|&&i| emails[i].is_unread).count();
         let has_attachments = indices.iter().any(|&i| emails[i].has_attachments);
         let subject = normalize_subject(&oldest.subject);
@@ -206,6 +210,7 @@ pub fn build_threads(emails: &[Email]) -> Vec<Thread> {
             email_indices: indices,
             newest_from,
             has_attachments,
+            newest_status_label,
         });
     }
 

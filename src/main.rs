@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod db;
 mod mail;
+mod notify;
 mod smtp;
 mod sync;
 #[allow(dead_code)]
@@ -13,11 +14,14 @@ use app::{App, ComposeField, DetailMode, ViewMode};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEventKind,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        supports_keyboard_enhancement,
+    },
 };
 use ratatui::prelude::*;
 use ratatui_image::picker::Picker;
@@ -79,9 +83,7 @@ fn main() -> Result<()> {
     if keyboard_enhanced {
         let _ = execute!(
             stdout,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            )
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
     }
 
@@ -188,13 +190,17 @@ fn run_app(
                     }
                 }
                 sync::SyncEvent::FolderComplete(folder, count) => {
-                    let should_refresh = folder == app.current_folder
-                        || (app.is_global_inbox && folder == "INBOX");
+                    let should_refresh =
+                        folder == app.current_folder || (app.is_global_inbox && folder == "INBOX");
                     if count > 0 && should_refresh {
                         app.refresh_emails(db);
                         if !app.status_sticky {
                             app.status_msg = format!("{}: +{} new", folder, count);
                         }
+                    }
+                    if count > 0 && app.should_notify_for_folder(&folder) {
+                        let account_label = app.current_account.clone();
+                        notify::notify_new_mail(&account_label, &folder, count);
                     }
                 }
                 sync::SyncEvent::AllComplete => {
@@ -210,8 +216,8 @@ fn run_app(
                     }
                 }
                 sync::SyncEvent::FlagsChanged(folder) => {
-                    let should_refresh = folder == app.current_folder
-                        || (app.is_global_inbox && folder == "INBOX");
+                    let should_refresh =
+                        folder == app.current_folder || (app.is_global_inbox && folder == "INBOX");
                     if should_refresh {
                         app.refresh_emails(db);
                     }
@@ -224,28 +230,21 @@ fn run_app(
                         app.rebuild_folder_tree();
                     }
                 }
+                sync::SyncEvent::UploadComplete(kind, local_id) => {
+                    app.handle_upload_event(db, kind, local_id, None);
+                }
+                sync::SyncEvent::UploadError(kind, local_id, e) => {
+                    app.handle_upload_event(db, kind, local_id, Some(e));
+                }
             }
         }
 
         // Drain completed send-queue results.
         while let Ok(result) = send_queue.result_rx.try_recv() {
-            match result.error {
-                None => {
-                    // Mark draft as sent in DB
-                    if let Some(id) = result.draft_id {
-                        let _ = db.mark_draft_sent(id);
-                    }
-                    app.last_send_error = None;
-                    // Always overwrite: the sticky "Queued for sending" message set when
-                    // the job was enqueued must be replaced by the send outcome.
-                    app.status_msg = "Message sent!".to_string();
-                    app.status_sticky = true;
-                }
-                Some(e) => {
-                    app.last_send_error = Some(e.clone());
-                    app.status_msg = format!("Send failed: {}", e);
-                    app.status_sticky = true;
-                }
+            if let Some(upload) = app.handle_send_result(db, result)
+                && let Ok(mut queue) = current_sync_control.upload_queue.lock()
+            {
+                queue.push(upload);
             }
         }
 
@@ -331,14 +330,17 @@ fn run_app(
 
                                     if needs_account_switch {
                                         // Shut down old sync thread
-                                        current_sync_control.shutdown.store(true, Ordering::Relaxed);
+                                        current_sync_control
+                                            .shutdown
+                                            .store(true, Ordering::Relaxed);
 
                                         app.current_account = acct_name.clone();
 
                                         // Load emails from cache for new account+folder
-                                        if let Ok(emails) =
-                                            db.get_email_list(&app.current_account, &app.current_folder)
-                                        {
+                                        if let Ok(emails) = db.get_email_list(
+                                            &app.current_account,
+                                            &app.current_folder,
+                                        ) {
                                             app.emails = emails;
                                             let expanded =
                                                 std::mem::take(&mut app.threaded_view.expanded);
@@ -370,7 +372,8 @@ fn run_app(
                                         }
                                     } else {
                                         // Same account, just switch folder
-                                        if let Ok(mut cf) = current_sync_control.current_folder.write()
+                                        if let Ok(mut cf) =
+                                            current_sync_control.current_folder.write()
                                         {
                                             *cf = folder_name;
                                         }
@@ -399,36 +402,36 @@ fn run_app(
                         {
                             app.delete_selected_draft(db);
                         } else {
-                        match key.code {
-                            KeyCode::Char('q') => {
-                                app.should_quit = true;
-                                return Ok(());
-                            }
-                            KeyCode::Down => app.move_down(),
-                            KeyCode::Up => app.move_up(),
-                            KeyCode::PageDown => app.page_down(page),
-                            KeyCode::PageUp => app.page_up(page),
-                            KeyCode::Home | KeyCode::Char('g') => app.go_home(),
-                            KeyCode::End | KeyCode::Char('G') => app.go_end(),
-                            KeyCode::Left => app.enter_folder_select(),
-                            KeyCode::Enter | KeyCode::Right => {
-                                if app.virtual_folder.as_deref() == Some("Drafts") {
-                                    // Resume editing the draft
-                                    app.resume_draft(db, app.selected);
-                                } else {
-                                    app.open_detail(db);
-                                    enqueue_mark_seen(app, db, &current_sync_control);
+                            match key.code {
+                                KeyCode::Char('q') => {
+                                    app.should_quit = true;
+                                    return Ok(());
                                 }
+                                KeyCode::Down => app.move_down(),
+                                KeyCode::Up => app.move_up(),
+                                KeyCode::PageDown => app.page_down(page),
+                                KeyCode::PageUp => app.page_up(page),
+                                KeyCode::Home | KeyCode::Char('g') => app.go_home(),
+                                KeyCode::End | KeyCode::Char('G') => app.go_end(),
+                                KeyCode::Left => app.enter_folder_select(),
+                                KeyCode::Enter | KeyCode::Right => {
+                                    if app.virtual_folder.as_deref() == Some("Drafts") {
+                                        // Resume editing the draft
+                                        app.resume_draft(db, app.selected);
+                                    } else {
+                                        app.open_detail(db);
+                                        enqueue_mark_seen(app, db, &current_sync_control);
+                                    }
+                                }
+                                KeyCode::Tab | KeyCode::Char('l') => app.toggle_thread_expand(),
+                                KeyCode::Char(' ') => app.next_thread(),
+                                KeyCode::BackTab => app.prev_thread(),
+                                KeyCode::Char('t') => app.toggle_thread_mode(),
+                                KeyCode::Char('/') => app.enter_search(),
+                                KeyCode::Char('F') => app.enter_folder_select(),
+                                KeyCode::Char('n') => app.enter_compose_new(db),
+                                _ => {}
                             }
-                            KeyCode::Tab | KeyCode::Char('l') => app.toggle_thread_expand(),
-                            KeyCode::Char(' ') => app.next_thread(),
-                            KeyCode::BackTab => app.prev_thread(),
-                            KeyCode::Char('t') => app.toggle_thread_mode(),
-                            KeyCode::Char('/') => app.enter_search(),
-                            KeyCode::Char('F') => app.enter_folder_select(),
-                            KeyCode::Char('n') => app.enter_compose_new(db),
-                            _ => {}
-                        }
                         } // end Ctrl+D branch
                     }
                     ViewMode::Detail => {
@@ -598,7 +601,16 @@ fn run_app(
 
                         // Ctrl+S to save draft
                         if is_ctrl && key.code == KeyCode::Char('s') {
-                            app.save_compose_as_draft(db);
+                            let was_new = app.save_compose_as_draft(db);
+                            // Only upload once per draft (on first save) to
+                            // avoid piling up duplicate remote copies on
+                            // every subsequent edit.
+                            if was_new
+                                && let Some(upload) = app.enqueue_draft_upload(db)
+                                && let Ok(mut queue) = current_sync_control.upload_queue.lock()
+                            {
+                                queue.push(upload);
+                            }
                             continue;
                         }
 
@@ -871,6 +883,16 @@ fn handle_compose_send(
         }
     };
 
+    // Validate the selected From address against the account's configured
+    // sender identities. The From field can only be *set* by cycling
+    // through those identities, but this catches any stale/corrupted state
+    // before mail ever gets dispatched.
+    if !app.compose_from_is_valid() {
+        app.status_msg = "Invalid sender address".to_string();
+        app.status_sticky = true;
+        return;
+    }
+
     // Validate To is non-empty
     if app.compose_to.trim().is_empty() {
         app.status_msg = "To field is empty".to_string();
@@ -897,9 +919,18 @@ fn handle_compose_send(
         })
         .collect();
 
-    // Auto-save as draft before sending
+    // Auto-save as draft before sending, then flip it to "sending" so it
+    // stays visible in the Drafts list (with an in-flight indicator)
+    // instead of disappearing until the background send completes.
     app.save_compose_as_draft(db);
     let draft_id = app.compose_draft_id;
+    if let Some(id) = draft_id {
+        let _ = db.mark_draft_sending(id);
+        if let Some(vf) = app.virtual_folder.clone() {
+            app.load_virtual_folder(db, &vf);
+        }
+    }
+    let sent_folder = app.current_sent_folder();
 
     send_queue.enqueue(smtp::SendJob {
         smtp_config,
@@ -913,6 +944,7 @@ fn handle_compose_send(
         in_reply_to: reply_msg_id,
         references: reply_refs,
         draft_id,
+        sent_folder,
     });
 
     app.status_msg = "Queued for sending".to_string();
