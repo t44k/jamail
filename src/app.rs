@@ -2192,8 +2192,8 @@ impl App {
             }
         }
 
-        dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        dirs.sort_by_key(|a| a.name.to_lowercase());
+        files.sort_by_key(|a| a.name.to_lowercase());
 
         self.filebrowser_entries = dirs;
         self.filebrowser_entries.extend(files);
@@ -5243,6 +5243,7 @@ mod tests {
         let upload = app.handle_send_result(
             &db,
             crate::smtp::SendResult {
+                account: "personal".to_string(),
                 draft_id: Some(id),
                 error: None,
                 sent_folder: None,
@@ -5266,6 +5267,7 @@ mod tests {
             .handle_send_result(
                 &db,
                 crate::smtp::SendResult {
+                    account: "personal".to_string(),
                     draft_id: Some(id),
                     error: None,
                     sent_folder: Some("Sent".to_string()),
@@ -5291,6 +5293,7 @@ mod tests {
         let upload = app.handle_send_result(
             &db,
             crate::smtp::SendResult {
+                account: "personal".to_string(),
                 draft_id: Some(id),
                 error: Some("connection refused".to_string()),
                 sent_folder: Some("Sent".to_string()),

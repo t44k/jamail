@@ -1,6 +1,7 @@
 use crate::config::JamailAccount;
 use crate::db::MailDb;
 use crate::mail::{FolderInfo, MailClient};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -16,7 +17,12 @@ pub struct MarkSeenRequest {
 /// Which local-message flow an `UploadRequest` belongs to. Both share the
 /// same upload machinery (APPEND to a configured IMAP folder); the kind is
 /// only used to route the completion event back to the right UI state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Also used as the wire representation in the `jamaild`/`jamail` IPC
+/// protocol's `EnqueueUpload` request and `UploadComplete`/`UploadError`
+/// events (see `ipc` module docs) — hence the `Serialize`/`Deserialize`
+/// derives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UploadKind {
     Sent,
     Draft,

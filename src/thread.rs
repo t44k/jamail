@@ -43,6 +43,12 @@ impl ThreadedView {
     }
 }
 
+impl Default for ThreadedView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // Union-Find data structure for merging thread groups
 struct UnionFind {
     parent: Vec<usize>,
@@ -215,7 +221,7 @@ pub fn build_threads(emails: &[Email]) -> Vec<Thread> {
     }
 
     // Sort threads by newest_date descending
-    threads.sort_by(|a, b| b.newest_date.cmp(&a.newest_date));
+    threads.sort_by_key(|t| std::cmp::Reverse(t.newest_date));
 
     threads
 }
