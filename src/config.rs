@@ -6,6 +6,19 @@ use std::path::PathBuf;
 #[derive(Debug, Deserialize)]
 pub struct JamailConfig {
     pub accounts: IndexMap<String, JamailAccount>,
+    /// Optional `jamaild`/`jamail` IPC settings. Unset (default): the socket
+    /// path is derived from `$XDG_RUNTIME_DIR` (see `ipc::resolve_socket_path`).
+    pub daemon: Option<DaemonConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct DaemonConfig {
+    /// Override the Unix domain socket path used for `jamaild`<->`jamail`
+    /// IPC. Unset (default): `$XDG_RUNTIME_DIR/jamail/jamaild.sock`, falling
+    /// back to `/tmp/jamail-<uid>/jamaild.sock` when `XDG_RUNTIME_DIR` isn't
+    /// set. The `JAMAIL_SOCKET` environment variable, when set, always takes
+    /// precedence over this setting on both binaries.
+    pub socket_path: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -263,6 +276,41 @@ mod tests {
         assert_eq!(
             acc.notify_folders,
             Some(vec!["INBOX".to_string(), "Important".to_string()])
+        );
+    }
+
+    #[test]
+    fn daemon_socket_path_defaults_to_none_when_unconfigured() {
+        let cfg = parse(
+            "accounts:\n\
+             \x20 personal:\n\
+             \x20   email: alice@example.com\n\
+             \x20   imap:\n\
+             \x20     host: imap.example.com\n\
+             \x20     port: 993\n\
+             \x20     login: alice@example.com\n\
+             \x20     auth: {type: password, value: secret}\n",
+        );
+        assert!(cfg.daemon.is_none());
+    }
+
+    #[test]
+    fn daemon_socket_path_parses_when_configured() {
+        let cfg = parse(
+            "daemon:\n\
+             \x20 socket_path: /custom/run/jamaild.sock\n\
+             accounts:\n\
+             \x20 personal:\n\
+             \x20   email: alice@example.com\n\
+             \x20   imap:\n\
+             \x20     host: imap.example.com\n\
+             \x20     port: 993\n\
+             \x20     login: alice@example.com\n\
+             \x20     auth: {type: password, value: secret}\n",
+        );
+        assert_eq!(
+            cfg.daemon.and_then(|d| d.socket_path),
+            Some("/custom/run/jamaild.sock".to_string())
         );
     }
 

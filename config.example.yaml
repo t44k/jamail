@@ -1,6 +1,14 @@
 # jamail configuration
 # Copy to ~/.config/jamail/config.yaml
 
+# Optional: jamaild/jamail IPC settings. Uncomment to override the socket
+# path jamaild listens on and jamail connects to (default:
+# $XDG_RUNTIME_DIR/jamail/jamaild.sock, or /tmp/jamail-<uid>/jamaild.sock if
+# XDG_RUNTIME_DIR isn't set). The JAMAIL_SOCKET environment variable always
+# takes precedence over this when set.
+# daemon:
+#   socket_path: /run/user/1000/jamail/jamaild.sock
+
 accounts:
   # Account name (used internally, shown in folder selector)
   personal:

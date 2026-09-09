@@ -743,16 +743,28 @@ impl MailDb {
         Ok(changed)
     }
 
-    pub fn get_email_uid_and_folder(&self, id: i64) -> Result<Option<(u32, String)>> {
+    /// Look up the (account, uid, folder) an email belongs to by its local
+    /// `id`. Includes `account` (not just `uid`/`folder`) because `id` is a
+    /// single autoincrement PK shared across every account (see CLAUDE.md
+    /// "Emails have an autoincrement id... All UI lookups use id") — with
+    /// `jamaild` now syncing every configured account concurrently, callers
+    /// that route a request to a specific account's IMAP connection (e.g.
+    /// mark-seen) need to know *which* account, not just assume "the
+    /// current one" (wrong for the cross-account Global Inbox view).
+    pub fn get_email_account_uid_and_folder(
+        &self,
+        id: i64,
+    ) -> Result<Option<(String, u32, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT uid, folder FROM emails WHERE id = ?1")?;
+            .prepare("SELECT account, uid, folder FROM emails WHERE id = ?1")?;
         let mut rows = stmt.query(params![id])?;
         match rows.next()? {
             Some(row) => {
-                let uid: u32 = row.get(0)?;
-                let folder: String = row.get(1)?;
-                Ok(Some((uid, folder)))
+                let account: String = row.get(0)?;
+                let uid: u32 = row.get(1)?;
+                let folder: String = row.get(2)?;
+                Ok(Some((account, uid, folder)))
             }
             None => Ok(None),
         }

@@ -1318,6 +1318,7 @@ name = "jamail"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "crossterm",
  "dirs",
@@ -1327,6 +1328,7 @@ dependencies = [
  "imap-proto",
  "indexmap",
  "lettre",
+ "libc",
  "mailparse",
  "mime_guess",
  "native-tls",
@@ -1335,6 +1337,7 @@ dependencies = [
  "regex",
  "rusqlite",
  "serde",
+ "serde_json",
  "serde_yml",
  "textwrap",
  "unicode-width",

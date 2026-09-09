@@ -1,16 +1,19 @@
-mod app;
-mod config;
-mod db;
-mod mail;
-mod notify;
-mod smtp;
-mod sync;
-#[allow(dead_code)]
-mod theme;
-mod thread;
+//! `jamail` — the foreground terminal UI client.
+//!
+//! Reads the shared local SQLite cache directly (same as before the
+//! daemon/client split) and talks to the `jamaild` background daemon over
+//! the IPC protocol in `jamail::ipc` for anything that needs a live IMAP
+//! session: which folder to prioritize for IDLE, mark-seen, and Sent/Draft
+//! folder uploads. All accounts sync continuously in `jamaild` regardless
+//! of what this client is looking at — see `jamail::daemon` module docs.
+//!
+//! If no `jamaild` is reachable at startup, one is auto-spawned (see
+//! `jamail::daemon::try_autostart`); either way this binary never blocks
+//! waiting for it — the UI renders immediately from the local cache and the
+//! IPC connection comes up in the background, with its own status-bar
+//! indicator while disconnected/reconnecting.
 
 use anyhow::{Context, Result};
-use app::{App, ComposeField, DetailMode, ViewMode};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -23,12 +26,11 @@ use crossterm::{
         supports_keyboard_enhancement,
     },
 };
+use jamail::app::{App, ComposeField, DetailMode, ViewMode};
+use jamail::{app, config, daemon, db, ipc, smtp};
 use ratatui::prelude::*;
 use ratatui_image::picker::Picker;
 use std::io::{self, IsTerminal};
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
@@ -40,14 +42,9 @@ fn main() -> Result<()> {
     let config = config::JamailConfig::load().context("Failed to load jamail config")?;
     let (default_name, _default_account) = config.default_account()?;
     let default_name = default_name.to_string();
+    let daemon_socket_override = config.daemon.as_ref().and_then(|d| d.socket_path.clone());
 
     let accounts: Vec<(String, config::JamailAccount)> = config.accounts.into_iter().collect();
-
-    let account = accounts
-        .iter()
-        .find(|(n, _)| *n == default_name)
-        .map(|(_, a)| a.clone())
-        .context("Default account not found")?;
 
     // Open database (creates on first run)
     let db = db::MailDb::open().context("Failed to open mail database")?;
@@ -62,15 +59,17 @@ fn main() -> Result<()> {
     // Load cached folders
     let cached_folders = db.get_folders(&default_name).unwrap_or_default();
 
-    // Spawn background sync thread
-    let (sync_tx, sync_rx) = mpsc::channel();
-    let sync_control = Arc::new(sync::SyncControl::new(&current_folder));
-    let _sync_handle = sync::spawn_sync_thread(
-        account,
-        default_name.clone(),
-        Arc::clone(&sync_control),
-        sync_tx,
-    );
+    // Connect to jamaild over IPC (auto-spawning one if unreachable). This
+    // never blocks: the IpcClient's own reconnect loop brings the
+    // connection up in the background regardless of whether jamaild was
+    // already running, was just spawned, or stays unreachable for a while.
+    let socket_path = ipc::resolve_socket_path(daemon_socket_override.as_deref());
+    daemon::try_autostart(&socket_path);
+    let ipc_client = ipc::IpcClient::spawn(socket_path);
+    ipc_client.send(ipc::Request::SetCurrentFolder {
+        account: default_name.clone(),
+        folder: current_folder.clone(),
+    });
 
     // Setup terminal
     enable_raw_mode()?;
@@ -117,8 +116,7 @@ fn main() -> Result<()> {
         &mut terminal,
         &mut app,
         &db,
-        sync_rx,
-        &sync_control,
+        &ipc_client,
         &accounts,
         send_queue,
     );
@@ -147,20 +145,12 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     db: &db::MailDb,
-    sync_rx: mpsc::Receiver<sync::SyncEvent>,
-    sync_control: &Arc<sync::SyncControl>,
+    ipc_client: &ipc::IpcClient,
     accounts: &[(String, config::JamailAccount)],
     send_queue: smtp::SendQueue,
 ) -> Result<()> {
     // Track time between loop iterations to detect sleep/wake
     let mut last_loop_time = Instant::now();
-
-    // Track current sync control so we can shut it down on account switch
-    let mut current_sync_control = Arc::clone(sync_control);
-    // Keep sender alive to prevent channel from closing; receiver is swapped on account switch
-    #[allow(unused_assignments)]
-    let mut _sync_tx_keepalive: Option<mpsc::Sender<sync::SyncEvent>> = None;
-    let mut current_sync_rx = sync_rx;
 
     loop {
         let cf = terminal.draw(|frame| {
@@ -168,83 +158,34 @@ fn run_app(
             app.render_selection(frame);
         })?;
 
-        // Drain sync events (non-blocking)
-        while let Ok(ev) = current_sync_rx.try_recv() {
-            match ev {
-                sync::SyncEvent::Syncing(folder) => {
-                    app.spinner_active = true;
-                    if !app.status_sticky {
-                        app.status_msg = format!("Syncing {}...", folder);
-                    }
-                }
-                sync::SyncEvent::Progress(folder, done, total) => {
-                    if !app.status_sticky {
-                        app.status_msg = format!("Syncing {} {}/{}...", folder, done, total);
-                    }
-                    if done % 20 == 0 || done == total {
-                        let should_refresh = folder == app.current_folder
-                            || (app.is_global_inbox && folder == "INBOX");
-                        if should_refresh {
-                            app.refresh_emails(db);
-                        }
-                    }
-                }
-                sync::SyncEvent::FolderComplete(folder, count) => {
-                    let should_refresh =
-                        folder == app.current_folder || (app.is_global_inbox && folder == "INBOX");
-                    if count > 0 && should_refresh {
-                        app.refresh_emails(db);
-                        if !app.status_sticky {
-                            app.status_msg = format!("{}: +{} new", folder, count);
-                        }
-                    }
-                    if count > 0 && app.should_notify_for_folder(&folder) {
-                        let account_label = app.current_account.clone();
-                        notify::notify_new_mail(&account_label, &folder, count);
-                    }
-                }
-                sync::SyncEvent::AllComplete => {
-                    app.spinner_active = false;
-                    if !app.status_sticky && app.status_msg.starts_with("Syncing") {
+        // Drain IPC events (non-blocking) — sync progress from jamaild for
+        // every account it manages, plus connection-lifecycle notices.
+        while let Ok(client_ev) = ipc_client.event_rx.try_recv() {
+            match client_ev {
+                ipc::ClientEvent::Connected => {
+                    if !app.status_sticky && app.status_msg.starts_with("jamaild") {
                         app.status_msg.clear();
                     }
                 }
-                sync::SyncEvent::Error(e) => {
+                ipc::ClientEvent::Disconnected(reason) => {
                     app.spinner_active = false;
                     if !app.status_sticky {
-                        app.status_msg = format!("Sync: {}", e);
+                        app.status_msg = format!("jamaild unreachable, retrying ({})", reason);
                     }
                 }
-                sync::SyncEvent::FlagsChanged(folder) => {
-                    let should_refresh =
-                        folder == app.current_folder || (app.is_global_inbox && folder == "INBOX");
-                    if should_refresh {
-                        app.refresh_emails(db);
-                    }
+                ipc::ClientEvent::Fatal(reason) => {
+                    app.status_msg = format!("jamaild: {}", reason);
+                    app.status_sticky = true;
                 }
-                sync::SyncEvent::FoldersLoaded(folders) => {
-                    app.account_folders
-                        .insert(app.current_account.clone(), folders);
-                    // Rebuild folder tree if we're on the folder select screen
-                    if app.view == ViewMode::FolderSelect {
-                        app.rebuild_folder_tree();
-                    }
-                }
-                sync::SyncEvent::UploadComplete(kind, local_id) => {
-                    app.handle_upload_event(db, kind, local_id, None);
-                }
-                sync::SyncEvent::UploadError(kind, local_id, e) => {
-                    app.handle_upload_event(db, kind, local_id, Some(e));
-                }
+                ipc::ClientEvent::Event(ev) => handle_sync_event(app, db, ev),
             }
         }
 
         // Drain completed send-queue results.
         while let Ok(result) = send_queue.result_rx.try_recv() {
-            if let Some(upload) = app.handle_send_result(db, result)
-                && let Ok(mut queue) = current_sync_control.upload_queue.lock()
-            {
-                queue.push(upload);
+            let account = result.account.clone();
+            if let Some(upload) = app.handle_send_result(db, result) {
+                send_upload_request(ipc_client, &account, upload);
             }
         }
 
@@ -254,9 +195,9 @@ fn run_app(
             let loop_elapsed = last_loop_time.elapsed();
             last_loop_time = Instant::now();
             if loop_elapsed > Duration::from_secs(70) {
-                current_sync_control
-                    .force_reconnect
-                    .store(true, Ordering::Relaxed);
+                ipc_client.send(ipc::Request::ForceReconnect {
+                    account: app.current_account.clone(),
+                });
             }
             continue;
         }
@@ -321,68 +262,26 @@ fn run_app(
                                     app.list_scroll_offset = 0;
                                     app.view = ViewMode::List;
                                 } else {
+                                    // Real account+folder. jamaild syncs every
+                                    // configured account continuously regardless
+                                    // of this selection — switching here just
+                                    // loads the cache for the new account/folder
+                                    // and tells jamaild which one to prioritize
+                                    // for IMAP IDLE (no thread spawn/teardown
+                                    // needed client-side any more).
                                     app.is_global_inbox = false;
                                     app.virtual_folder = None;
                                     app.local_messages.clear();
-                                    let needs_account_switch = acct_name != app.current_account;
-
+                                    app.current_account = acct_name.clone();
                                     app.current_folder = folder_name.clone();
+                                    app.refresh_emails(db);
+                                    app.selected = 0;
+                                    app.list_scroll_offset = 0;
 
-                                    if needs_account_switch {
-                                        // Shut down old sync thread
-                                        current_sync_control
-                                            .shutdown
-                                            .store(true, Ordering::Relaxed);
-
-                                        app.current_account = acct_name.clone();
-
-                                        // Load emails from cache for new account+folder
-                                        if let Ok(emails) = db.get_email_list(
-                                            &app.current_account,
-                                            &app.current_folder,
-                                        ) {
-                                            app.emails = emails;
-                                            let expanded =
-                                                std::mem::take(&mut app.threaded_view.expanded);
-                                            app.threaded_view.threads =
-                                                thread::build_threads(&app.emails);
-                                            app.threaded_view.expanded = expanded;
-                                            thread::rebuild_rows(&mut app.threaded_view);
-                                            app.selected = 0;
-                                            app.list_scroll_offset = 0;
-                                        }
-
-                                        // Spawn new sync thread
-                                        if let Some((_, new_account)) =
-                                            accounts.iter().find(|(n, _)| *n == acct_name)
-                                        {
-                                            let new_control =
-                                                Arc::new(sync::SyncControl::new(&folder_name));
-                                            let (tx, rx) = mpsc::channel();
-                                            let _handle = sync::spawn_sync_thread(
-                                                new_account.clone(),
-                                                acct_name.clone(),
-                                                Arc::clone(&new_control),
-                                                tx.clone(),
-                                            );
-                                            current_sync_control = new_control;
-                                            // Keep sender alive to prevent channel close
-                                            _sync_tx_keepalive = Some(tx);
-                                            current_sync_rx = rx;
-                                        }
-                                    } else {
-                                        // Same account, just switch folder
-                                        if let Ok(mut cf) =
-                                            current_sync_control.current_folder.write()
-                                        {
-                                            *cf = folder_name;
-                                        }
-
-                                        // Load emails from cache immediately
-                                        app.refresh_emails(db);
-                                        app.selected = 0;
-                                        app.list_scroll_offset = 0;
-                                    }
+                                    ipc_client.send(ipc::Request::SetCurrentFolder {
+                                        account: acct_name,
+                                        folder: folder_name,
+                                    });
 
                                     app.view = ViewMode::List;
                                 }
@@ -420,7 +319,7 @@ fn run_app(
                                         app.resume_draft(db, app.selected);
                                     } else {
                                         app.open_detail(db);
-                                        enqueue_mark_seen(app, db, &current_sync_control);
+                                        enqueue_mark_seen(app, db, ipc_client);
                                     }
                                 }
                                 KeyCode::Tab | KeyCode::Char('l') => app.toggle_thread_expand(),
@@ -483,7 +382,7 @@ fn run_app(
                                 DetailMode::Text => {
                                     if key.modifiers.contains(KeyModifiers::SHIFT) {
                                         app.prev_in_list(db);
-                                        enqueue_mark_seen(app, db, &current_sync_control);
+                                        enqueue_mark_seen(app, db, ipc_client);
                                     } else {
                                         app.close_detail();
                                     }
@@ -498,7 +397,7 @@ fn run_app(
                                 DetailMode::Text => {
                                     if key.modifiers.contains(KeyModifiers::SHIFT) {
                                         app.next_in_list(db);
-                                        enqueue_mark_seen(app, db, &current_sync_control);
+                                        enqueue_mark_seen(app, db, ipc_client);
                                     }
                                     // Plain Right in Text mode: no action
                                 }
@@ -530,7 +429,7 @@ fn run_app(
                             KeyCode::PageDown => {
                                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                                     app.next_in_thread(db);
-                                    enqueue_mark_seen(app, db, &current_sync_control);
+                                    enqueue_mark_seen(app, db, ipc_client);
                                 } else {
                                     app.scroll_detail_page_down(page);
                                 }
@@ -538,7 +437,7 @@ fn run_app(
                             KeyCode::PageUp => {
                                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                                     app.prev_in_thread(db);
-                                    enqueue_mark_seen(app, db, &current_sync_control);
+                                    enqueue_mark_seen(app, db, ipc_client);
                                 } else {
                                     app.scroll_detail_page_up(page);
                                 }
@@ -565,7 +464,7 @@ fn run_app(
                         KeyCode::Enter | KeyCode::Right => {
                             if !app.search_results.is_empty() {
                                 app.open_detail(db);
-                                enqueue_mark_seen(app, db, &current_sync_control);
+                                enqueue_mark_seen(app, db, ipc_client);
                             } else {
                                 app.execute_search(db);
                             }
@@ -605,11 +504,8 @@ fn run_app(
                             // Only upload once per draft (on first save) to
                             // avoid piling up duplicate remote copies on
                             // every subsequent edit.
-                            if was_new
-                                && let Some(upload) = app.enqueue_draft_upload(db)
-                                && let Ok(mut queue) = current_sync_control.upload_queue.lock()
-                            {
-                                queue.push(upload);
+                            if was_new && let Some(upload) = app.enqueue_draft_upload(db) {
+                                send_upload_request(ipc_client, &app.current_account, upload);
                             }
                             continue;
                         }
@@ -820,6 +716,109 @@ fn run_app(
     }
 }
 
+/// Apply one daemon-pushed sync/upload event. Notification delivery is
+/// deliberately *not* decided here (or anywhere in this binary) — see
+/// `jamail::daemon::dispatch_sync_event`, which runs inside `jamaild` and
+/// fires regardless of what this client is displaying or whether it's even
+/// running.
+fn handle_sync_event(app: &mut App, db: &db::MailDb, ev: ipc::Event) {
+    match ev {
+        ipc::Event::Syncing { account, folder } => {
+            app.spinner_active = true;
+            if !app.status_sticky {
+                app.status_msg = format!("Syncing {}/{}...", account, folder);
+            }
+        }
+        ipc::Event::Progress {
+            account,
+            folder,
+            done,
+            total,
+        } => {
+            if !app.status_sticky {
+                app.status_msg = format!("Syncing {}/{} {}/{}...", account, folder, done, total);
+            }
+            if done % 20 == 0 || done == total {
+                let should_refresh = (account == app.current_account
+                    && folder == app.current_folder)
+                    || (app.is_global_inbox && folder == "INBOX");
+                if should_refresh {
+                    app.refresh_emails(db);
+                }
+            }
+        }
+        ipc::Event::FolderComplete {
+            account,
+            folder,
+            count,
+        } => {
+            let should_refresh = (account == app.current_account && folder == app.current_folder)
+                || (app.is_global_inbox && folder == "INBOX");
+            if count > 0 && should_refresh {
+                app.refresh_emails(db);
+                if !app.status_sticky {
+                    app.status_msg = format!("{}/{}: +{} new", account, folder, count);
+                }
+            }
+        }
+        ipc::Event::AllComplete { .. } => {
+            app.spinner_active = false;
+            if !app.status_sticky && app.status_msg.starts_with("Syncing") {
+                app.status_msg.clear();
+            }
+        }
+        ipc::Event::Error { account, message } => {
+            app.spinner_active = false;
+            if !app.status_sticky {
+                app.status_msg = format!("Sync {}: {}", account, message);
+            }
+        }
+        ipc::Event::FlagsChanged { account, folder } => {
+            let should_refresh = (account == app.current_account && folder == app.current_folder)
+                || (app.is_global_inbox && folder == "INBOX");
+            if should_refresh {
+                app.refresh_emails(db);
+            }
+        }
+        ipc::Event::FoldersLoaded { account, folders } => {
+            app.account_folders.insert(account, folders);
+            // Rebuild folder tree if we're on the folder select screen
+            if app.view == ViewMode::FolderSelect {
+                app.rebuild_folder_tree();
+            }
+        }
+        ipc::Event::UploadComplete { kind, local_id, .. } => {
+            app.handle_upload_event(db, kind, local_id, None);
+        }
+        ipc::Event::UploadError {
+            kind,
+            local_id,
+            message,
+            ..
+        } => {
+            app.handle_upload_event(db, kind, local_id, Some(message));
+        }
+    }
+}
+
+/// Base64-encode `upload.raw_message` and send it to `jamaild` as an
+/// `EnqueueUpload` request for `account`.
+fn send_upload_request(
+    ipc_client: &ipc::IpcClient,
+    account: &str,
+    upload: jamail::sync::UploadRequest,
+) {
+    use base64::Engine;
+    let raw_message_b64 = base64::engine::general_purpose::STANDARD.encode(&upload.raw_message);
+    ipc_client.send(ipc::Request::EnqueueUpload {
+        account: account.to_string(),
+        kind: upload.kind,
+        local_id: upload.local_id,
+        folder: upload.folder,
+        raw_message_b64,
+    });
+}
+
 fn extract_selection_text(buffer: &Buffer, sel: &app::Selection, area: Rect) -> String {
     let (sr, sc, er, ec) = sel.normalized();
     let mut result = String::new();
@@ -933,6 +932,7 @@ fn handle_compose_send(
     let sent_folder = app.current_sent_folder();
 
     send_queue.enqueue(smtp::SendJob {
+        account: app.current_account.clone(),
         smtp_config,
         from,
         to,
@@ -952,12 +952,15 @@ fn handle_compose_send(
     app.view = app.compose_previous_view.clone();
 }
 
-fn enqueue_mark_seen(app: &App, db: &db::MailDb, sync_control: &sync::SyncControl) {
+fn enqueue_mark_seen(app: &App, db: &db::MailDb, ipc_client: &ipc::IpcClient) {
     if let Some(id) = app.detail_id
-        && let Ok(Some((uid, folder))) = db.get_email_uid_and_folder(id)
-        && let Ok(mut queue) = sync_control.mark_seen_queue.lock()
+        && let Ok(Some((account, uid, folder))) = db.get_email_account_uid_and_folder(id)
     {
-        queue.push(sync::MarkSeenRequest { folder, uid });
+        ipc_client.send(ipc::Request::MarkSeen {
+            account,
+            folder,
+            uid,
+        });
     }
 }
 

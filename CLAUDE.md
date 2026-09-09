@@ -6,53 +6,103 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 jamail is a terminal email client built with ratatui/crossterm. It connects to IMAP servers, caches all mail locally in a compressed SQLite database, and provides instant full-text search via FTS5.
 
-Config is read from `~/.config/jamail/config.yaml`. Database lives at `~/.local/share/jamail/mail.db`.
+It ships as **two binaries** sharing one library crate (`src/lib.rs`):
+
+- **`jamaild`** (`src/bin/jamaild.rs` + `src/daemon.rs`) — a background daemon. Owns every configured account's IMAP connection/sync loop and all writes to the local cache, and is the sole place that decides to fire a desktop notification. Suitable for `systemd --user` (`contrib/systemd/jamaild.service`); syncs every account continuously from startup regardless of whether any client is connected.
+- **`jamail`** (`src/bin/jamail.rs`) — the terminal UI. Reads the cache directly and talks to `jamaild` over the IPC protocol in `src/ipc.rs` for anything needing a live IMAP session (which folder to IDLE on, mark-seen, Sent/Draft uploads) and for the sync-event stream. Auto-spawns a `jamaild` if none is reachable.
+
+Config is read from `~/.config/jamail/config.yaml` by **both** binaries independently (each reads what it needs; only `jamaild` needs IMAP credentials, only `jamail` needs SMTP credentials for compose/send). Database lives at `~/.local/share/jamail/mail.db`, opened independently by both (SQLite WAL mode allows concurrent reads/writes from multiple connections, same as before the daemon split).
 
 Rust edition 2024 — uses let-chain syntax (`if let ... && let ...`).
 
 ## Build Commands
 
 ```bash
-cargo build              # compile
-cargo run                # run (needs IMAP config and a TTY)
-cargo clippy             # lint
+cargo build --bins       # compile both jamail and jamaild
+cargo run --bin jamail   # run the TUI (needs IMAP config and a TTY; auto-spawns jamaild)
+cargo run --bin jamaild  # run the daemon in the foreground (needs IMAP config, no TTY needed)
+cargo clippy --all-targets -- -D warnings   # lint (lib + both bins + tests/)
 cargo fmt                # format
 ```
 
-Unit tests live inline in each module under `#[cfg(test)]` (`cargo test`). They cover pure logic (config parsing, folder ordering, notification triggers, draft raw-message building, status-label text) and DB/App state transitions via `MailDb::open_in_memory()` and a `test_app()` helper — not TUI rendering or live IMAP/SMTP.
+Unit tests live inline in each module under `#[cfg(test)]` (`cargo test`). They cover pure logic (config parsing, folder ordering, notification triggers, draft raw-message building, status-label text), IPC framing/serialization/version-handshake/reconnect behavior (`src/ipc.rs`), daemon request-handling/client-broadcast/notification-dispatch/socket-lifecycle behavior over real `UnixStream` pairs (`src/daemon.rs`), and DB/App state transitions via `MailDb::open_in_memory()` and a `test_app()` helper — not TUI rendering. `tests/smoke.rs` is a real end-to-end integration test: it spawns the actual compiled `jamaild`/`jamail` binaries and talks to the daemon over a real Unix socket (see that file's module doc for exactly what it covers and the one deliberate scope limitation — no live IMAP/TLS server is faked, since doing so would require weakening certificate validation in production code).
 
 ## Architecture
 
+### Daemon/Client IPC (jamaild <-> jamail)
+
+Replaces the old single-process "background sync thread" model. Full protocol
+definition — framing, versioning, error semantics, socket path resolution,
+lifecycle/shutdown — is documented in `src/ipc.rs`'s module doc comment;
+daemon-side process/connection model is documented in `src/daemon.rs`'s. Summary:
+
+- **Transport**: a Unix domain stream socket, `$XDG_RUNTIME_DIR/jamail/jamaild.sock`
+  by default (overridable via `JAMAIL_SOCKET` env var or `daemon.socket_path` in
+  config), directory `0700` / socket `0600`.
+- **Framing**: `[u32 LE length][JSON payload]`, capped at `ipc::MAX_FRAME_BYTES`.
+- **Handshake**: client sends `ClientHello{protocol_version}`; daemon replies
+  `ServerHello::Ok` or `ServerHello::VersionMismatch` (then closes) — see
+  `ipc::PROTOCOL_VERSION`/`ipc::is_compatible`.
+- **Requests** (`jamail` -> `jamaild`, one `Response` each): `Ping`,
+  `SetCurrentFolder{account,folder}` (IDLE-target hint only — never starts/stops
+  syncing an account), `MarkSeen`, `EnqueueUpload` (base64'd raw message; result
+  arrives later as an `UploadComplete`/`UploadError` event, correlated by
+  `local_id`), `ForceReconnect`, `Shutdown` (graceful: sets every account's
+  `sync::SyncControl.shutdown`, unlinks the socket, exits — same path SIGTERM/SIGINT
+  trigger).
+- **Events** (`jamaild` -> `jamail`, unsolicited, tagged with `account`): the wire
+  form of `sync::SyncEvent`, produced by `ipc::wire_event`.
+- **Client reconnect**: `ipc::IpcClient` owns a persistent connection with
+  automatic reconnect/backoff, surfaced to the UI as `ClientEvent::{Connected,
+  Disconnected, Fatal}` — `Fatal` (version mismatch) stops retrying; anything else
+  keeps retrying indefinitely, mirroring the old sync thread's own 5s-backoff
+  reconnect style.
+- **Notification ownership**: `daemon::dispatch_sync_event` runs inside `jamaild`'s
+  per-account event-pump thread and is the *only* place that decides to call
+  `notify::notify_new_mail` — `jamail` never references the `notify` module at all
+  (enforced by a test in `tests/smoke.rs`).
+
 ### Threading Model
 
-Two threads communicate via `mpsc::channel<SyncEvent>`:
+**Inside `jamaild`**: one `sync::spawn_sync_thread` (unchanged from before the
+daemon split) plus one "event pump" thread per configured account (the pump reads
+that account's `SyncEvent`s, calls `daemon::dispatch_sync_event` for notification
+delivery, then broadcasts the tagged event to every connected client). Each accepted
+client connection gets a reader thread (`daemon::handle_client` — handshake +
+request loop) and a writer thread (drains a per-client channel fed by both direct
+responses and broadcast events, so only one thread ever writes to a given socket).
 
-- **Main thread** (main.rs): TUI event loop. Polls keyboard/mouse events with 200ms timeout, drains sync events via non-blocking `try_recv()`, re-renders every iteration. Reads from the database for email content.
-- **Background sync thread** (sync.rs): Owns the IMAP connection. Syncs all folders sequentially, then IDLEs on the currently viewed folder. Auto-reconnects on error (5s backoff). Writes to the database and sends progress events to the main thread.
-
-Both threads open their own `MailDb` connection. SQLite WAL mode allows concurrent reads and writes.
+**Inside `jamail`**: the TUI event loop (unchanged in shape from before the daemon
+split) polls keyboard/mouse events with a 200ms timeout and drains
+`ipc::IpcClient::event_rx` via non-blocking `try_recv()` instead of an in-process
+`mpsc::Receiver<SyncEvent>`. Reads from the database directly for email content, same
+as always.
 
 ### Multi-Account & Multi-Folder
 
 - Multiple IMAP accounts are configured in `config.yaml` (IndexMap preserves order)
 - Each account can optionally filter/order folders via a `folders` list in config
-- `SyncControl` (Arc) allows the main thread to communicate folder changes to the sync thread:
-  - `current_folder: RwLock<String>` — which folder to IDLE on (no thread restart needed)
-  - `shutdown: AtomicBool` — signal to stop (set when switching accounts)
+- `jamaild` builds one `SyncControl` (Arc) per configured account at startup and never tears any of them down while running — this is what lets every account keep syncing, and notifications keep firing, regardless of which one (if any) a connected `jamail` is currently looking at:
+  - `current_folder: RwLock<String>` — which folder to IDLE on (updated by `ipc::Request::SetCurrentFolder`, no thread restart needed)
+  - `shutdown: AtomicBool` — signal to stop (set by `daemon::Daemon::trigger_graceful_shutdown` on `ipc::Request::Shutdown`/SIGTERM/SIGINT)
   - `folder_filter: RwLock<Vec<String>>` — which folders to sync
-- Account switching shuts down the old sync thread and spawns a new one
-- Folder switching within the same account just updates `SyncControl` + loads cached emails
+- "Switching accounts" in `jamail` is client-side only now: no thread spawn/teardown, just load the new account+folder from the local cache and send `SetCurrentFolder` so `jamaild` knows which one to prioritize for IDLE
+- Folder switching within the same account works the same way — loads cached emails, sends `SetCurrentFolder`
 
 ### Module Responsibilities
 
-- **main.rs** — Terminal setup/teardown, event loop dispatch, account/folder switching, compose key dispatch, SMTP send handler, mouse text extraction, clipboard copy
+- **lib.rs** — Declares every shared module as `pub mod`; both binaries depend on this one library crate
+- **bin/jamail.rs** — The terminal client's `main`/event loop: terminal setup/teardown, event loop dispatch, folder/account navigation (now just a local cache load + an `ipc::Request::SetCurrentFolder`, no thread management), compose key dispatch, SMTP send handler, mouse text extraction, clipboard copy, daemon auto-spawn on startup
+- **bin/jamaild.rs** — The daemon's `main`: thin wrapper calling `daemon::run()`
+- **daemon.rs** — Daemon process/connection model: spawns one `sync::SyncControl`+sync thread+event-pump thread per configured account at startup (never torn down while running), accepts IPC client connections (`handle_client`: handshake, request loop, per-client writer thread, broadcast registration), `dispatch_sync_event` (the notification-ownership decision), socket bind/stale-socket recovery (`bind_or_recover`), SIGTERM/SIGINT + `Request::Shutdown` graceful-shutdown handling
+- **ipc.rs** — The `jamaild`<->`jamail` wire protocol: versioned framing (`write_frame`/`read_frame`), `Request`/`Response`/`Event`/`ClientHello`/`ServerHello` message types, socket path resolution (`resolve_socket_path`, env var > config > XDG default), the client-side `IpcClient` connection manager (auto-reconnect with backoff, `Connected`/`Disconnected`/`Fatal` lifecycle events)
 - **app.rs** — All UI state and rendering (ViewMode::FolderSelect/List/Detail/Search/Compose), folder tree, vertical folder label, mouse selection tracking, compose view (body editor, autocomplete, file browser)
-- **mail.rs** — IMAP protocol: connect, list_folders, sync_folder (incremental via UIDVALIDITY), MIME parsing, IMAP IDLE, date parsing, HTML→text conversion (via w3m subprocess)
-- **db.rs** — SQLite schema (v4: account+folder scoped; `local_messages` tracks draft/sending/send_error/sent status plus independent upload_status/upload_error for remote Sent/Draft folder uploads), zstd compression/decompression, FTS5 search, schema migration, CRUD operations, known-address extraction for autocomplete
-- **sync.rs** — Background thread lifecycle: SyncControl (current_folder, folder_filter, mark_seen_queue, upload_queue), multi-folder sync loop, SyncEvent enum (includes UploadComplete/UploadError for Sent/Draft folder APPENDs)
-- **config.rs** — YAML config deserialization (JamailConfig, JamailAccount, ImapConfig, AuthConfig, SmtpConfig). `JamailAccount` also carries `senders` (multiple From identities), `sent_folder`/`draft_folder` (remote upload destinations, each independently `Option<String>` — unset disables upload), `notify_folders` (desktop-notification trigger folders), and `show_unlisted_folders` (bool, default `false` — when `folders` is set, also sync/show remote folders not listed there) — all optional and backward-compatible
-- **smtp.rs** — SMTP email sending via `lettre` (blocking transport, STARTTLS/implicit TLS, plain text and multipart with attachments); `send_email` returns the raw sent bytes for Sent-folder upload; `build_draft_raw` builds a tolerant (empty-recipients-OK) raw message for Draft-folder upload
-- **notify.rs** — Best-effort desktop notification (`notify-send`) + sound (`canberra-gtk-play`/`paplay`/`pw-play`, tried in order) for accounts with `notify_folders` configured; no-ops silently when the tools aren't installed, same pattern as clipboard copy
+- **mail.rs** — IMAP protocol: connect, list_folders, sync_folder (incremental via UIDVALIDITY), MIME parsing, IMAP IDLE, date parsing, HTML→text conversion (via w3m subprocess). `FolderInfo` also derives `Serialize`/`Deserialize` — it's reused verbatim as the wire type in `ipc::Event::FoldersLoaded`
+- **db.rs** — SQLite schema (v4: account+folder scoped; `local_messages` tracks draft/sending/send_error/sent status plus independent upload_status/upload_error for remote Sent/Draft folder uploads), zstd compression/decompression, FTS5 search, schema migration, CRUD operations, known-address extraction for autocomplete. `get_email_account_uid_and_folder()` returns the owning account alongside uid/folder — needed since `jamaild` now syncs every account concurrently, so routing a mark-seen request by account (not just assuming "the current one") matters, notably from the cross-account Global Inbox view
+- **sync.rs** — `jamaild`-internal per-account sync thread lifecycle: SyncControl (current_folder, folder_filter, mark_seen_queue, upload_queue), multi-folder sync loop, SyncEvent enum (includes UploadComplete/UploadError for Sent/Draft folder APPENDs). Unchanged in shape from before the daemon split — `daemon.rs` now owns one instance of this per account instead of `jamail`'s old main.rs owning a single one for whichever account was active. `UploadKind` also derives `Serialize`/`Deserialize` — reused verbatim as the wire type in `ipc::Request::EnqueueUpload`/`ipc::Event::UploadComplete`/`UploadError`
+- **config.rs** — YAML config deserialization (JamailConfig, JamailAccount, ImapConfig, AuthConfig, SmtpConfig). `JamailAccount` also carries `senders` (multiple From identities), `sent_folder`/`draft_folder` (remote upload destinations, each independently `Option<String>` — unset disables upload), `notify_folders` (desktop-notification trigger folders), and `show_unlisted_folders` (bool, default `false` — when `folders` is set, also sync/show remote folders not listed there) — all optional and backward-compatible. `JamailConfig.daemon: Option<DaemonConfig>` (optional `socket_path` override) is read independently by both binaries
+- **smtp.rs** — SMTP email sending via `lettre` (blocking transport, STARTTLS/implicit TLS, plain text and multipart with attachments); stays entirely client-side (`jamail`'s `SendQueue`) since sending is a synchronous foreground action tied to the compose UI. `send_email` returns the raw sent bytes for Sent-folder upload; `build_draft_raw` builds a tolerant (empty-recipients-OK) raw message for Draft-folder upload. `SendJob`/`SendResult` carry `account` (captured at enqueue time) so a Sent-folder upload always targets the account the message was actually sent from, even if the user switches accounts in the UI before the background send completes
+- **notify.rs** — Best-effort desktop notification (`notify-send`) + sound (`canberra-gtk-play`/`paplay`/`pw-play`, tried in order) for accounts with `notify_folders` configured; no-ops silently when the tools aren't installed, same pattern as clipboard copy. Called exclusively from `daemon.rs` (`dispatch_sync_event`/`default_notifier`) — `jamail` (the client) never references this module
 - **theme.rs** — Color palette and style constants (dark theme, all RGB values, compose view colors, Sent/Draft status badge colors)
 - **thread.rs** — Email threading via Message-ID/In-Reply-To/References + subject-based fallback; caches `newest_status_label` from the newest email for thread-summary row rendering
 
@@ -76,15 +126,15 @@ Both threads open their own `MailDb` connection. SQLite WAL mode allows concurre
 - **Parallel email processing** — `sync_folder` uses `std::thread::scope` to run `process_raw_email` calls concurrently (w3m subprocesses). Capped at `PROCESS_PARALLELISM` (8) concurrent threads per sub-batch to limit peak memory from attachment data.
 - **SQLite memory limits** — `PRAGMA cache_size = -4000` (4MB cap per connection), `PRAGMA mmap_size = 0` (no memory-mapped I/O).
 - **Multiple sender identities** — `accounts.<name>.senders` (optional) lists "From" identities cycled via Left/Right on the compose From field. `App.compose_senders` is always rebuilt from config at compose-entry time, so the From field can only ever hold a configured value; `compose_from_is_valid()` re-checks this immediately before a send is enqueued.
-- **Folder display order matches sync order** — `mail::order_folders()` is the single source of truth for both what the sync thread syncs (`SyncControl.folder_filter`) and what the folder selector shows (`App.rebuild_folder_tree`), keyed off the same `accounts.<name>.folders` config. Unconfigured: INBOX first, then alphabetical (deterministic default, since IMAP LIST order and DB-cache order aren't guaranteed to agree or stay stable). When `folders` is set, `accounts.<name>.show_unlisted_folders` (default `false`) controls whether remote folders absent from that list are appended after it (same INBOX-first/alphabetical order) instead of being hidden/unsynced entirely.
+- **Folder display order matches sync order** — `mail::order_folders()` is the single source of truth for both what each account's sync thread in `jamaild` syncs (`SyncControl.folder_filter`) and what `jamail`'s folder selector shows (`App.rebuild_folder_tree`, driven by `ipc::Event::FoldersLoaded`), keyed off the same `accounts.<name>.folders` config. Unconfigured: INBOX first, then alphabetical (deterministic default, since IMAP LIST order and DB-cache order aren't guaranteed to agree or stay stable). When `folders` is set, `accounts.<name>.show_unlisted_folders` (default `false`) controls whether remote folders absent from that list are appended after it (same INBOX-first/alphabetical order) instead of being hidden/unsynced entirely.
 - **Folder-selection cursor survives tree rebuilds** — `App.rebuild_folder_tree()` captures the currently-selected row's identity (account+folder name, or the virtual/global-inbox/account sentinel) before rebuilding, then relocates the cursor to that same row afterward regardless of index shifts from reordering, expand/collapse, or newly-synced folders; falls back to the first row when that identity is no longer present (row removed, account collapsed). `App.enter_folder_select()` relies on this instead of resetting the cursor, so reopening the folder selector returns to where you left it.
-- **Remote Sent/Draft folder upload is opt-in and one-shot** — `sent_folder`/`draft_folder` are independent `Option<String>` keys; unset means "local cache only" (no APPEND attempted). A sent message is uploaded once (after a successful SMTP send); a draft is uploaded once, on its *first* explicit `Ctrl+S` save only — later edits update the local cache but do not re-upload, so there's no remote delete/replace-on-update logic to track a remote UID. Uploads go through `SyncControl.upload_queue`, drained by the sync thread (which already owns a live IMAP connection) alongside `mark_seen_queue`; results come back as `SyncEvent::UploadComplete`/`UploadError`.
+- **Remote Sent/Draft folder upload is opt-in and one-shot** — `sent_folder`/`draft_folder` are independent `Option<String>` keys; unset means "local cache only" (no APPEND attempted). A sent message is uploaded once (after a successful SMTP send); a draft is uploaded once, on its *first* explicit `Ctrl+S` save only — later edits update the local cache but do not re-upload, so there's no remote delete/replace-on-update logic to track a remote UID. `jamail` sends the raw message (base64'd) to `jamaild` as `ipc::Request::EnqueueUpload`, which pushes onto that account's `SyncControl.upload_queue`, drained by its sync thread (which already owns a live IMAP connection) alongside `mark_seen_queue`; results come back as `ipc::Event::UploadComplete`/`UploadError`.
 - **Sent/Draft in-flight state never disappears silently** — `local_messages.status` includes `sending` and `send_error` (not just `draft`/`sent`), and `get_drafts()` includes all three non-`sent` states so a message stays visible (with a "Sending…"/"Send failed: ..." badge) through the whole send lifecycle. `upload_status`/`upload_error` track the independent Sent/Draft-folder upload outcome the same way. `Email.status_label` (set only for local Drafts/Sent rows) carries the badge text into both the flat and threaded list renderers.
-- **Desktop notifications** — `notify_folders` (optional, per account) lists folders that trigger a `notify-send` desktop notification + best-effort sound (`canberra-gtk-play`/`paplay`/`pw-play`) on new mail, mirroring the existing external-tool-with-graceful-fallback pattern (w3m, xdg-open, wl-copy/xclip/xsel). Unset means no notifications. Fires once per `FolderComplete` sync event (not per message), so an initial full backfill sync produces one notification with the total count rather than one per message.
+- **Desktop notifications are owned entirely by `jamaild`** — `notify_folders` (optional, per account) lists folders that trigger a `notify-send` desktop notification + best-effort sound (`canberra-gtk-play`/`paplay`/`pw-play`) on new mail, mirroring the existing external-tool-with-graceful-fallback pattern (w3m, xdg-open, wl-copy/xclip/xsel). Unset means no notifications. The decision and the call both happen in `daemon::dispatch_sync_event`, run from each account's event-pump thread inside `jamaild` — never in `jamail`, and never gated on any client being connected, which is what makes this work under `systemd --user` with no terminal open at all. Fires once per `FolderComplete` sync event (not per message), so an initial full backfill sync produces one notification with the total count rather than one per message.
 
 ### Adding Keyboard Shortcuts
 
-1. Add the key handler in `main.rs` under the appropriate `ViewMode` match arm
+1. Add the key handler in `src/bin/jamail.rs` under the appropriate `ViewMode` match arm
 2. Add the action method in `app.rs` on `App`
 3. Update `render_status_bar()` in app.rs to show the new key hint
 

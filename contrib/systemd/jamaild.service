@@ -1,0 +1,28 @@
+[Unit]
+Description=jamail IMAP sync and notification daemon
+# Best-effort network wait; jamaild itself reconnects on its own (5s
+# backoff per account) if it starts before the network is up, so this is a
+# convenience, not a hard requirement.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# cargo install --path . installs both binaries to ~/.cargo/bin by default.
+# Adjust this path if you installed jamail elsewhere (`which jamaild`).
+ExecStart=%h/.cargo/bin/jamaild
+Restart=on-failure
+RestartSec=5
+
+# jamaild never listens on the network — only a Unix domain socket under
+# $XDG_RUNTIME_DIR (0600, in a 0700 directory) plus outbound IMAP/SMTP.
+# Further sandboxing (ProtectSystem=strict, ProtectHome=read-only, etc.) is
+# deliberately left out here: it would need ReadWritePaths tuned to wherever
+# a given install's config/data actually live (dirs::data_dir() honors
+# XDG_DATA_HOME, config.yaml's daemon.socket_path can point anywhere), and
+# getting that wrong silently breaks the daemon. Add it yourself once
+# you've confirmed the exact paths this install uses.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
