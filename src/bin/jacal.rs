@@ -341,7 +341,18 @@ fn handle_browse_key(
 ) -> bool {
     app.clear_status();
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => return false,
+        KeyCode::Char('q') => return false,
+        // Esc walks back through the views you stepped through, restoring
+        // the period and cursor you left behind (CalApp::go_back) — so
+        // Enter into a day and Esc puts you back on the month you were
+        // reading. It is never a quit key; `q` is the only way out.
+        KeyCode::Esc => {
+            if app.go_back() {
+                reload_events(app, db);
+            } else {
+                app.set_status("Nothing to go back to — press q to quit.");
+            }
+        }
         // Move the focused day/cell by one step; in columnar views
         // (Day/3-Day/Week) Up/Down instead moves the selected *event*
         // within the focused day (see CalApp::move_focus_vertical docs).
@@ -375,20 +386,25 @@ fn handle_browse_key(
             reload_events(app, db);
         }
         // Zoom in one level of detail at the focused cell: Year -> Month,
-        // Month/Week/3-Day -> Day. No-op already in Day view.
+        // Month/Week/3-Day -> Day, Day -> the event under the cursor.
         KeyCode::Enter => {
             app.zoom_in();
             reload_events(app, db);
         }
-        KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => {
-            app.cycle_view_backward();
+        // Tab steps one level *narrower* (Year -> Month -> Week -> 3-Day ->
+        // Day -> Event) and Shift+Tab one level wider; neither wraps around.
+        // Most terminals report Shift+Tab as a bare `BackTab` with no SHIFT
+        // modifier bit, so `BackTab` alone has to mean "widen" — checking
+        // only the modifier would make Shift+Tab narrow like plain Tab.
+        KeyCode::BackTab => {
+            app.widen_view();
             reload_events(app, db);
         }
-        KeyCode::Tab | KeyCode::BackTab => {
+        KeyCode::Tab => {
             if modifiers.contains(KeyModifiers::SHIFT) {
-                app.cycle_view_backward();
+                app.widen_view();
             } else {
-                app.cycle_view_forward();
+                app.narrow_view();
             }
             reload_events(app, db);
         }
@@ -449,12 +465,16 @@ fn handle_form_key(
     }
     match code {
         KeyCode::Esc => app.cancel_form(),
-        KeyCode::Tab => {
+        // Down/Tab move to the next field, Up/Shift+Tab to the previous —
+        // the arrows are what most people reach for in a form, and nothing
+        // else in this modal needs them (the fields are single-line, so
+        // there is no vertical cursor movement to compete with).
+        KeyCode::Tab | KeyCode::Down => {
             if let Some(draft) = app.draft.as_mut() {
                 draft.next_field();
             }
         }
-        KeyCode::BackTab => {
+        KeyCode::BackTab | KeyCode::Up => {
             if let Some(draft) = app.draft.as_mut() {
                 draft.prev_field();
             }
@@ -536,24 +556,35 @@ fn handle_delete_confirm_key(
 ) {
     match code {
         KeyCode::Char('y') | KeyCode::Enter => {
-            if let Some(id) = app.selected_event().map(|e| e.id) {
-                let account = app.current_account.clone();
-                if let Err(e) = db.mark_calendar_event_pending_delete(id) {
-                    app.set_status(format!("Could not delete: {}", e));
-                } else {
+            // Act on the event the prompt was opened for, not on whatever
+            // the cursor happens to be on now: a sync landing while the
+            // prompt was up can have moved it (see calapp::PendingDelete).
+            let Some(target) = app.take_pending_delete() else {
+                return;
+            };
+            let account = app.current_account.clone();
+            match db.mark_calendar_event_pending_delete(target.id) {
+                // The row was only ever local and is already gone; queuing
+                // a Delete for its id would be worse than useless, since
+                // SQLite can hand that id to the next event created.
+                Ok(false) => {
+                    reload_events(app, db);
+                    app.set_status("Deleted.");
+                }
+                Ok(true) => {
                     ipc_client.send(ipc::Request::EnqueueCalendarMutation {
                         account,
-                        mutation: CalMutation::Delete { local_id: id },
+                        mutation: CalMutation::Delete {
+                            local_id: target.id,
+                        },
                     });
                     reload_events(app, db);
                     app.set_status("Deleting, syncing…");
                 }
+                Err(e) => app.set_status(format!("Could not delete: {}", e)),
             }
-            app.mode = CalMode::Browse;
         }
-        KeyCode::Char('n') | KeyCode::Esc => {
-            app.mode = CalMode::Browse;
-        }
+        KeyCode::Char('n') | KeyCode::Esc => app.cancel_delete_confirm(),
         _ => {}
     }
 }

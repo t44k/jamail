@@ -1,6 +1,9 @@
-//! `jacal`'s TUI state and rendering: view navigation (day/3-day/week/
-//! month), calendar selection, event list selection, the create/edit/
-//! delete form state, and drawing all of it — mirrors `app.rs`'s role for
+//! `jacal`'s TUI state and rendering: view navigation (year/month/week/
+//! 3-day/day/single event, narrowed and widened one step at a time by
+//! `Tab`/`Shift+Tab`), calendar selection, event list selection, the
+//! create/edit/delete form state, and drawing all of it — including the
+//! shared time grid the day-column views are laid out on (see
+//! [`plan_time_axis`]) — mirrors `app.rs`'s role for
 //! `jamail` (CLAUDE.md: "All UI state and rendering"). `bin/jacal.rs`
 //! stays a thin event loop: it loads events from the database and sends
 //! IPC requests, feeding the results into a [`CalApp`], the same split
@@ -15,7 +18,9 @@ use crate::calendar::{
 use crate::config::WeekStart;
 use crate::db::{CalendarEventRow, CalendarRow};
 use crate::theme;
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
+use chrono::{
+    DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone, Timelike, Utc, Weekday,
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -24,53 +29,69 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
+/// The timeframes `jacal` can show, declared widest-first — the order
+/// `Tab`/`Shift+Tab` walk. [`CalView::Event`] is the narrowest "range" of
+/// all: a single event's detail.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CalView {
-    Day,
-    ThreeDay,
-    Week,
-    Month,
     Year,
+    Month,
+    Week,
+    ThreeDay,
+    Day,
+    Event,
 }
 
 impl CalView {
     pub fn label(&self) -> &'static str {
         match self {
-            CalView::Day => "Day",
-            CalView::ThreeDay => "3-Day",
-            CalView::Week => "Week",
-            CalView::Month => "Month",
             CalView::Year => "Year",
+            CalView::Month => "Month",
+            CalView::Week => "Week",
+            CalView::ThreeDay => "3-Day",
+            CalView::Day => "Day",
+            CalView::Event => "Event",
         }
     }
 
-    /// Cycle order used by the view-switch key in `jacal`.
-    pub fn next(&self) -> CalView {
+    /// One step narrower: Year -> Month -> Week -> 3-Day -> Day -> Event.
+    /// `None` at the narrow end — deliberately saturating rather than
+    /// wrapping, so `Tab` *always* steps into a smaller range and never
+    /// jumps back out to Year.
+    pub fn narrower(&self) -> Option<CalView> {
         match self {
-            CalView::Day => CalView::ThreeDay,
-            CalView::ThreeDay => CalView::Week,
-            CalView::Week => CalView::Month,
-            CalView::Month => CalView::Year,
-            CalView::Year => CalView::Day,
+            CalView::Year => Some(CalView::Month),
+            CalView::Month => Some(CalView::Week),
+            CalView::Week => Some(CalView::ThreeDay),
+            CalView::ThreeDay => Some(CalView::Day),
+            CalView::Day => Some(CalView::Event),
+            CalView::Event => None,
         }
     }
 
-    pub fn prev(&self) -> CalView {
+    /// One step wider — the exact inverse of [`Self::narrower`], `None` at
+    /// the wide end (`Shift+Tab` never wraps around to Event either).
+    pub fn wider(&self) -> Option<CalView> {
         match self {
-            CalView::Day => CalView::Year,
-            CalView::ThreeDay => CalView::Day,
-            CalView::Week => CalView::ThreeDay,
-            CalView::Month => CalView::Week,
-            CalView::Year => CalView::Month,
+            CalView::Year => None,
+            CalView::Month => Some(CalView::Year),
+            CalView::Week => Some(CalView::Month),
+            CalView::ThreeDay => Some(CalView::Week),
+            CalView::Day => Some(CalView::ThreeDay),
+            CalView::Event => Some(CalView::Day),
         }
     }
 
-    /// True for the "columns of days" views (Day/3-Day/Week), where
-    /// Up/Down navigates *events within the focused day* and Left/Right
-    /// moves the focused day itself. False for the grid views (Month/Year),
-    /// where all four arrows move between grid cells.
+    /// True for the "columns of days" views (Day/3-Day/Week) and the
+    /// single-event view, where Up/Down navigates *events within the
+    /// focused day* and Left/Right moves the focused day itself. False for
+    /// the grid views (Month/Year), where all four arrows move between
+    /// grid cells.
     fn is_columnar(&self) -> bool {
-        matches!(self, CalView::Day | CalView::ThreeDay | CalView::Week)
+        matches!(
+            self,
+            CalView::Day | CalView::ThreeDay | CalView::Week | CalView::Event
+        )
     }
 }
 
@@ -170,6 +191,73 @@ const WEEKEND_FG: Color = Color::Rgb(210, 150, 150);
 /// applied instead of (never together with) the cell's own weekend/normal
 /// background, and overridden by the selection background when selected.
 const ALL_DAY_BG: Color = Color::Rgb(40, 55, 35);
+/// The marker glyph for a single event, used everywhere one is drawn: as
+/// the bullet on an event line in Day/3-Day/Week, and as the *entire*
+/// representation of an event in the Month cells and Year mini-months,
+/// where there is no room for text. Its color (see
+/// [`CalApp::event_dot_color`]) is what tells one event's calendar — or an
+/// unresolved sync conflict — apart from another's.
+const EVENT_DOT: &str = "●";
+/// Time labels in an *empty* slot of a Day/3-Day/Week time grid:
+/// deliberately very dim, so the grid reads as a ruler behind the events
+/// rather than as content competing with them.
+const SLOT_LABEL_FG: Color = Color::Rgb(62, 62, 76);
+/// Slightly brighter than [`SLOT_LABEL_FG`], for labels landing exactly on
+/// the hour — keeps a readable hour rhythm in a sub-hourly grid.
+const SLOT_LABEL_HOUR_FG: Color = Color::Rgb(88, 88, 106);
+/// Drawn in every time-grid slot an event covers *after* the one it starts
+/// in, so a long event reads as a continuous block down its column.
+const SLOT_CONTINUATION: &str = "│";
+/// Width of a ruler label (`09h`, `now`) — see [`CalApp::slot_label`].
+const HOUR_LABEL_WIDTH: usize = 3;
+/// At most this fraction of a column may be spent on cascade indentation,
+/// capping how far [`pack_cascade`] will step a deeply-clashing event right
+/// so its title always keeps most of the width. A share rather than a fixed
+/// margin, so the staircase still reads in a narrow week column instead of
+/// collapsing to a flat stack.
+const CASCADE_INDENT_SHARE: u16 = 3;
+/// Below this many columns an event line drops its leading time: the row's
+/// position on the time axis already says when it is, and the summary is
+/// what's actually in short supply. Does not apply to an event the packer
+/// had to displace off its own row — see [`CellText`].
+const TIGHT_TEXT_WIDTH: usize = 14;
+/// At or above this many columns an event line has room for the works.
+const FULL_TEXT_WIDTH: usize = 28;
+
+/// How much of an event a cell has room to say.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CellText {
+    /// Time range, summary, recurrence marker, location and sync badge.
+    Full,
+    /// Start time and summary.
+    WithTime,
+    /// Summary only — for a narrow lane, where the row's own position on
+    /// the time axis already says when the event is.
+    SummaryOnly,
+}
+
+impl CellText {
+    /// Never [`CellText::Full`] — for the callers that ask for the terse
+    /// form regardless of how much room they have (Month cells, which are
+    /// laid out around a line budget, not a width).
+    fn min_detail(self) -> CellText {
+        match self {
+            CellText::Full | CellText::WithTime => CellText::WithTime,
+            CellText::SummaryOnly => CellText::SummaryOnly,
+        }
+    }
+
+    /// The most detail that fits in `width`.
+    fn for_width(width: u16) -> CellText {
+        if (width as usize) >= FULL_TEXT_WIDTH {
+            CellText::Full
+        } else if (width as usize) >= TIGHT_TEXT_WIDTH {
+            CellText::WithTime
+        } else {
+            CellText::SummaryOnly
+        }
+    }
+}
 
 fn local_time_of(ts_utc: i64) -> DateTime<Local> {
     DateTime::<Utc>::from_timestamp(ts_utc, 0)
@@ -194,6 +282,212 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
     let truncated: String = s.chars().take(max - 1).collect();
     format!("{}…", truncated)
+}
+
+/// Below this many usable rows a time grid is more cramped than useful
+/// and [`plan_time_axis`] declines, leaving the caller on the plain
+/// stacked-list rendering.
+const MIN_GRID_ROWS: usize = 8;
+/// Below this many usable columns a day column can't hold a time label
+/// plus anything else, so the grid is skipped for the same reason.
+const MIN_GRID_COL_WIDTH: u16 = 9;
+/// At most this many terminal rows are reserved above the grid for all-day
+/// banners, however many all-day events a day actually has — the time grid
+/// is what the space is for.
+const MAX_ALL_DAY_ROWS: usize = 3;
+/// Candidate slot lengths, finest first: [`plan_time_axis`] takes the
+/// first that fits the available height. Every one divides 1440 exactly,
+/// which is what lets the axis be snapped to a slot boundary and still end
+/// no later than midnight.
+const SLOT_CHOICES: [u32; 6] = [15, 30, 60, 120, 180, 240];
+const MINUTES_PER_DAY: i64 = 24 * 60;
+/// The stretch of the day a time grid always keeps on screen, whatever the
+/// events do. Without a floor like this, a day holding one lunchtime
+/// meeting would be drawn as a two-hour close-up around it — technically
+/// "the events in their relative positions", but no longer recognisable as
+/// a day, and useless for comparing against a neighbouring column.
+const DAY_CORE: (i64, i64) = (8 * 60, 20 * 60);
+
+/// The vertical time ruler shared by every column of a Day/3-Day/Week
+/// grid: `rows` consecutive slots of `slot_minutes`, the first starting
+/// `start_minutes` after local midnight.
+///
+/// One axis is computed for the whole view rather than per column, which
+/// is the entire point of the grid — 09:00 sits on the same terminal row
+/// in every day, so events can be compared across days by eye.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TimeAxis {
+    pub start_minutes: u32,
+    pub slot_minutes: u32,
+    pub rows: usize,
+}
+
+impl TimeAxis {
+    /// Minutes-from-local-midnight at which `row` begins.
+    pub fn row_start_minutes(&self, row: usize) -> u32 {
+        self.start_minutes + self.slot_minutes * row as u32
+    }
+
+    /// Minutes-from-local-midnight at which the last row ends.
+    pub fn end_minutes(&self) -> u32 {
+        self.start_minutes + self.slot_minutes * self.rows as u32
+    }
+
+    /// The row `minute` falls in, clamped into the axis — an instant
+    /// before the first slot pins to row 0 and one after the last slot to
+    /// the last row, so a multi-day event that runs through the whole
+    /// column still renders instead of vanishing.
+    pub fn row_of(&self, minute: i64) -> usize {
+        let rel = minute - self.start_minutes as i64;
+        if rel <= 0 {
+            return 0;
+        }
+        ((rel / self.slot_minutes as i64) as usize).min(self.rows.saturating_sub(1))
+    }
+
+    /// The inclusive first/last rows a `[start_min, end_min)` range
+    /// occupies. The end is exclusive, so an event ending exactly on a
+    /// slot boundary stops at the slot before it rather than claiming an
+    /// extra empty row.
+    pub fn row_span(&self, start_min: i64, end_min: i64) -> (usize, usize) {
+        let first = self.row_of(start_min);
+        let last = self.row_of((end_min - 1).max(start_min));
+        (first, last.max(first))
+    }
+}
+
+/// Lay out the time ruler for a Day/3-Day/Week grid.
+///
+/// `rows_available` is how many terminal rows the grid itself may use
+/// (all-day banner rows already subtracted). `spans` is every *timed*
+/// event's `[start, end)` in minutes-from-local-midnight across **all**
+/// displayed days, so the resulting axis covers every column.
+///
+/// The axis always covers every span *and* [`DAY_CORE`], at the finest
+/// slot length that fits; whatever height is left over is spent widening
+/// the window around that. Returns `None` only when there isn't the
+/// vertical room for a grid at all — the caller then falls back to the
+/// plain stacked list.
+pub fn plan_time_axis(rows_available: usize, spans: &[(i64, i64)]) -> Option<TimeAxis> {
+    if rows_available < MIN_GRID_ROWS {
+        return None;
+    }
+    // What has to be on screen: [`DAY_CORE`] widened to take in every
+    // event, snapped out to whole hours.
+    let (mut need_start, mut need_end) = DAY_CORE;
+    for &(start, end) in spans {
+        need_start = need_start.min(start.clamp(0, MINUTES_PER_DAY));
+        need_end = need_end.max(end.clamp(0, MINUTES_PER_DAY));
+    }
+    need_start -= need_start.rem_euclid(60);
+    need_end = ((need_end + 59) / 60 * 60).min(MINUTES_PER_DAY);
+
+    for slot in SLOT_CHOICES {
+        let slot_min = slot as i64;
+        let day_rows = (MINUTES_PER_DAY / slot_min) as usize;
+        let need_first = need_start.div_euclid(slot_min);
+        let need_last = (need_end - 1).max(need_start).div_euclid(slot_min);
+        let need_rows = (need_last - need_first + 1) as usize;
+        let rows = rows_available.min(day_rows);
+        if need_rows > rows {
+            continue; // too fine a slot to fit what must be shown
+        }
+        // Spend the leftover rows widening the window around what must be
+        // shown, so the grid fills its column instead of floating in it,
+        // then slide the whole thing back inside the day at either end.
+        let first_row =
+            (need_first - ((rows - need_rows) / 2) as i64).clamp(0, (day_rows - rows) as i64);
+        return Some(TimeAxis {
+            start_minutes: (first_row * slot_min) as u32,
+            slot_minutes: slot,
+            rows,
+        });
+    }
+    None
+}
+
+/// Where one event ended up on a day's grid.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Placement {
+    /// The event's index within its day's event list — i.e. exactly what
+    /// [`CalApp::event_cursor`] counts, so selection survives the packing.
+    pub pos: usize,
+    pub start_row: usize,
+    pub end_row: usize,
+    /// How many columns in from the left edge this event's line begins.
+    /// Its text then runs to the *full* width of the column from there —
+    /// the space is never divided up — and the columns to its left carry
+    /// the continuation bars of the events it is nested under.
+    pub indent: usize,
+}
+
+/// Lay a day's overlapping events out as a staircase.
+///
+/// `events` is `(pos, first_row, last_row)` per timed event. Every event
+/// gets a line of its own — never half a line — so its title is always
+/// readable at full width. Events that clash are drawn one under the other,
+/// each starting one column further right than the one it overlaps, and the
+/// columns it has stepped past carry those events' continuation bars. The
+/// result reads as a staircase: you can see at a glance how many events
+/// share a time, and read every one of their titles.
+///
+/// Two rules produce it:
+///
+/// * **One event begins per row.** A second event in the same slot slides
+///   down to the next free line. Its line still prints its real start time
+///   (see [`CellText`]), so simultaneous events read as consecutive rows
+///   showing the same time.
+/// * **An event nests one column deeper than everything it overlaps in
+///   time**, capped at `max_indent` so the title never gets squeezed out.
+pub fn pack_cascade(
+    events: &[(usize, usize, usize)],
+    rows: usize,
+    max_indent: usize,
+) -> Vec<Placement> {
+    let mut placements = Vec::with_capacity(events.len());
+    if rows == 0 || events.is_empty() {
+        return placements;
+    }
+    let mut sorted = events.to_vec();
+    sorted.sort_by_key(|&(pos, first, last)| (first, last, pos));
+
+    let mut row_taken = vec![false; rows];
+    // (first_row, last_row, indent) of what's already placed — the *real*
+    // spans, so which events count as simultaneous doesn't change just
+    // because one of them got pushed down a line.
+    let mut placed_spans: Vec<(usize, usize, usize)> = Vec::with_capacity(sorted.len());
+
+    for &(pos, first, last) in &sorted {
+        let Some(start_row) = (first.min(rows - 1)..rows).find(|&r| !row_taken[r]) else {
+            continue; // every line below is spoken for: nowhere honest to draw it
+        };
+        let indent = placed_spans
+            .iter()
+            .filter(|&&(other_first, other_last, _)| other_first <= last && first <= other_last)
+            .map(|&(_, _, other_indent)| other_indent + 1)
+            .max()
+            .unwrap_or(0)
+            .min(max_indent);
+        row_taken[start_row] = true;
+        placed_spans.push((first, last, indent));
+        placements.push(Placement {
+            pos,
+            start_row,
+            end_row: last.max(start_row).min(rows - 1),
+            indent,
+        });
+    }
+    placements
+}
+
+/// Minutes from local midnight of `day` to the local instant `ts_utc`.
+/// Negative before that midnight and past [`MINUTES_PER_DAY`] after the
+/// day ends, so a multi-day event keeps an offset the axis can clamp
+/// meaningfully instead of being folded back into the day.
+fn minutes_within_day(ts_utc: i64, day: NaiveDate) -> i64 {
+    let local = local_time_of(ts_utc).naive_local();
+    let midnight = day.and_hms_opt(0, 0, 0).unwrap();
+    (local - midnight).num_minutes()
 }
 
 /// Expand every recurring row in `rows` into one row per occurrence
@@ -250,12 +544,48 @@ pub struct CalendarVisibility {
     pub visible: bool,
 }
 
+/// Everything that makes up "where you were looking": not just the view,
+/// but the period on screen and the cell/event under the cursor. Stacked by
+/// [`CalApp::push_history`] so `Esc` can put all of it back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ViewPosition {
+    pub view: CalView,
+    pub anchor: NaiveDate,
+    pub focused_date: NaiveDate,
+    pub event_cursor: usize,
+}
+
+/// How far back `Esc` can walk. Bounded only so a long session can't grow
+/// the stack without limit; nobody navigates 32 levels deep on purpose.
+const VIEW_HISTORY_MAX: usize = 32;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CalMode {
     Browse,
     Create,
     Edit,
     ConfirmDelete,
+}
+
+/// The event a [`CalMode::ConfirmDelete`] prompt is about, captured when
+/// the prompt opens instead of being re-read from the cursor when it is
+/// answered.
+///
+/// That matters because `jacal`'s event loop keeps reloading events while
+/// the prompt is on screen (an incoming sync, or the periodic refresh), and
+/// a reload re-sorts and re-filters the list — so the cursor can come to
+/// rest on a *different* event between the user reading "Delete X?" and
+/// pressing `y`. Capturing up front is the same thing [`DraftEvent`] does
+/// with `editing_local_id` for the edit form.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PendingDelete {
+    pub id: i64,
+    pub summary: String,
+    /// Whether the row carries an `RRULE`. Deleting it removes the whole
+    /// series, not just the occurrence under the cursor (see the `calendar`
+    /// module docs on why editing/deleting always acts on the master
+    /// `VEVENT`), so the prompt has to say so before the user confirms.
+    pub recurring: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -584,8 +914,14 @@ pub struct CalApp {
     /// `all_events` filtered to visible calendars, sorted by start time —
     /// what's actually displayed/selectable.
     pub events: Vec<CalendarEventRow>,
+    /// The positions stepped *out of*, oldest first — what `Esc` walks back
+    /// through (see [`Self::go_back`]).
+    pub view_history: Vec<ViewPosition>,
     pub mode: CalMode,
     pub draft: Option<DraftEvent>,
+    /// The event the delete prompt is about while `mode` is
+    /// [`CalMode::ConfirmDelete`] — see [`PendingDelete`].
+    pub pending_delete: Option<PendingDelete>,
     pub status: Option<String>,
     pub ipc_connected: bool,
 }
@@ -603,8 +939,10 @@ impl CalApp {
             calendars: Vec::new(),
             all_events: Vec::new(),
             events: Vec::new(),
+            view_history: Vec::new(),
             mode: CalMode::Browse,
             draft: None,
+            pending_delete: None,
             status: None,
             ipc_connected: false,
         }
@@ -616,7 +954,7 @@ impl CalApp {
     /// including the grid's leading/trailing days from adjacent months.
     pub fn visible_range(&self) -> (NaiveDate, NaiveDate) {
         match self.view {
-            CalView::Day => (self.anchor, self.anchor + Duration::days(1)),
+            CalView::Day | CalView::Event => (self.anchor, self.anchor + Duration::days(1)),
             CalView::ThreeDay => (self.anchor, self.anchor + Duration::days(3)),
             CalView::Week => {
                 let start = start_of_week(self.anchor, self.week_start);
@@ -671,7 +1009,7 @@ impl CalApp {
 
     pub fn next_period(&mut self) {
         self.anchor = match self.view {
-            CalView::Day => self.anchor + Duration::days(1),
+            CalView::Day | CalView::Event => self.anchor + Duration::days(1),
             CalView::ThreeDay => self.anchor + Duration::days(3),
             CalView::Week => self.anchor + Duration::days(7),
             CalView::Month => add_months(self.anchor, 1),
@@ -681,7 +1019,7 @@ impl CalApp {
 
     pub fn prev_period(&mut self) {
         self.anchor = match self.view {
-            CalView::Day => self.anchor - Duration::days(1),
+            CalView::Day | CalView::Event => self.anchor - Duration::days(1),
             CalView::ThreeDay => self.anchor - Duration::days(3),
             CalView::Week => self.anchor - Duration::days(7),
             CalView::Month => add_months(self.anchor, -1),
@@ -696,16 +1034,73 @@ impl CalApp {
         self.event_cursor = 0;
     }
 
-    pub fn cycle_view_forward(&mut self) {
-        self.view = self.view.next();
-        self.focused_date = self.anchor;
-        self.event_cursor = 0;
+    /// Where the user is looking right now.
+    pub fn position(&self) -> ViewPosition {
+        ViewPosition {
+            view: self.view,
+            anchor: self.anchor,
+            focused_date: self.focused_date,
+            event_cursor: self.event_cursor,
+        }
     }
 
-    pub fn cycle_view_backward(&mut self) {
-        self.view = self.view.prev();
-        self.focused_date = self.anchor;
-        self.event_cursor = 0;
+    /// Remember the current position before a view change, so `Esc` can
+    /// return to it.
+    fn push_history(&mut self) {
+        self.view_history.push(self.position());
+        if self.view_history.len() > VIEW_HISTORY_MAX {
+            self.view_history.remove(0);
+        }
+    }
+
+    /// `Esc`: undo the last view change, restoring the whole position — so
+    /// `Enter`ing a day from Month view and pressing `Esc` puts you back on
+    /// the month you were reading, on the same cell, rather than one step
+    /// wider than wherever you ended up. Returns `false` when there is
+    /// nothing to go back to (quitting is `q`'s job, never `Esc`'s).
+    pub fn go_back(&mut self) -> bool {
+        let Some(previous) = self.view_history.pop() else {
+            return false;
+        };
+        self.view = previous.view;
+        self.anchor = previous.anchor;
+        self.focused_date = previous.focused_date;
+        self.event_cursor = previous.event_cursor;
+        true
+    }
+
+    /// `Tab`: step one level narrower (see [`CalView::narrower`]),
+    /// keeping the focused day. No-op in [`CalView::Event`] — there is
+    /// nothing smaller to step into.
+    pub fn narrow_view(&mut self) {
+        if let Some(view) = self.view.narrower() {
+            self.push_history();
+            self.switch_view(view);
+        }
+    }
+
+    /// `Shift+Tab`: step one level wider (see [`CalView::wider`]), keeping
+    /// the focused day. No-op in [`CalView::Year`].
+    pub fn widen_view(&mut self) {
+        if let Some(view) = self.view.wider() {
+            self.push_history();
+            self.switch_view(view);
+        }
+    }
+
+    /// Switch to `view`, re-anchoring the visible period on the currently
+    /// focused day so the thing you were looking at stays on screen
+    /// (Week -> Day lands on the focused day, not the week's first day).
+    /// The selected event survives a move between two columnar views —
+    /// which is what makes Day -> Event open the event under the cursor —
+    /// but is reset when moving to/from a grid view, where "the event
+    /// under the cursor" has no meaning.
+    fn switch_view(&mut self, view: CalView) {
+        if !(view.is_columnar() && self.view.is_columnar()) {
+            self.event_cursor = 0;
+        }
+        self.view = view;
+        self.anchor = self.focused_date;
     }
 
     /// Jump the whole visible period forward/back (as opposed to
@@ -779,22 +1174,21 @@ impl CalApp {
         self.set_focused_date(target);
     }
 
-    /// Narrow focus one level: Year -> Month (of the focused month), Month
-    /// -> Day (of the focused day), Week/3-Day -> Day (of the focused
-    /// day). No-op in Day view (nothing more specific to narrow to).
+    /// `Enter`: narrow focus one level, skipping the intermediate widths
+    /// `Tab` would walk through — Year -> Month (of the focused month),
+    /// Month/Week/3-Day -> Day (of the focused day), Day -> Event (the one
+    /// under the cursor). No-op in Event view (nothing more specific to
+    /// narrow to). [`Self::go_back`] returns from wherever this lands.
     pub fn zoom_in(&mut self) {
-        match self.view {
-            CalView::Year => {
-                self.anchor = self.focused_date;
-                self.view = CalView::Month;
-                self.event_cursor = 0;
-            }
-            CalView::Month | CalView::Week | CalView::ThreeDay => {
-                self.anchor = self.focused_date;
-                self.view = CalView::Day;
-                self.event_cursor = 0;
-            }
-            CalView::Day => {}
+        let target = match self.view {
+            CalView::Year => Some(CalView::Month),
+            CalView::Month | CalView::Week | CalView::ThreeDay => Some(CalView::Day),
+            CalView::Day => Some(CalView::Event),
+            CalView::Event => None,
+        };
+        if let Some(view) = target {
+            self.push_history();
+            self.switch_view(view);
         }
     }
 
@@ -968,12 +1362,33 @@ impl CalApp {
         Ok(())
     }
 
+    /// Open the delete prompt for the currently-selected event, capturing
+    /// which event it is (see [`PendingDelete`]).
     pub fn begin_delete_confirm(&mut self) -> Result<(), String> {
-        if self.selected_event().is_none() {
-            return Err("no event selected".to_string());
-        }
+        let ev = self
+            .selected_event()
+            .ok_or_else(|| "no event selected".to_string())?;
+        self.pending_delete = Some(PendingDelete {
+            id: ev.id,
+            summary: ev.summary.clone(),
+            recurring: ev.rrule.is_some(),
+        });
         self.mode = CalMode::ConfirmDelete;
         Ok(())
+    }
+
+    /// Close the delete prompt, handing back the event it was about so the
+    /// caller can act on exactly what the user was shown. Returns `None` if
+    /// there wasn't one.
+    pub fn take_pending_delete(&mut self) -> Option<PendingDelete> {
+        self.mode = CalMode::Browse;
+        self.pending_delete.take()
+    }
+
+    /// Close the delete prompt without deleting anything.
+    pub fn cancel_delete_confirm(&mut self) {
+        self.pending_delete = None;
+        self.mode = CalMode::Browse;
     }
 
     pub fn cancel_form(&mut self) {
@@ -991,12 +1406,12 @@ impl CalApp {
 
     // -- Rendering (not unit-tested — see module docs) -------------------
 
-    /// Draw the whole screen: header, agenda list, status bar, and —
-    /// while active — the create/edit form or delete-confirmation
-    /// overlay. Month view is rendered as a date-grouped agenda list, the
-    /// same as Day/3-Day/Week, rather than a calendar grid — a deliberate
-    /// scope decision (see CLAUDE.md-style limitations noted in the crate
-    /// docs/README) that keeps one rendering path for every timeframe.
+    /// Draw the whole screen: header, the body for the current
+    /// [`CalView`], status bar, and — while active — the create/edit form
+    /// or delete-confirmation overlay. Each view has its own body
+    /// renderer: day columns (on a shared [`TimeAxis`] where the terminal
+    /// allows), the month grid, the year grid of mini-months, and the
+    /// single-event detail.
     pub fn render(&self, frame: &mut Frame) {
         let area = frame.area();
         frame.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
@@ -1025,6 +1440,7 @@ impl CalApp {
             }
             CalView::Month => self.render_month_grid(frame, main_area),
             CalView::Year => self.render_year_grid(frame, main_area),
+            CalView::Event => self.render_event_detail(frame, main_area),
         }
         self.render_status_bar(frame, status_area);
 
@@ -1104,6 +1520,74 @@ impl CalApp {
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 
+    /// The color of `ev`'s [`EVENT_DOT`]: its calendar's stable color (see
+    /// [`Self::calendar_color`]), except an unresolved sync conflict, which
+    /// is always red whatever calendar it belongs to — that's the one thing
+    /// that must not blend into the palette.
+    fn event_dot_color(&self, ev: &CalendarEventRow) -> Color {
+        if ev.local_status == crate::db::CAL_STATUS_CONFLICT {
+            theme::STATUS_ERROR
+        } else {
+            self.calendar_color(&ev.calendar_url)
+        }
+    }
+
+    /// One color standing in for a whole day's events, for the Year view's
+    /// single-dot-per-day cells: red if *any* event that day is in conflict
+    /// (see [`Self::event_dot_color`]), otherwise the first event's
+    /// calendar color.
+    fn day_dot_color(&self, indices: &[usize]) -> Color {
+        if indices
+            .iter()
+            .any(|&i| self.events[i].local_status == crate::db::CAL_STATUS_CONFLICT)
+        {
+            return theme::STATUS_ERROR;
+        }
+        indices
+            .first()
+            .map(|&i| self.calendar_color(&self.events[i].calendar_url))
+            .unwrap_or(theme::FG_DIM)
+    }
+
+    /// A one-line, color-coded summary of a cell's events: one
+    /// [`EVENT_DOT`] per event in start order, colored per
+    /// [`Self::event_dot_color`], with the tail collapsed into a dim `+N`
+    /// when they don't all fit in `width`. This is the Month grid's
+    /// at-a-glance layer, and the only thing that survives in a
+    /// one-row-tall cell — where it still carries both how many events the
+    /// day has and which calendars they came from.
+    fn event_dot_strip(&self, indices: &[usize], width: u16, bg: Color) -> Line<'static> {
+        let width = width as usize;
+        if width == 0 || indices.is_empty() {
+            return Line::from("");
+        }
+        let mut shown = indices.len().min(width);
+        if shown < indices.len() {
+            // Leave room for the "+N" tag before deciding how many dots fit.
+            let tag_len = format!("+{}", indices.len() - shown).chars().count();
+            shown = width.saturating_sub(tag_len);
+        }
+        let mut spans: Vec<Span<'static>> = indices
+            .iter()
+            .take(shown)
+            .map(|&i| {
+                Span::styled(
+                    EVENT_DOT,
+                    Style::default()
+                        .fg(self.event_dot_color(&self.events[i]))
+                        .bg(bg),
+                )
+            })
+            .collect();
+        if shown < indices.len() {
+            spans.push(Span::styled(
+                truncate_str(&format!("+{}", indices.len() - shown), width),
+                Style::default().fg(theme::FG_DIM).bg(bg),
+            ));
+        }
+        Line::from(spans)
+    }
+
     /// Build the visible lines for one day's/cell's events: renders up to
     /// `max_lines` events via [`Self::render_event_line`] and appends a
     /// "+K more" line if not everything fit — except the
@@ -1149,7 +1633,12 @@ impl CalApp {
         for (pos, &idx) in indices.iter().take(show_count).enumerate() {
             let ev = &self.events[idx];
             let selected = is_focused_day && pos == self.event_cursor;
-            lines.push(self.render_event_line(ev, selected, compact, width, cell_bg));
+            let text_level = if compact {
+                CellText::for_width(width).min_detail()
+            } else {
+                CellText::Full
+            };
+            lines.push(self.render_event_line(ev, selected, text_level, width, cell_bg));
         }
         if indices.len() > show_count {
             lines.push(Line::from(Span::styled(
@@ -1162,9 +1651,11 @@ impl CalApp {
         lines
     }
 
-    /// One event as a "[color dot] text" line, text truncated (with an
-    /// ellipsis) to fit `width` rather than wrapped -- wrapping would blow
-    /// out the fixed line budget every cell/column is laid out around.
+    /// One event as a "[color dot] text" cell, padded to exactly `width`
+    /// columns so side-by-side lanes line up (and so a selected event is
+    /// highlighted across its whole cell). Text is truncated with an
+    /// ellipsis rather than wrapped -- wrapping would blow out the fixed
+    /// line budget every cell/column is laid out around.
     /// The dot's color is stable per calendar (see
     /// [`Self::calendar_color`]); `selected` highlights the whole line
     /// with a background, the same way a selected row does elsewhere in
@@ -1174,23 +1665,19 @@ impl CalApp {
     /// enclosing day cell's own weekend/normal background) rather than
     /// relying on transparency, so the dot's tiny background always
     /// matches its surroundings too.
-    fn render_event_line(
+    fn event_cell(
         &self,
         ev: &CalendarEventRow,
         selected: bool,
-        compact: bool,
+        text_level: CellText,
         width: u16,
         cell_bg: Color,
-    ) -> Line<'static> {
+    ) -> Vec<Span<'static>> {
         let start_local = local_time_of(ev.dtstart_utc);
-        let conflict = ev.local_status == crate::db::CAL_STATUS_CONFLICT;
-        let dot_color = if conflict {
-            theme::STATUS_ERROR
-        } else {
-            self.calendar_color(&ev.calendar_url)
-        };
-        let text = if compact {
-            if ev.all_day {
+        let dot_color = self.event_dot_color(ev);
+        let text = if text_level != CellText::Full {
+            // An all-day event has no start time worth printing.
+            if ev.all_day || text_level == CellText::SummaryOnly {
                 ev.summary.clone()
             } else {
                 format!("{} {}", start_local.format("%H:%M"), ev.summary)
@@ -1235,21 +1722,311 @@ impl CalApp {
             cell_bg
         };
         let base_style = Style::default().bg(line_bg).fg(theme::SUBJECT_COLOR);
-        Line::from(vec![
-            Span::styled("*", Style::default().fg(dot_color).bg(line_bg)),
+        let pad = avail.saturating_sub(text.chars().count());
+        vec![
+            Span::styled(EVENT_DOT, Style::default().fg(dot_color).bg(line_bg)),
             Span::styled(" ", base_style),
             Span::styled(text, base_style),
-        ])
+            Span::styled(" ".repeat(pad), base_style),
+        ]
+    }
+
+    /// The same cell as a standalone full-width line.
+    fn render_event_line(
+        &self,
+        ev: &CalendarEventRow,
+        selected: bool,
+        text_level: CellText,
+        width: u16,
+        cell_bg: Color,
+    ) -> Line<'static> {
+        Line::from(self.event_cell(ev, selected, text_level, width, cell_bg))
+    }
+
+    /// Every timed event on `days`, as `[start, end)` minute offsets from
+    /// each day's own local midnight, clamped into that day — the input
+    /// [`plan_time_axis`] needs to build one ruler covering every column.
+    fn timed_spans_for(&self, days: &[NaiveDate]) -> Vec<(i64, i64)> {
+        let mut spans = Vec::new();
+        for &day in days {
+            for &i in self.event_indices_for(day).iter() {
+                let ev = &self.events[i];
+                if ev.all_day {
+                    continue;
+                }
+                let start = minutes_within_day(ev.dtstart_utc, day);
+                let end = minutes_within_day(ev.dtend_utc, day);
+                if end <= 0 || start >= MINUTES_PER_DAY {
+                    continue;
+                }
+                spans.push((start.max(0), end.min(MINUTES_PER_DAY)));
+            }
+        }
+        spans
+    }
+
+    /// The most all-day events any one of `days` carries, capped at
+    /// [`MAX_ALL_DAY_ROWS`]. Reserved uniformly across every column so all
+    /// the time grids below start on the same terminal row.
+    fn all_day_rows_for(&self, days: &[NaiveDate]) -> usize {
+        days.iter()
+            .map(|&day| {
+                self.event_indices_for(day)
+                    .iter()
+                    .filter(|&&i| self.events[i].all_day)
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+            .min(MAX_ALL_DAY_ROWS)
+    }
+
+    /// One day's events placed on `axis`: its all-day events (which have
+    /// no position on a time ruler and get banner rows above the grid)
+    /// and its timed ones as `(cursor position, index into
+    /// [`Self::events`], first row, last row)`. The cursor position is the
+    /// event's index within [`Self::event_indices_for`], i.e. exactly what
+    /// [`Self::event_cursor`] counts, so selection survives the reshuffle
+    /// into rows.
+    #[allow(clippy::type_complexity)]
+    fn layout_day(
+        &self,
+        day: NaiveDate,
+        axis: &TimeAxis,
+    ) -> (Vec<(usize, usize)>, Vec<(usize, usize, usize, usize)>) {
+        let mut all_day = Vec::new();
+        let mut timed = Vec::new();
+        for (pos, &i) in self.event_indices_for(day).iter().enumerate() {
+            let ev = &self.events[i];
+            if ev.all_day {
+                all_day.push((pos, i));
+                continue;
+            }
+            let (first, last) = axis.row_span(
+                minutes_within_day(ev.dtstart_utc, day),
+                minutes_within_day(ev.dtend_utc, day),
+            );
+            timed.push((pos, i, first, last));
+        }
+        (all_day, timed)
+    }
+
+    /// One day column rendered as a time grid: up to `all_day_rows` all-day
+    /// banner rows, then one row per slot of `axis`. A slot an event starts
+    /// in shows that event; a slot it merely runs through shows a
+    /// continuation bar in the calendar's color; an empty slot shows its own
+    /// time in very dim gray, so the column reads as a ruler you can place
+    /// events against — and against the neighbouring days, which share the
+    /// axis.
+    fn grid_column_lines(
+        &self,
+        day: NaiveDate,
+        axis: &TimeAxis,
+        all_day_rows: usize,
+        width: u16,
+        cell_bg: Color,
+    ) -> Vec<Line<'static>> {
+        let (all_day, timed) = self.layout_day(day, axis);
+        let selected = if day == self.focused_date {
+            Some(self.event_cursor)
+        } else {
+            None
+        };
+        let banner_text = CellText::for_width(width);
+        let blank = || Line::from(Span::styled(String::new(), Style::default().bg(cell_bg)));
+        let mut lines = Vec::with_capacity(all_day_rows + axis.rows);
+
+        // -- All-day banners, padded out to the shared reserved height.
+        let shown = if all_day.len() > all_day_rows {
+            all_day_rows.saturating_sub(1)
+        } else {
+            all_day.len()
+        };
+        let mut visible: Vec<(usize, usize)> = all_day.iter().copied().take(shown).collect();
+        // Never hide the event the cursor is on, even when it sorts past
+        // the cap (same invariant `cell_event_lines` keeps).
+        if let Some(sel) = selected
+            && !visible.iter().any(|&(pos, _)| pos == sel)
+            && let Some(&entry) = all_day.iter().find(|&&(pos, _)| pos == sel)
+            && let Some(last) = visible.last_mut()
+        {
+            *last = entry;
+        }
+        for row in 0..all_day_rows {
+            if let Some(&(pos, idx)) = visible.get(row) {
+                lines.push(self.render_event_line(
+                    &self.events[idx],
+                    selected == Some(pos),
+                    banner_text,
+                    width,
+                    cell_bg,
+                ));
+            } else if row == shown && all_day.len() > shown {
+                lines.push(Line::from(Span::styled(
+                    truncate_str(
+                        &format!("+{} all-day", all_day.len() - shown),
+                        width as usize,
+                    ),
+                    Style::default()
+                        .fg(theme::FG_DIM)
+                        .bg(cell_bg)
+                        .add_modifier(Modifier::ITALIC),
+                )));
+            } else {
+                lines.push(blank());
+            }
+        }
+
+        // -- The time grid itself. Clashing events cascade: one per line,
+        //    each stepped a column right of the ones it overlaps, whose
+        //    continuation bars fill the columns it stepped past.
+        let now_row = (day == Local::now().date_naive()).then(|| {
+            let now = Local::now();
+            axis.row_of(now.time().hour() as i64 * 60 + now.time().minute() as i64)
+        });
+        let spans: Vec<(usize, usize, usize)> = timed
+            .iter()
+            .map(|&(pos, _, first, last)| (pos, first, last))
+            .collect();
+        let placements = pack_cascade(&spans, axis.rows, (width / CASCADE_INDENT_SHARE) as usize);
+        let of_pos = |pos: usize| timed.iter().find(|&&(p, ..)| p == pos);
+
+        for row in 0..axis.rows {
+            let owner = placements.iter().find(|p| p.start_row == row);
+            // Bars of everything still running through this row, by column.
+            // Anything at or past the owner's indent is left undrawn: the
+            // owner's line runs the full width from there, and covering it
+            // is the whole point of the cascade.
+            let bar_limit = owner.map_or(width as usize, |o| o.indent);
+            let bar_at = |col: usize| {
+                placements
+                    .iter()
+                    .find(|p| p.indent == col && p.start_row < row && row <= p.end_row)
+                    .and_then(|p| of_pos(p.pos).map(|&(pos, idx, ..)| (pos, idx)))
+            };
+            let first_busy = (0..bar_limit)
+                .find(|&col| bar_at(col).is_some())
+                .unwrap_or(bar_limit);
+            let mut line: Vec<Span<'static>> = Vec::new();
+            let mut col = 0usize;
+
+            // The ruler only gets a say where nothing has claimed the left
+            // edge — otherwise the hour would collide with a bar or a title.
+            if first_busy > HOUR_LABEL_WIDTH && owner.is_none_or(|o| o.indent > 0) {
+                let label = self.slot_label(axis, row, now_row == Some(row));
+                if !label.0.is_empty() {
+                    line.push(Span::styled(
+                        label.0.clone(),
+                        Style::default().fg(label.1).bg(cell_bg),
+                    ));
+                    col = label.0.chars().count();
+                }
+            }
+            while col < width as usize {
+                if let Some(o) = owner.filter(|o| o.indent == col) {
+                    if let Some(&(_, idx, first_row, _)) = of_pos(o.pos) {
+                        let is_selected = selected == Some(o.pos);
+                        let cell_width = width - col as u16;
+                        // An event the cascade slid off its own slot must
+                        // print its real start time even in a narrow
+                        // column, or a stacked clash claims the wrong time.
+                        let mut text_level = CellText::for_width(cell_width);
+                        if first_row != o.start_row && text_level == CellText::SummaryOnly {
+                            text_level = CellText::WithTime;
+                        }
+                        line.extend(self.event_cell(
+                            &self.events[idx],
+                            is_selected,
+                            text_level,
+                            cell_width,
+                            cell_bg,
+                        ));
+                    }
+                    col = width as usize;
+                    continue;
+                }
+                if let Some((pos, idx)) = bar_at(col) {
+                    let bg = if selected == Some(pos) {
+                        theme::BG_SELECTED
+                    } else {
+                        cell_bg
+                    };
+                    line.push(Span::styled(
+                        SLOT_CONTINUATION,
+                        Style::default()
+                            .fg(self.event_dot_color(&self.events[idx]))
+                            .bg(bg),
+                    ));
+                    col += 1;
+                    continue;
+                }
+                // A run of empty columns up to the next thing on this row.
+                let next = (col + 1..width as usize)
+                    .find(|&c| {
+                        owner.is_some_and(|o| o.indent == c)
+                            || (c < bar_limit && bar_at(c).is_some())
+                    })
+                    .unwrap_or(width as usize);
+                line.push(Span::styled(
+                    " ".repeat(next - col),
+                    Style::default().bg(cell_bg),
+                ));
+                col = next;
+            }
+            lines.push(Line::from(line));
+        }
+        lines
+    }
+
+    /// The ruler text for a row: the hour, and only the hour — `09h` on the
+    /// rows that land on one, nothing on the rows in between. That is all
+    /// the time information an empty slot needs, and it keeps the grid
+    /// reading as a background ruler rather than a wall of timestamps. The
+    /// slot the current time falls in says `now` instead, on today's column
+    /// only. The caller decides whether there is room to draw it.
+    fn slot_label(&self, axis: &TimeAxis, row: usize, is_now: bool) -> (String, Color) {
+        let minutes = axis.row_start_minutes(row);
+        if is_now {
+            ("now".to_string(), theme::TIME_RELATIVE)
+        } else if minutes.is_multiple_of(60) {
+            (format!("{:02}h", minutes / 60), SLOT_LABEL_HOUR_FG)
+        } else {
+            (String::new(), SLOT_LABEL_FG)
+        }
     }
 
     /// Render Day/3-Day/Week: one bordered column per entry in `days`,
     /// each with a weekday/date header (distinctly colored for weekends,
-    /// today, and the keyboard-focused day) and its events stacked below.
+    /// today, and the keyboard-focused day).
+    ///
+    /// Given the room for it, each column's body is a time grid on one
+    /// shared [`TimeAxis`] (see [`Self::grid_column_lines`]) so events sit
+    /// at their real position in the day and line up across days. When the
+    /// terminal is too short or the columns too narrow for that, it falls
+    /// back to the plain stacked list.
     fn render_columns(&self, frame: &mut Frame, area: Rect, days: &[NaiveDate]) {
         let n = days.len().max(1) as u32;
         let constraints: Vec<Constraint> = (0..n).map(|_| Constraint::Ratio(1, n)).collect();
         let columns = Layout::horizontal(constraints).split(area);
         let today = Local::now().date_naive();
+
+        // One axis for every column, decided from the narrowest/shortest
+        // inner rect so no column has to render something that doesn't fit.
+        let inner_height = area.height.saturating_sub(2) as usize;
+        let inner_width = columns
+            .iter()
+            .map(|c| c.width.saturating_sub(2))
+            .min()
+            .unwrap_or(0);
+        let all_day_rows = self.all_day_rows_for(days);
+        let axis = if inner_width >= MIN_GRID_COL_WIDTH {
+            plan_time_axis(
+                inner_height.saturating_sub(all_day_rows),
+                &self.timed_spans_for(days),
+            )
+        } else {
+            None
+        };
 
         for (col, &day) in columns.iter().zip(days.iter()) {
             let is_today = day == today;
@@ -1285,6 +2062,16 @@ impl CalApp {
             let inner = block.inner(*col);
             frame.render_widget(block, *col);
 
+            // Grid rows are position-critical: one line per slot, never
+            // wrapped, or the columns stop lining up with each other.
+            if let Some(axis) = &axis {
+                let lines = self.grid_column_lines(day, axis, all_day_rows, inner.width, cell_bg);
+                frame.render_widget(
+                    Paragraph::new(lines).style(Style::default().bg(cell_bg)),
+                    inner,
+                );
+                continue;
+            }
             let indices = self.event_indices_for(day);
             let lines =
                 self.cell_event_lines(day, &indices, inner.height as usize, false, inner.width);
@@ -1386,7 +2173,19 @@ impl CalApp {
             return; // leading/trailing overflow days: number only, no event detail
         }
         let indices = self.event_indices_for(day);
-        let lines = self.cell_event_lines(day, &indices, inner.height as usize, true, inner.width);
+        // The dot strip goes first: it is the one line that fits even in a
+        // one-row-tall cell (an 80x24 terminal gives a month cell exactly
+        // that), and it is what makes a month's event load and its mix of
+        // calendars readable at a glance. Whatever rows are left below it
+        // get the usual compact event text.
+        let mut lines = Vec::with_capacity(inner.height as usize);
+        if !indices.is_empty() {
+            lines.push(self.event_dot_strip(&indices, inner.width, cell_bg));
+        }
+        let text_rows = (inner.height as usize).saturating_sub(lines.len());
+        if text_rows > 0 {
+            lines.extend(self.cell_event_lines(day, &indices, text_rows, true, inner.width));
+        }
         frame.render_widget(
             Paragraph::new(lines).style(Style::default().bg(cell_bg)),
             inner,
@@ -1472,7 +2271,12 @@ impl CalApp {
             let cols = Layout::horizontal([Constraint::Ratio(1, 7); 7]).split(*row_area);
             for (cell_area, &day) in cols.iter().zip(week.iter()) {
                 let in_month = day.month() == month_first.month();
-                let has_events = in_month && !self.event_indices_for(day).is_empty();
+                let indices = if in_month {
+                    self.event_indices_for(day)
+                } else {
+                    Vec::new()
+                };
+                let has_events = !indices.is_empty();
                 let is_today = day == today;
                 let is_focused_day = day == self.focused_date;
                 let weekend = is_weekend(day);
@@ -1485,26 +2289,197 @@ impl CalApp {
                 } else {
                     Style::default().fg(theme::FG_TEXT)
                 };
-                if has_events {
-                    style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-                }
                 if is_focused_day && !is_today {
                     style = style.bg(theme::BG_SELECTED);
                 }
+                // A day cell is 3 columns wide at any sane terminal size, so
+                // it can carry "NN" plus one [`EVENT_DOT`] color-coded per
+                // [`Self::day_dot_color`]. The dot column is reserved
+                // (rendered as a space) even on event-free days, so the day
+                // numbers stay aligned down the mini-month. Below 3 columns
+                // there is no room at all and a bold/underlined number is
+                // the fallback marker.
+                let dot_fits = cell_area.width >= 3;
+                if has_events && !dot_fits {
+                    style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                } else if has_events {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                let mut spans = vec![Span::styled(format!("{:>2}", day.day()), style)];
+                if dot_fits {
+                    spans.push(if has_events {
+                        Span::styled(EVENT_DOT, Style::default().fg(self.day_dot_color(&indices)))
+                    } else {
+                        Span::raw(" ")
+                    });
+                }
                 frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(format!("{:>2}", day.day()), style)))
-                        .alignment(ratatui::layout::Alignment::Center),
+                    Paragraph::new(Line::from(spans)).alignment(ratatui::layout::Alignment::Center),
                     *cell_area,
                 );
             }
         }
     }
 
+    /// Render [`CalView::Event`]: everything about the one event under the
+    /// cursor — the narrowest range `Tab` steps into. Up/Down still walk
+    /// the focused day's events (the view is columnar), so this doubles as
+    /// a reading pane for stepping through a day.
+    fn render_event_detail(&self, frame: &mut Frame, area: Rect) {
+        let indices = self.event_indices_for(self.focused_date);
+        let title = match self.selected_event() {
+            Some(_) => format!(
+                " {}  ({} of {}) ",
+                self.focused_date.format("%A, %B %-d, %Y"),
+                self.event_cursor + 1,
+                indices.len()
+            ),
+            None => format!(" {} ", self.focused_date.format("%A, %B %-d, %Y")),
+        };
+        let block = Block::bordered()
+            .title(Span::styled(
+                title,
+                Style::default()
+                    .fg(theme::THREAD_INDICATOR)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .border_style(Style::default().fg(theme::HELP_BORDER))
+            .style(Style::default().bg(theme::BG));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let Some(ev) = self.selected_event() else {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        "No events on this day.",
+                        Style::default().fg(theme::FG_DIM),
+                    )),
+                    Line::from(Span::styled(
+                        "h/l to another day, Shift+Tab to step back out, n to create one.",
+                        Style::default().fg(theme::FG_DIM),
+                    )),
+                ]),
+                inner,
+            );
+            return;
+        };
+
+        let row = |label: &str, value: String| -> Line<'static> {
+            Line::from(vec![
+                Span::styled(
+                    format!("{:<12}", label),
+                    Style::default().fg(theme::DETAIL_HEADER_LABEL),
+                ),
+                Span::styled(value, Style::default().fg(theme::DETAIL_HEADER_VALUE)),
+            ])
+        };
+
+        let when = if ev.all_day {
+            let first = local_date_of(ev.dtstart_utc);
+            let last = local_date_of((ev.dtend_utc - 1).max(ev.dtstart_utc));
+            if first == last {
+                format!("All day, {}", first.format("%a %-d %b %Y"))
+            } else {
+                format!(
+                    "All day, {} - {}",
+                    first.format("%a %-d %b"),
+                    last.format("%a %-d %b %Y")
+                )
+            }
+        } else {
+            let start = local_time_of(ev.dtstart_utc);
+            let end = local_time_of(ev.dtend_utc);
+            if start.date_naive() == end.date_naive() {
+                format!(
+                    "{} {} - {}",
+                    start.format("%a %-d %b %Y"),
+                    start.format("%H:%M"),
+                    end.format("%H:%M")
+                )
+            } else {
+                format!(
+                    "{} - {}",
+                    start.format("%a %-d %b %Y %H:%M"),
+                    end.format("%a %-d %b %Y %H:%M")
+                )
+            }
+        };
+        let calendar = self
+            .calendars
+            .iter()
+            .find(|c| c.url == ev.calendar_url)
+            .map(|c| c.display_name.clone())
+            .unwrap_or_else(|| ev.calendar_url.clone());
+        let sync = match ev.local_status.as_str() {
+            crate::db::CAL_STATUS_PENDING_CREATE => "queued for upload".to_string(),
+            crate::db::CAL_STATUS_PENDING_UPDATE => "edit queued for upload".to_string(),
+            crate::db::CAL_STATUS_PENDING_DELETE => "delete queued".to_string(),
+            crate::db::CAL_STATUS_CONFLICT => format!(
+                "CONFLICT - {}",
+                ev.local_error.as_deref().unwrap_or("resolve on the server")
+            ),
+            _ => "synced".to_string(),
+        };
+
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(EVENT_DOT, Style::default().fg(self.event_dot_color(ev))),
+                Span::raw(" "),
+                Span::styled(
+                    ev.summary.clone(),
+                    Style::default()
+                        .fg(theme::DETAIL_SUBJECT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            row("When", when),
+            row("Calendar", calendar),
+        ];
+        if !ev.location.is_empty() {
+            lines.push(row("Location", ev.location.clone()));
+        }
+        if !ev.organizer.is_empty() {
+            lines.push(row("Organizer", ev.organizer.clone()));
+        }
+        if let Some(rrule) = &ev.rrule {
+            lines.push(row("Repeats", rrule.clone()));
+        }
+        lines.push(row("Status", ev.status.clone()));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<12}", "Sync"),
+                Style::default().fg(theme::DETAIL_HEADER_LABEL),
+            ),
+            Span::styled(
+                sync,
+                Style::default().fg(if ev.local_status == crate::db::CAL_STATUS_SYNCED {
+                    theme::STATUS_SUCCESS
+                } else if ev.local_status == crate::db::CAL_STATUS_CONFLICT {
+                    theme::STATUS_ERROR
+                } else {
+                    theme::STATUS_PENDING
+                }),
+            ),
+        ]));
+        if !ev.description.is_empty() {
+            lines.push(Line::from(""));
+            for para in ev.description.lines() {
+                lines.push(Line::from(Span::styled(
+                    para.to_string(),
+                    Style::default().fg(theme::DETAIL_BODY),
+                )));
+            }
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
         let text = if let Some(status) = &self.status {
             status.clone()
         } else {
-            "hjkl move  [/] jump period  Enter zoom  Tab view  t today  n new  e edit  d del  1-9 cal  s sync  q quit"
+            "hjkl move  [/] jump period  Tab/S-Tab narrow/widen  Enter zoom  Esc back  t today  n new  e edit  d del  1-9 cal  s sync  q quit"
                 .to_string()
         };
         frame.render_widget(
@@ -1569,7 +2544,7 @@ impl CalApp {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "Tab/Shift+Tab field  Space toggles All day  Enter save  Esc cancel",
+                "Up/Down or Tab/Shift+Tab field  Space toggles All day  Enter save  Esc cancel",
                 Style::default().fg(theme::FG_DIM),
             )),
         ];
@@ -1577,28 +2552,33 @@ impl CalApp {
     }
 
     fn render_delete_confirm(&self, frame: &mut Frame, area: Rect) {
-        let popup = centered_rect(50, 5, area);
+        let target = self.pending_delete.as_ref();
+        let recurring = target.map(|t| t.recurring).unwrap_or(false);
+        let popup = centered_rect(56, if recurring { 6 } else { 5 }, area);
         frame.render_widget(Clear, popup);
-        let summary = self
-            .selected_event()
-            .map(|e| e.summary.as_str())
-            .unwrap_or("this event");
+        let summary = target.map(|t| t.summary.as_str()).unwrap_or("this event");
         let block = Block::default()
             .title(" Delete event? ")
             .borders(Borders::ALL)
             .style(Style::default().bg(theme::HELP_BG).fg(theme::STATUS_ERROR));
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
-        let lines = vec![
-            Line::from(Span::styled(
-                format!("Delete \"{}\"?", summary),
-                Style::default().fg(theme::FG_TEXT),
-            )),
-            Line::from(Span::styled(
-                "y confirm   n/Esc cancel",
-                Style::default().fg(theme::FG_DIM),
-            )),
-        ];
+        let mut lines = vec![Line::from(Span::styled(
+            format!("Delete \"{}\"?", summary),
+            Style::default().fg(theme::FG_TEXT),
+        ))];
+        if recurring {
+            // Deleting acts on the master VEVENT, so this is never "just
+            // this occurrence" — say so before the user commits to it.
+            lines.push(Line::from(Span::styled(
+                "This repeats: every occurrence will be deleted.",
+                Style::default().fg(theme::STATUS_ERROR),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "y confirm   n/Esc cancel",
+            Style::default().fg(theme::FG_DIM),
+        )));
         frame.render_widget(Paragraph::new(lines), inner);
     }
 }
@@ -1623,6 +2603,11 @@ mod tests {
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    /// A UTC timestamp at `h:00`, for building test event rows.
+    fn ts(y: i32, m: u32, d: u32, h: u32) -> i64 {
+        Utc.with_ymd_and_hms(y, m, d, h, 0, 0).unwrap().timestamp()
     }
 
     fn test_app() -> CalApp {
@@ -1695,29 +2680,78 @@ mod tests {
     }
 
     #[test]
-    fn cycle_view_forward_and_backward_are_inverses() {
+    fn narrow_view_steps_strictly_from_year_down_to_a_single_event() {
         let mut app = test_app();
-        let start = app.view;
-        for _ in 0..5 {
-            app.cycle_view_forward();
+        app.view = CalView::Year;
+        for expected in [
+            CalView::Month,
+            CalView::Week,
+            CalView::ThreeDay,
+            CalView::Day,
+            CalView::Event,
+        ] {
+            app.narrow_view();
+            assert_eq!(app.view, expected);
         }
+        app.narrow_view();
         assert_eq!(
-            app.view, start,
-            "cycling forward through all 5 views must return to the start"
+            app.view,
+            CalView::Event,
+            "Tab must never wrap around from Event back to Year"
         );
-        app.cycle_view_backward();
-        app.cycle_view_forward();
-        assert_eq!(app.view, start);
     }
 
     #[test]
-    fn cycle_view_forward_visits_year_between_month_and_day() {
+    fn widen_view_is_the_exact_inverse_and_stops_at_year() {
+        let mut app = test_app();
+        app.view = CalView::Event;
+        for expected in [
+            CalView::Day,
+            CalView::ThreeDay,
+            CalView::Week,
+            CalView::Month,
+            CalView::Year,
+        ] {
+            app.widen_view();
+            assert_eq!(app.view, expected);
+        }
+        app.widen_view();
+        assert_eq!(app.view, CalView::Year);
+    }
+
+    #[test]
+    fn narrowing_keeps_the_focused_day_and_re_anchors_the_period_on_it() {
+        let mut app = test_app(); // Week view, Mon 2024-01-15
+        app.focused_date = date(2024, 1, 18); // Thursday
+        app.narrow_view(); // -> 3-Day
+        assert_eq!(app.focused_date, date(2024, 1, 18));
+        assert_eq!(app.anchor, date(2024, 1, 18));
+        app.narrow_view(); // -> Day
+        assert_eq!(app.visible_range(), (date(2024, 1, 18), date(2024, 1, 19)));
+    }
+
+    #[test]
+    fn narrowing_from_day_to_event_keeps_the_selected_event() {
+        let mut app = test_app();
+        app.view = CalView::Day;
+        app.set_events(vec![
+            make_row("a", ts(2024, 1, 15, 9), ts(2024, 1, 15, 10), None, false),
+            make_row("b", ts(2024, 1, 15, 11), ts(2024, 1, 15, 12), None, false),
+        ]);
+        app.event_cursor = 1;
+        app.narrow_view();
+        assert_eq!(app.view, CalView::Event);
+        assert_eq!(app.selected_event().map(|e| e.uid.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn widening_out_of_a_grid_view_resets_the_event_cursor() {
         let mut app = test_app();
         app.view = CalView::Month;
-        app.cycle_view_forward();
+        app.event_cursor = 3;
+        app.widen_view();
         assert_eq!(app.view, CalView::Year);
-        app.cycle_view_forward();
-        assert_eq!(app.view, CalView::Day);
+        assert_eq!(app.event_cursor, 0);
     }
 
     #[test]
@@ -2263,12 +3297,356 @@ mod tests {
     }
 
     #[test]
-    fn zoom_in_from_day_view_is_a_no_op() {
+    fn zoom_in_from_day_view_opens_the_event_under_the_cursor() {
         let mut app = test_app();
         app.view = CalView::Day;
+        app.zoom_in();
+        assert_eq!(app.view, CalView::Event);
+        assert_eq!(app.anchor, app.focused_date);
+    }
+
+    #[test]
+    fn esc_returns_to_the_view_you_zoomed_out_of_not_one_step_wider() {
+        // Enter from Month jumps straight to Day; Esc must go back to the
+        // month, not to 3-Day (which is what one step wider would give).
+        let mut app = test_app();
+        app.view = CalView::Month;
+        app.anchor = date(2024, 1, 1);
+        app.focused_date = date(2024, 1, 18);
+        app.zoom_in();
+        assert_eq!(app.view, CalView::Day);
+        assert!(app.go_back());
+        assert_eq!(app.view, CalView::Month);
+        assert_eq!(app.anchor, date(2024, 1, 1));
+        assert_eq!(app.focused_date, date(2024, 1, 18));
+    }
+
+    #[test]
+    fn esc_walks_back_through_every_view_step_in_turn() {
+        let mut app = test_app(); // Week
+        app.narrow_view(); // 3-Day
+        app.narrow_view(); // Day
+        app.widen_view(); // 3-Day
+        for expected in [CalView::Day, CalView::ThreeDay, CalView::Week] {
+            assert!(app.go_back());
+            assert_eq!(app.view, expected);
+        }
+    }
+
+    #[test]
+    fn esc_restores_the_selected_event_it_left_behind() {
+        let mut app = test_app();
+        app.view = CalView::Day;
+        app.set_events(vec![
+            make_row("a", ts(2024, 1, 15, 9), ts(2024, 1, 15, 10), None, false),
+            make_row("b", ts(2024, 1, 15, 11), ts(2024, 1, 15, 12), None, false),
+        ]);
+        app.event_cursor = 1;
+        app.widen_view(); // -> 3-Day
+        app.widen_view(); // -> Week
+        app.go_back();
+        app.go_back();
+        assert_eq!(app.view, CalView::Day);
+        assert_eq!(app.event_cursor, 1);
+    }
+
+    #[test]
+    fn esc_with_nothing_to_go_back_to_reports_it_rather_than_quitting() {
+        let mut app = test_app();
+        assert!(!app.go_back(), "quitting is q's job, never Esc's");
+        assert_eq!(app.view, CalView::Week, "and the view is left alone");
+    }
+
+    #[test]
+    fn the_view_history_cannot_grow_without_bound() {
+        let mut app = test_app();
+        for _ in 0..(VIEW_HISTORY_MAX * 2) {
+            app.narrow_view();
+            app.widen_view();
+        }
+        assert!(app.view_history.len() <= VIEW_HISTORY_MAX);
+    }
+
+    #[test]
+    fn zoom_in_from_the_event_view_is_a_no_op() {
+        let mut app = test_app();
+        app.view = CalView::Event;
         let before = (app.view, app.anchor);
         app.zoom_in();
         assert_eq!((app.view, app.anchor), before);
+    }
+
+    // -- Time grid (Day/3-Day/Week) --------------------------------------
+
+    #[test]
+    fn a_short_terminal_falls_back_to_the_plain_list() {
+        assert!(plan_time_axis(MIN_GRID_ROWS - 1, &[]).is_none());
+        assert!(plan_time_axis(MIN_GRID_ROWS, &[]).is_some());
+    }
+
+    #[test]
+    fn an_empty_day_gets_a_working_day_ruler_rather_than_a_blank_24_hours() {
+        let axis = plan_time_axis(24, &[]).unwrap();
+        assert!(axis.start_minutes <= 8 * 60);
+        assert!(axis.end_minutes() >= 20 * 60);
+    }
+
+    #[test]
+    fn the_axis_always_covers_every_event_on_every_displayed_day() {
+        // 07:00 on one day and 22:00 on another: one shared ruler has to
+        // span both, or a column would render an event outside its own grid.
+        let axis = plan_time_axis(12, &[(7 * 60, 8 * 60), (21 * 60, 22 * 60)]).unwrap();
+        assert!(axis.start_minutes <= 7 * 60);
+        assert!(axis.end_minutes() >= 22 * 60);
+    }
+
+    #[test]
+    fn the_axis_never_runs_past_midnight_at_either_end() {
+        for rows in MIN_GRID_ROWS..40 {
+            for spans in [
+                vec![],
+                vec![(0, 30)],
+                vec![(23 * 60, MINUTES_PER_DAY)],
+                vec![(0, 30), (23 * 60, MINUTES_PER_DAY)],
+            ] {
+                let axis = plan_time_axis(rows, &spans).unwrap();
+                assert!(
+                    axis.end_minutes() as i64 <= MINUTES_PER_DAY,
+                    "rows={}",
+                    rows
+                );
+                assert!(axis.rows <= rows, "rows={}", rows);
+                for (start, end) in &spans {
+                    let (first, last) = axis.row_span(*start, *end);
+                    assert!(first <= last && last < axis.rows);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_taller_terminal_buys_resolution_not_a_closer_crop() {
+        let roomy = plan_time_axis(40, &[(9 * 60, 10 * 60)]).unwrap();
+        let cramped = plan_time_axis(8, &[(9 * 60, 10 * 60)]).unwrap();
+        assert!(
+            roomy.slot_minutes < cramped.slot_minutes,
+            "{}min vs {}min",
+            roomy.slot_minutes,
+            cramped.slot_minutes
+        );
+        for axis in [roomy, cramped] {
+            assert!(axis.start_minutes as i64 <= DAY_CORE.0);
+            assert!(axis.end_minutes() as i64 >= DAY_CORE.1);
+        }
+    }
+
+    #[test]
+    fn a_day_with_one_meeting_still_shows_the_whole_working_day() {
+        let axis = plan_time_axis(24, &[(12 * 60, 13 * 60)]).unwrap();
+        assert!(axis.start_minutes as i64 <= DAY_CORE.0);
+        assert!(axis.end_minutes() as i64 >= DAY_CORE.1);
+    }
+
+    #[test]
+    fn row_span_is_inclusive_and_treats_the_end_as_exclusive() {
+        let axis = TimeAxis {
+            start_minutes: 8 * 60,
+            slot_minutes: 60,
+            rows: 12,
+        };
+        // 09:00-10:00 occupies exactly the 09:00 row, not 09:00 and 10:00.
+        assert_eq!(axis.row_span(9 * 60, 10 * 60), (1, 1));
+        assert_eq!(axis.row_span(9 * 60, 11 * 60), (1, 2));
+        // A zero-length event still claims the row it starts in.
+        assert_eq!(axis.row_span(9 * 60, 9 * 60), (1, 1));
+    }
+
+    #[test]
+    fn an_event_outside_the_axis_pins_to_the_nearest_edge_instead_of_vanishing() {
+        let axis = TimeAxis {
+            start_minutes: 8 * 60,
+            slot_minutes: 60,
+            rows: 12,
+        };
+        assert_eq!(axis.row_span(-120, 9 * 60), (0, 0)); // began yesterday
+        assert_eq!(axis.row_span(23 * 60, 24 * 60), (11, 11)); // runs past the end
+    }
+
+    #[test]
+    fn minutes_within_day_is_measured_from_that_days_own_local_midnight() {
+        let day = date(2024, 1, 15);
+        let t = ts(2024, 1, 15, 9);
+        assert_eq!(
+            minutes_within_day(t + 3600, day) - minutes_within_day(t, day),
+            60
+        );
+        // The same instant is a day further along when measured from the
+        // previous day's midnight.
+        assert_eq!(
+            minutes_within_day(t, day - Duration::days(1)) - minutes_within_day(t, day),
+            MINUTES_PER_DAY
+        );
+    }
+
+    // -- Overlap cascade -------------------------------------------------
+
+    /// `(pos, first_row, last_row)` triples, as `grid_column_lines` builds them.
+    fn ev(pos: usize, first: usize, last: usize) -> (usize, usize, usize) {
+        (pos, first, last)
+    }
+
+    #[test]
+    fn a_lone_event_starts_at_the_left_edge_on_its_own_row() {
+        let placed = pack_cascade(&[ev(0, 2, 4)], 12, 8);
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].indent, 0);
+        assert_eq!((placed[0].start_row, placed[0].end_row), (2, 4));
+    }
+
+    #[test]
+    fn events_that_never_overlap_all_start_at_the_left_edge() {
+        let placed = pack_cascade(&[ev(0, 0, 1), ev(1, 3, 4), ev(2, 7, 7)], 12, 8);
+        assert!(placed.iter().all(|p| p.indent == 0));
+        let starts: Vec<usize> = placed.iter().map(|p| p.start_row).collect();
+        assert_eq!(starts, vec![0, 3, 7], "and each keeps its own row");
+    }
+
+    #[test]
+    fn simultaneous_events_cascade_one_row_down_and_one_column_right() {
+        // Three events in the same slot: three lines, stepping right, each
+        // with the full remaining width for its title.
+        let placed = pack_cascade(&[ev(0, 4, 4), ev(1, 4, 4), ev(2, 4, 4)], 12, 8);
+        assert_eq!(placed.len(), 3);
+        for (n, p) in placed.iter().enumerate() {
+            assert_eq!(p.start_row, 4 + n, "one event begins per row");
+            assert_eq!(p.indent, n, "each steps one column right of the last");
+        }
+    }
+
+    #[test]
+    fn a_staggered_clash_nests_under_what_it_overlaps() {
+        // 10:00-12:00, then 10:30-12:00, then 11:00-12:00.
+        let placed = pack_cascade(&[ev(0, 4, 7), ev(1, 5, 7), ev(2, 6, 7)], 12, 8);
+        let indents: Vec<usize> = placed.iter().map(|p| p.indent).collect();
+        assert_eq!(indents, vec![0, 1, 2]);
+        let starts: Vec<usize> = placed.iter().map(|p| p.start_row).collect();
+        assert_eq!(
+            starts,
+            vec![4, 5, 6],
+            "none had to move: their slots differ"
+        );
+    }
+
+    #[test]
+    fn the_cascade_unwinds_once_the_overlap_ends() {
+        // The clash is early; a later, unrelated event is back at the edge.
+        let placed = pack_cascade(&[ev(0, 0, 1), ev(1, 0, 1), ev(2, 6, 7)], 12, 8);
+        assert_eq!(placed[1].indent, 1);
+        assert_eq!(
+            placed[2].indent, 0,
+            "a fresh event is not nested under the past"
+        );
+    }
+
+    #[test]
+    fn every_event_gets_a_row_of_its_own() {
+        let events: Vec<(usize, usize, usize)> = (0..6).map(|k| ev(k, 3, 5)).collect();
+        let placed = pack_cascade(&events, 16, 8);
+        assert_eq!(placed.len(), events.len());
+        let mut rows: Vec<usize> = placed.iter().map(|p| p.start_row).collect();
+        rows.sort();
+        rows.dedup();
+        assert_eq!(rows.len(), events.len(), "no two events share a line");
+        assert!(
+            placed.iter().all(|p| p.start_row >= 3),
+            "and none starts above its slot"
+        );
+    }
+
+    #[test]
+    fn the_indent_is_capped_so_a_title_always_has_room() {
+        let events: Vec<(usize, usize, usize)> = (0..8).map(|k| ev(k, 0, 9)).collect();
+        let placed = pack_cascade(&events, 16, 2);
+        assert_eq!(placed.len(), 8);
+        assert!(placed.iter().all(|p| p.indent <= 2));
+    }
+
+    #[test]
+    fn an_event_with_no_free_line_below_is_dropped_rather_than_drawn_wrong() {
+        // Four events clashing in the last two rows of the grid: only two
+        // lines exist, so two are placed and the rest left out.
+        let events: Vec<(usize, usize, usize)> = (0..4).map(|k| ev(k, 2, 2)).collect();
+        let placed = pack_cascade(&events, 4, 8);
+        assert_eq!(placed.len(), 2);
+        assert!(placed.iter().all(|p| p.start_row < 4));
+    }
+
+    // -- Delete confirmation ---------------------------------------------
+
+    #[test]
+    fn the_delete_prompt_targets_the_event_it_was_opened_for_not_the_cursor() {
+        // A sync landing while the prompt is up reloads and re-sorts the
+        // list; the cursor can end up on a different event. Confirming must
+        // still delete the event the prompt named.
+        let mut app = test_app();
+        app.view = CalView::Day;
+        app.set_events(vec![make_row(
+            "doomed",
+            ts(2024, 1, 15, 9),
+            ts(2024, 1, 15, 10),
+            None,
+            false,
+        )]);
+        app.begin_delete_confirm().unwrap();
+        let doomed_id = app.pending_delete.as_ref().unwrap().id;
+
+        let mut other = make_row(
+            "survivor",
+            ts(2024, 1, 15, 8),
+            ts(2024, 1, 15, 9),
+            None,
+            false,
+        );
+        other.id = doomed_id + 1;
+        app.set_events(vec![other]); // the reload a background sync would do
+
+        let target = app.take_pending_delete().unwrap();
+        assert_eq!(target.id, doomed_id);
+        assert_eq!(target.summary, "doomed");
+        assert_eq!(app.mode, CalMode::Browse);
+    }
+
+    #[test]
+    fn the_delete_prompt_flags_a_recurring_event_as_a_whole_series() {
+        let mut app = test_app();
+        app.view = CalView::Day;
+        app.set_events(vec![make_row(
+            "weekly",
+            ts(2024, 1, 15, 9),
+            ts(2024, 1, 15, 10),
+            Some("FREQ=WEEKLY"),
+            false,
+        )]);
+        app.begin_delete_confirm().unwrap();
+        assert!(app.pending_delete.as_ref().unwrap().recurring);
+    }
+
+    #[test]
+    fn cancelling_the_delete_prompt_drops_the_target() {
+        let mut app = test_app();
+        app.view = CalView::Day;
+        app.set_events(vec![make_row(
+            "keep-me",
+            ts(2024, 1, 15, 9),
+            ts(2024, 1, 15, 10),
+            None,
+            false,
+        )]);
+        app.begin_delete_confirm().unwrap();
+        app.cancel_delete_confirm();
+        assert_eq!(app.mode, CalMode::Browse);
+        assert!(app.pending_delete.is_none());
+        assert!(app.take_pending_delete().is_none());
     }
 
     #[test]

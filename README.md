@@ -19,7 +19,7 @@ jamail ships as three binaries: **`jamaild`**, a background daemon that owns eve
 - **Attachment support** — view metadata, save to disk, image previews in supported terminals
 - **Mouse text selection** with automatic clipboard copy
 - **HTML email rendering** via w3m (falls back to tag stripping)
-- **Optional CalDAV calendar sync** (`jacal`) — day/3-day/week/month agenda views, create/edit/delete events, synced by `jamaild` the same way mail is; see [Calendar: jacal + CalDAV](#calendar-jacal--caldav)
+- **Optional CalDAV calendar sync** (`jacal`) — year/month/week/3-day/day/single-event views, day columns drawn against a shared time grid, create/edit/delete events, synced by `jamaild` the same way mail is; see [Calendar: jacal + CalDAV](#calendar-jacal--caldav)
 
 ## Install
 
@@ -124,15 +124,47 @@ create/update/delete requests.
 - **Conflict-safe writes**: every create/update/delete uses
   `If-Match`/`If-None-Match` ETag preconditions; a conflict never silently
   overwrites the server or the local copy — it's flagged for you to resolve.
-- **Views**: day / 3-day / week / month / year, each rendered as a colored
-  table grid (not a flat list) — a color dot plus background per calendar,
-  weekend columns in a distinct color, and an all-day event shown with its
-  own banner background on every day it spans. Week start is Monday by
-  default, configurable per install (`week_start: sunday`). Navigate with
-  h/j/k/l (day/cell, and the event under the cursor in Day/3-Day/Week), Tab
-  (cycle view), t (today), `[`/`]` (jump a whole period), Enter (zoom into a
-  day/month); n new, e edit, d delete, s manual sync, 1-9 toggle a
-  calendar's visibility.
+- **Views**: year / month / week / 3-day / day / single event, each rendered
+  as a colored table grid (not a flat list) — a color-coded `●` per event
+  (its calendar's color; red for an unresolved sync conflict), weekend
+  columns in a distinct color, and an all-day event shown with its own
+  banner background on every day it spans. Week start is Monday by default,
+  configurable per install (`week_start: sunday`).
+- **Time grid**: given the room for it, Day/3-day/week columns are drawn
+  against a shared time ruler — a dim `09h` on each row that lands on an
+  hour, and every event sitting at its real position in the day, running
+  down a continuation bar for as long as it lasts. Because all the columns
+  share one ruler, 09:00 is the same screen row in every day, so you can
+  compare days by eye. The slot size (15 min up to 4 h) and the stretch of
+  day shown adapt to the terminal: taller windows buy finer slots, and a
+  window too short or too narrow for a grid falls back to a plain stacked
+  list.
+- **Overlapping events cascade**: the column is never divided up, so every
+  event keeps a line of its own at full width and you can always read its
+  title. A clashing event is drawn on the next line, stepped one column to
+  the right, with the events it overlaps running their continuation bars
+  down the columns it stepped past — a staircase you can count at a glance:
+
+  ```
+  ● 10:00-12:00 Design review
+  │● 10:30-12:00 Budget call
+  ││● 11:00-12:00 Interview
+  │││
+  ```
+
+  Each line prints its own start time, so events pushed down a line from
+  the slot they really belong to (three events at 09:00 become three
+  consecutive lines) all read as the same time rather than staggered ones.
+- **Navigation**: `Tab` steps one level *narrower* — year → month → week →
+  3-day → day → the single event under the cursor — and `Shift+Tab` one
+  level wider; neither wraps around. `Enter` zooms straight in on the
+  focused cell (a month jumps to the day, skipping the widths in between),
+  and `Esc` retraces your steps — back to the view you came from, on the
+  period and cell you left it on. `q` is the only way out. h/j/k/l move the
+  focused day/cell (and the event under the cursor in the day-column
+  views), t jumps to today, `[`/`]` jump a whole period; n new, e edit,
+  d delete, s manual sync, 1-9 toggle a calendar's visibility. In the
+  create/edit form, Up/Down (or Tab/Shift+Tab) move between fields.
 - **Recurring events**: `RRULE` is expanded to every occurrence that falls
   in the visible range (`EXDATE` exclusions honored), so a repeating event
   shows up on each date it actually occurs, not just its first occurrence.

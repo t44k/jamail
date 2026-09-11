@@ -410,10 +410,8 @@ impl CalDavClient {
 }
 
 /// Build a resource href for a brand-new event: `{calendar_url}{uid}.ics`.
-pub fn new_event_href(calendar_url: &str, uid: &str) -> Result<String> {
-    let url = HttpUrl::parse(calendar_url).context("invalid calendar URL")?;
-    let sanitized: String = uid
-        .chars()
+pub fn sanitize_uid(uid: &str) -> String {
+    uid.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '@' || c == '.' {
                 c
@@ -421,7 +419,12 @@ pub fn new_event_href(calendar_url: &str, uid: &str) -> Result<String> {
                 '_'
             }
         })
-        .collect();
+        .collect()
+}
+
+pub fn new_event_href(calendar_url: &str, uid: &str) -> Result<String> {
+    let url = HttpUrl::parse(calendar_url).context("invalid calendar URL")?;
+    let sanitized = sanitize_uid(uid);
     let dir = if url.path_and_query.ends_with('/') {
         url.path_and_query.clone()
     } else {

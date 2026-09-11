@@ -105,6 +105,19 @@ fn default_calendar_path(account: &str) -> String {
     format!("/dav/{}/calendars/default/", account)
 }
 
+/// The href this server assigns to an event with `uid` in `account`'s
+/// hosted "Default" calendar — exactly the path a CalDAV client would
+/// `PUT` it to. Used by `calsync` to give a locally-created event a real
+/// path when it commits a write to a server-hosted calendar, so the event
+/// is immediately `GET`-able by clients of this same server.
+pub fn default_event_href(account: &str, uid: &str) -> String {
+    format!(
+        "{}{}.ics",
+        default_calendar_path(account),
+        crate::caldav::sanitize_uid(uid)
+    )
+}
+
 /// Bind `listen_addr` (e.g. `"127.0.0.1:5232"` or `"127.0.0.1:0"` to let
 /// the OS pick a free port — used by tests) without starting the accept
 /// loop yet. Split from [`spawn`] so tests can learn the real bound

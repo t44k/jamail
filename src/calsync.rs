@@ -9,10 +9,15 @@
 //! poll loop (`poll_interval_secs`, from config; default 5 minutes — see
 //! [`crate::config::CalDavConfig`]). Each cycle, per discovered calendar:
 //!
-//! 1. Drain any queued local writes first ([`CalSyncControl::write_queue`]
-//!    — pending create/update/delete from `jacal`, delivered via
-//!    `ipc::Request::EnqueueCalendarMutation`) so local edits reach the
+//! 1. Apply outstanding local writes first, so local edits reach the
 //!    server before the next read-back would otherwise overwrite them.
+//!    [`CalSyncControl::write_queue`] (pending create/update/delete from
+//!    `jacal`, delivered via `ipc::Request::EnqueueCalendarMutation`) is
+//!    only a wake-up hint: the work list is every row the database still
+//!    has in a `pending_*` state, so a write queued before `jamaild`
+//!    restarted, or one whose last attempt failed, is retried rather than
+//!    lost. What each row gets is decided from its own `local_status`, not
+//!    from the queued variant — see [`apply_pending_write`].
 //! 2. Try [`crate::caldav::CalDavClient::sync_calendar`] with the stored
 //!    sync-token; on [`crate::caldav::SyncOutcome::FullResyncRequired`],
 //!    fall back to [`crate::caldav::CalDavClient::list_all_events`] and
@@ -62,6 +67,20 @@ pub enum CalMutation {
     Delete { local_id: i64 },
 }
 
+impl CalMutation {
+    /// The `calendar_events.id` this mutation concerns. What actually
+    /// happens to that row is decided from the row's own `local_status`
+    /// (see [`apply_pending_write`]) rather than from the variant, so this
+    /// is all the sync thread needs from a queue entry.
+    pub fn local_id(&self) -> i64 {
+        match self {
+            CalMutation::Create { local_id }
+            | CalMutation::Update { local_id, .. }
+            | CalMutation::Delete { local_id } => *local_id,
+        }
+    }
+}
+
 pub enum CalSyncEvent {
     Syncing(String),
     CalendarSynced(String, usize),
@@ -86,10 +105,15 @@ impl CalSyncControl {
         }
     }
 
+    /// Queue a local write and wake the loop, so a create/edit/delete the
+    /// user just made reaches the server within half a second instead of
+    /// waiting out the rest of the poll interval (up to five minutes by
+    /// default) — long enough that the UI looks like it ignored the key.
     pub fn enqueue(&self, mutation: CalMutation) {
         if let Ok(mut q) = self.write_queue.lock() {
             q.push(mutation);
         }
+        self.force_sync.store(true, Ordering::Relaxed);
     }
 }
 
@@ -184,14 +208,33 @@ fn run_one_cycle(
 ) {
     control.force_sync.store(false, Ordering::Relaxed);
 
-    // 1. Drain queued local writes first.
-    let writes: Vec<CalMutation> = control
+    // 1. Apply local writes first. The queue is only a wake-up hint: the
+    //    database is the work list, so a write queued before `jamaild`
+    //    restarted — or one whose last attempt hit a transient network
+    //    error — is picked up here too. Without that, the destructive drain
+    //    below would strand such a row in `pending_*` forever: nothing else
+    //    ever retried it, so a single failed DELETE meant an event the user
+    //    deleted stayed on the server and came back on the next read pass.
+    let queued: Vec<CalMutation> = control
         .write_queue
         .lock()
         .map(|mut q| q.drain(..).collect())
         .unwrap_or_default();
-    for mutation in writes {
-        apply_mutation(client, db, mutation, tx);
+    let mut attempted: HashSet<i64> = HashSet::new();
+    for mutation in queued {
+        if attempted.insert(mutation.local_id()) {
+            apply_pending_write(client, db, mutation.local_id(), tx);
+        }
+    }
+    if let Ok(pending) = db.get_pending_calendar_writes(account_name) {
+        for row in pending {
+            // Anything already attempted this cycle waits for the next one
+            // rather than being retried immediately against a server that
+            // just refused it.
+            if attempted.insert(row.id) {
+                apply_pending_write(client, db, row.id, tx);
+            }
+        }
     }
 
     // 2. Discover calendars and sync each.
@@ -333,94 +376,143 @@ fn apply_changed_event(
     .is_ok()
 }
 
-fn apply_mutation(
+/// Push whatever `calendar_events.local_status` says is still outstanding
+/// for `local_id` to the server.
+///
+/// The row's own status — not the [`CalMutation`] variant that referenced
+/// it — decides what happens. That is deliberate: a queue entry can be
+/// stale (its row was already removed locally) and SQLite reuses rowids, so
+/// trusting the variant would let a stale `Delete` destroy a *different*,
+/// newly created event that happened to inherit the id. A row with nothing
+/// outstanding (`synced`, or `conflict` awaiting the user) is skipped.
+fn apply_pending_write(
     client: &CalDavClient,
     db: &MailDb,
-    mutation: CalMutation,
+    local_id: i64,
     tx: &Sender<CalSyncEvent>,
 ) {
-    match mutation {
-        CalMutation::Create { local_id } => match db.get_calendar_event_by_id(local_id) {
-            Ok(Some(row)) => match row.to_vevent() {
-                Ok(event) => {
-                    let href = match crate::caldav::new_event_href(&row.calendar_url, &event.uid) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            let _ = tx.send(CalSyncEvent::MutationError(local_id, e.to_string()));
-                            return;
-                        }
-                    };
-                    let ics = event.to_new_ics(chrono::Utc::now());
-                    match client.put_event(&href, &ics, None, true) {
-                        Ok(etag) => {
-                            let _ = db.mark_calendar_event_synced(local_id, &href, Some(&etag));
-                            let _ = tx.send(CalSyncEvent::MutationApplied(local_id));
-                        }
-                        Err(CalDavError::Conflict(msg)) => {
-                            let _ = db.mark_calendar_event_conflict(local_id, &msg);
-                            let _ = tx.send(CalSyncEvent::MutationConflict(local_id, msg));
-                        }
-                        Err(e) => {
-                            let _ = tx.send(CalSyncEvent::MutationError(local_id, e.to_string()));
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(CalSyncEvent::MutationError(local_id, e.to_string()));
-                }
-            },
-            Ok(None) => {}
-            Err(e) => {
-                let _ = tx.send(CalSyncEvent::MutationError(local_id, e.to_string()));
+    let row = match db.get_calendar_event_by_id(local_id) {
+        Ok(Some(row)) => row,
+        Ok(None) => return,
+        Err(e) => {
+            let _ = tx.send(CalSyncEvent::MutationError(local_id, e.to_string()));
+            return;
+        }
+    };
+    // A calendar this daemon hosts itself has no remote to talk to: the
+    // local row is already the authoritative copy, so the write is
+    // committed in place (see `MailDb::server_commit_local_write`).
+    if row.calendar_url.starts_with(db::SERVER_CALENDAR_URL_PREFIX) {
+        let href = crate::caldav_server::default_event_href(&row.account, &row.uid);
+        match db.server_commit_local_write(row.id, &href) {
+            Ok(()) => {
+                let _ = tx.send(CalSyncEvent::MutationApplied(row.id));
             }
-        },
-        CalMutation::Update { local_id, edits: _ } => {
-            // Edits are already applied to the local row by
-            // `db::apply_local_calendar_edit` at edit time (see
-            // `calapp`); here we just push the resulting raw ICS with the
-            // row's current ETag as `If-Match`.
-            match db.get_calendar_event_by_id(local_id) {
-                Ok(Some(row)) if row.raw_ics.is_some() => {
-                    let ics = row.raw_ics.clone().unwrap();
-                    match client.put_event(&row.href, &ics, row.etag.as_deref(), false) {
-                        Ok(etag) => {
-                            let _ = db.mark_calendar_event_synced(local_id, &row.href, Some(&etag));
-                            let _ = tx.send(CalSyncEvent::MutationApplied(local_id));
-                        }
-                        Err(CalDavError::Conflict(msg)) => {
-                            let _ = db.mark_calendar_event_conflict(local_id, &msg);
-                            let _ = tx.send(CalSyncEvent::MutationConflict(local_id, msg));
-                        }
-                        Err(e) => {
-                            let _ = tx.send(CalSyncEvent::MutationError(local_id, e.to_string()));
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    let _ = tx.send(CalSyncEvent::MutationError(local_id, e.to_string()));
-                }
+            Err(e) => {
+                let _ = tx.send(CalSyncEvent::MutationError(row.id, e.to_string()));
             }
         }
-        CalMutation::Delete { local_id } => match db.get_calendar_event_by_id(local_id) {
-            Ok(Some(row)) => match client.delete_event(&row.href, row.etag.as_deref()) {
-                Ok(()) => {
-                    let _ = db.delete_calendar_event_row(local_id);
-                    let _ = tx.send(CalSyncEvent::MutationApplied(local_id));
-                }
-                Err(CalDavError::Conflict(msg)) => {
-                    let _ = db.mark_calendar_event_conflict(local_id, &msg);
-                    let _ = tx.send(CalSyncEvent::MutationConflict(local_id, msg));
-                }
-                Err(e) => {
-                    let _ = tx.send(CalSyncEvent::MutationError(local_id, e.to_string()));
-                }
-            },
-            Ok(None) => {}
-            Err(e) => {
-                let _ = tx.send(CalSyncEvent::MutationError(local_id, e.to_string()));
-            }
-        },
+        return;
+    }
+    match row.local_status.as_str() {
+        db::CAL_STATUS_PENDING_CREATE => apply_create(client, db, &row, tx),
+        db::CAL_STATUS_PENDING_UPDATE => apply_update(client, db, &row, tx),
+        db::CAL_STATUS_PENDING_DELETE => apply_delete(client, db, &row, tx),
+        _ => {}
+    }
+}
+
+fn apply_create(
+    client: &CalDavClient,
+    db: &MailDb,
+    row: &crate::db::CalendarEventRow,
+    tx: &Sender<CalSyncEvent>,
+) {
+    let event = match row.to_vevent() {
+        Ok(e) => e,
+        Err(e) => {
+            let _ = tx.send(CalSyncEvent::MutationError(row.id, e.to_string()));
+            return;
+        }
+    };
+    let href = match crate::caldav::new_event_href(&row.calendar_url, &event.uid) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = tx.send(CalSyncEvent::MutationError(row.id, e.to_string()));
+            return;
+        }
+    };
+    let ics = event.to_new_ics(chrono::Utc::now());
+    match client.put_event(&href, &ics, None, true) {
+        Ok(etag) => {
+            let _ = db.mark_calendar_event_synced(row.id, &href, Some(&etag));
+            let _ = tx.send(CalSyncEvent::MutationApplied(row.id));
+        }
+        Err(CalDavError::Conflict(msg)) => {
+            let _ = db.mark_calendar_event_conflict(row.id, &msg);
+            let _ = tx.send(CalSyncEvent::MutationConflict(row.id, msg));
+        }
+        Err(e) => {
+            let _ = tx.send(CalSyncEvent::MutationError(row.id, e.to_string()));
+        }
+    }
+}
+
+/// The edits themselves are already applied to the local row by
+/// `db::apply_local_calendar_edit` at edit time (see `calapp`); this just
+/// pushes the resulting raw ICS with the row's current ETag as `If-Match`.
+fn apply_update(
+    client: &CalDavClient,
+    db: &MailDb,
+    row: &crate::db::CalendarEventRow,
+    tx: &Sender<CalSyncEvent>,
+) {
+    let Some(ics) = row.raw_ics.clone() else {
+        return;
+    };
+    match client.put_event(&row.href, &ics, row.etag.as_deref(), false) {
+        Ok(etag) => {
+            let _ = db.mark_calendar_event_synced(row.id, &row.href, Some(&etag));
+            let _ = tx.send(CalSyncEvent::MutationApplied(row.id));
+        }
+        Err(CalDavError::Conflict(msg)) => {
+            let _ = db.mark_calendar_event_conflict(row.id, &msg);
+            let _ = tx.send(CalSyncEvent::MutationConflict(row.id, msg));
+        }
+        Err(e) => {
+            let _ = tx.send(CalSyncEvent::MutationError(row.id, e.to_string()));
+        }
+    }
+}
+
+fn apply_delete(
+    client: &CalDavClient,
+    db: &MailDb,
+    row: &crate::db::CalendarEventRow,
+    tx: &Sender<CalSyncEvent>,
+) {
+    // A row still carrying the local placeholder href was never uploaded
+    // (its create failed), so there is nothing remote to DELETE — and the
+    // placeholder is not a path: sending it would resolve it against the
+    // account's CalDAV base URL and fire a request at somebody else's
+    // resource.
+    if row.href.starts_with(db::LOCAL_HREF_PREFIX) {
+        let _ = db.delete_calendar_event_row(row.id);
+        let _ = tx.send(CalSyncEvent::MutationApplied(row.id));
+        return;
+    }
+    match client.delete_event(&row.href, row.etag.as_deref()) {
+        Ok(()) => {
+            let _ = db.delete_calendar_event_row(row.id);
+            let _ = tx.send(CalSyncEvent::MutationApplied(row.id));
+        }
+        Err(CalDavError::Conflict(msg)) => {
+            let _ = db.mark_calendar_event_conflict(row.id, &msg);
+            let _ = tx.send(CalSyncEvent::MutationConflict(row.id, msg));
+        }
+        Err(e) => {
+            let _ = tx.send(CalSyncEvent::MutationError(row.id, e.to_string()));
+        }
     }
 }
 
@@ -533,16 +625,101 @@ mod tests {
     }
 
     #[test]
-    fn apply_mutation_delete_of_nonexistent_row_is_a_harmless_no_op() {
+    fn apply_pending_write_for_a_nonexistent_row_is_a_harmless_no_op() {
         let db = MailDb::open_in_memory().unwrap();
         let client = CalDavClient::new("http://127.0.0.1:1", "u", "p").unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        apply_mutation(&client, &db, CalMutation::Delete { local_id: 999 }, &tx);
+        apply_pending_write(&client, &db, 999, &tx);
         assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn apply_mutation_create_is_a_conflict_when_server_unreachable_surfaces_as_error_not_panic() {
+    fn a_stale_delete_never_touches_a_row_that_has_nothing_pending() {
+        // SQLite reuses rowids, so a queued Delete can name a row that is
+        // now a different, freshly synced event. The row's own status, not
+        // the queued variant, has to decide what happens to it.
+        let db = MailDb::open_in_memory().unwrap();
+        let event = parse_vevents(
+            "BEGIN:VEVENT\r\nUID:reused-1\r\nDTSTART:20240115T090000Z\r\nEND:VEVENT\r\n",
+        )
+        .unwrap()
+        .remove(0);
+        let id = db
+            .upsert_calendar_event(
+                "acct",
+                "http://127.0.0.1:1/cal/",
+                "/cal/reused-1.ics",
+                Some("etag-1"),
+                &event,
+                event.raw.as_ref().unwrap(),
+            )
+            .unwrap();
+        let client = CalDavClient::new("http://127.0.0.1:1", "u", "p").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        apply_pending_write(&client, &db, id, &tx);
+        assert!(rx.try_recv().is_err(), "no request should have been made");
+        assert!(
+            db.get_calendar_event_by_id(id).unwrap().is_some(),
+            "a synced row must survive a stale Delete naming its id"
+        );
+    }
+
+    #[test]
+    fn deleting_a_never_uploaded_row_skips_the_network_entirely() {
+        // A row whose create failed still carries the `local:` placeholder
+        // href. That is not a path — resolving it against the account's
+        // CalDAV base would fire a DELETE at an unrelated resource.
+        let db = MailDb::open_in_memory().unwrap();
+        let event = parse_vevents(
+            "BEGIN:VEVENT\r\nUID:never-up-1\r\nDTSTART:20240115T090000Z\r\nEND:VEVENT\r\n",
+        )
+        .unwrap()
+        .remove(0);
+        let id = db
+            .insert_local_calendar_event("acct", "http://127.0.0.1:1/cal/", &event)
+            .unwrap();
+        db.mark_calendar_event_conflict(id, "uid already exists")
+            .unwrap();
+        assert!(db.mark_calendar_event_pending_delete(id).unwrap());
+        let client = CalDavClient::new("http://127.0.0.1:1", "u", "p").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        apply_pending_write(&client, &db, id, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(CalSyncEvent::MutationApplied(applied)) if applied == id
+        ));
+        assert!(db.get_calendar_event_by_id(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_write_to_a_server_hosted_calendar_is_committed_locally() {
+        // `server:` calendars are hosted by this daemon; there is no remote
+        // to PUT to, so the write must complete against the local database
+        // (and land in the sync log) rather than sit pending forever.
+        let db = MailDb::open_in_memory().unwrap();
+        let event = parse_vevents(
+            "BEGIN:VEVENT\r\nUID:hosted-1\r\nDTSTART:20240115T090000Z\r\nEND:VEVENT\r\n",
+        )
+        .unwrap()
+        .remove(0);
+        let id = db
+            .insert_local_calendar_event("acct", "server:acct", &event)
+            .unwrap();
+        let client = CalDavClient::new("http://127.0.0.1:1", "u", "p").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        apply_pending_write(&client, &db, id, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(CalSyncEvent::MutationApplied(applied)) if applied == id
+        ));
+        let row = db.get_calendar_event_by_id(id).unwrap().unwrap();
+        assert_eq!(row.local_status, db::CAL_STATUS_SYNCED);
+        assert_eq!(row.href, "/dav/acct/calendars/default/hosted-1.ics");
+        assert!(row.etag.is_some());
+    }
+
+    #[test]
+    fn apply_create_when_server_unreachable_surfaces_as_error_not_panic() {
         // Use a real, currently-loopback-unreachable port so the PUT fails
         // fast with a connection error (not a hang) — verifies the error
         // path reports MutationError rather than panicking or silently
@@ -558,7 +735,7 @@ mod tests {
             .unwrap();
         let client = CalDavClient::new("http://127.0.0.1:1", "u", "p").unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        apply_mutation(&client, &db, CalMutation::Create { local_id }, &tx);
+        apply_pending_write(&client, &db, local_id, &tx);
         match rx.try_recv() {
             Ok(CalSyncEvent::MutationError(id, _)) => assert_eq!(id, local_id),
             other => panic!(
