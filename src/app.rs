@@ -4820,6 +4820,7 @@ mod tests {
             draft_folder: None,
             notify_folders: None,
             color: None,
+            caldav: None,
         }
     }
 

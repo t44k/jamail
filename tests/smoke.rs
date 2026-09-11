@@ -269,6 +269,7 @@ fn daemon_notification_dispatch_runs_the_real_production_path() {
         draft_folder: None,
         notify_folders: Some(vec!["INBOX".to_string()]),
         color: None,
+        caldav: None,
     };
 
     // The exact function jamaild's per-account event pump calls in

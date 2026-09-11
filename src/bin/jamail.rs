@@ -798,6 +798,16 @@ fn handle_sync_event(app: &mut App, db: &db::MailDb, ev: ipc::Event) {
         } => {
             app.handle_upload_event(db, kind, local_id, Some(message));
         }
+        // Calendar sync/mutation events are `jacal`'s concern — `jamail`
+        // shares the same broadcast connection (jamaild pushes every
+        // account's events to every connected client, see `daemon.rs`
+        // module docs) but has nothing to do with them.
+        ipc::Event::CalendarSyncing { .. }
+        | ipc::Event::CalendarSynced { .. }
+        | ipc::Event::CalendarError { .. }
+        | ipc::Event::CalendarMutationApplied { .. }
+        | ipc::Event::CalendarMutationError { .. }
+        | ipc::Event::CalendarMutationConflict { .. } => {}
     }
 }
 

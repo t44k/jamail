@@ -2,7 +2,7 @@
 
 A terminal email client built with Rust. Connects to IMAP servers, caches everything locally in a compressed SQLite database, and provides instant full-text search.
 
-jamail ships as two binaries: **`jamaild`**, a background daemon that owns every account's IMAP connection and delivers desktop notifications (suitable for `systemd --user`, keeps working even with no terminal open), and **`jamail`**, the terminal UI, which talks to it over a small local IPC protocol. See [Architecture: jamaild + jamail](#architecture-jamaild--jamail) below.
+jamail ships as three binaries: **`jamaild`**, a background daemon that owns every account's IMAP (and, if configured, CalDAV) connection and delivers desktop notifications (suitable for `systemd --user`, keeps working even with no terminal open); **`jamail`**, the terminal UI, which talks to it over a small local IPC protocol; and **`jacal`**, a separate calendar terminal UI for accounts with CalDAV configured. See [Architecture: jamaild + jamail](#architecture-jamaild--jamail) and [Calendar: jacal + CalDAV](#calendar-jacal--caldav) below.
 
 ## Features
 
@@ -19,6 +19,7 @@ jamail ships as two binaries: **`jamaild`**, a background daemon that owns every
 - **Attachment support** — view metadata, save to disk, image previews in supported terminals
 - **Mouse text selection** with automatic clipboard copy
 - **HTML email rendering** via w3m (falls back to tag stripping)
+- **Optional CalDAV calendar sync** (`jacal`) — day/3-day/week/month agenda views, create/edit/delete events, synced by `jamaild` the same way mail is; see [Calendar: jacal + CalDAV](#calendar-jacal--caldav)
 
 ## Install
 
@@ -103,6 +104,67 @@ error semantics) is documented in `src/ipc.rs`.
 | wl-copy / xclip / xsel | Clipboard for mouse selection | Selection won't copy |
 | notify-send | Desktop notification for `notify_folders` | Notification silently skipped |
 | canberra-gtk-play / paplay / pw-play | Notification sound | Sound silently skipped |
+
+## Calendar: jacal + CalDAV
+
+Add a `caldav:` block to an account in `config.yaml` (see `config.example.yaml`)
+and `jamaild` spawns a calendar sync thread for it, alongside that account's IMAP
+sync — same process, same local SQLite cache, same "the daemon owns the live
+connection" model as mail. `jacal` is a separate binary (only accounts with
+`caldav` configured show up in it) that reads the cache and talks to `jamaild`
+over the same IPC socket to trigger a manual sync and to queue event
+create/update/delete requests.
+
+- **Discovery**: standard RFC 4791 `current-user-principal` ->
+  `calendar-home-set` chain, falling back to treating the configured URL itself
+  as the calendar home if a server doesn't support that.
+- **Sync**: RFC 6578 `sync-collection` when the server supports it, falling
+  back to a full `calendar-query` listing otherwise. Polled (default every 5
+  minutes, `poll_interval_secs`) — CalDAV has no IDLE/push equivalent.
+- **Conflict-safe writes**: every create/update/delete uses
+  `If-Match`/`If-None-Match` ETag preconditions; a conflict never silently
+  overwrites the server or the local copy — it's flagged for you to resolve.
+- **Views**: day / 3-day / week / month / year, each rendered as a colored
+  table grid (not a flat list) — a color dot plus background per calendar,
+  weekend columns in a distinct color, and an all-day event shown with its
+  own banner background on every day it spans. Week start is Monday by
+  default, configurable per install (`week_start: sunday`). Navigate with
+  h/j/k/l (day/cell, and the event under the cursor in Day/3-Day/Week), Tab
+  (cycle view), t (today), `[`/`]` (jump a whole period), Enter (zoom into a
+  day/month); n new, e edit, d delete, s manual sync, 1-9 toggle a
+  calendar's visibility.
+- **Recurring events**: `RRULE` is expanded to every occurrence that falls
+  in the visible range (`EXDATE` exclusions honored), so a repeating event
+  shows up on each date it actually occurs, not just its first occurrence.
+- **Alarms**: `VALARM`s on an event (including each occurrence of a
+  recurring one) fire a desktop notification while `jacal` is open;
+  `default_alarm_minutes_before` sets a fallback lead time for events with
+  no alarm of their own.
+- **Inbound CalDAV server** (optional): set `daemon.caldav_server_listen`
+  to have `jamaild` also serve each `caldav`-configured account's calendar
+  back out over real CalDAV/WebDAV, so another CalDAV client (or another
+  `jacal`) can connect to it directly — see `config.example.yaml`.
+
+**Explicit limitations** (see the `calendar`/`caldav`/`caldav_server`/
+`calnotify` module docs for the full rationale):
+
+- Editing or deleting a recurring event always acts on the single master
+  `VEVENT` — there's no "this occurrence only" vs. "this and following" vs.
+  "all occurrences" choice. `RDATE` (ad-hoc extra occurrences) and `EXRULE`
+  (a second rule describing exclusions, deprecated by RFC 5545) are
+  preserved losslessly for round-tripping but not expanded/applied.
+- Only **IANA-named timezones** are understood (`chrono-tz`); a server-defined
+  custom `VTIMEZONE` with a non-IANA identifier is an explicit parse error,
+  not silently misinterpreted.
+- **Basic auth only** for CalDAV (no OAuth2/Digest), matching this project's
+  existing IMAP/SMTP auth scope.
+- **Alarms only fire while `jacal` is running** — unlike mail notifications
+  (owned by the always-on `jamaild`), there's no always-on piece for calendar
+  alarms in this first cut.
+- No `VFREEBUSY`/scheduling (`iTIP`) support — creating an event with
+  attendees stores it as given; it does not send invitations.
+- The optional inbound CalDAV server hosts **one calendar per account**
+  ("Default", auto-created) — not arbitrary multi-calendar hosting.
 
 ## Configuration
 
@@ -216,6 +278,11 @@ jamail
 ```
 
 The database is stored at `~/.local/share/jamail/mail.db` and acts as a cache — delete it anytime to force a full re-sync. `jamail` auto-starts a `jamaild` if none is reachable; see [Architecture: jamaild + jamail](#architecture-jamaild--jamail) for the recommended `systemd --user` setup instead.
+
+For calendars, run `jacal` instead (needs at least one account with `caldav`
+configured — see [Calendar: jacal + CalDAV](#calendar-jacal--caldav)). It also
+auto-starts a `jamaild` if needed, since that's what owns the actual CalDAV
+connection.
 
 ### Keyboard shortcuts
 

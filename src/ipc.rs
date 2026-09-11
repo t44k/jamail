@@ -122,8 +122,9 @@ use std::thread;
 use std::time::Duration;
 
 /// Bumped whenever [`Request`]/[`Response`]/[`Event`]/[`ClientHello`]/
-/// [`ServerHello`] change in a wire-incompatible way.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// [`ServerHello`] change in a wire-incompatible way. Bumped to 2 for the
+/// calendar `Request`/`Event` variants added alongside `jacal`.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Defensive cap on a single frame's payload size. Well above any real
 /// message (the largest is a base64'd outgoing email with attachments).
@@ -268,6 +269,24 @@ pub enum Request {
     /// Ask the daemon to shut down gracefully (see module docs). Answered
     /// with [`Response::Ok`] before the daemon begins tearing down.
     Shutdown,
+    /// Ask `account`'s calendar sync thread to run a cycle immediately
+    /// instead of waiting for its next poll interval (see
+    /// `config::CalDavConfig::poll_interval_secs`). A no-op — answered
+    /// with [`Response::Error`] — for an account with no `caldav`
+    /// configured. Used by `jacal`'s manual sync-trigger key.
+    SyncCalendars { account: String },
+    /// Queue a local calendar create/update/delete for `account`'s
+    /// calendar sync thread to apply against the server on its next cycle
+    /// (mirrors [`Request::EnqueueUpload`]'s "queue it, the sync thread
+    /// already owns a live connection" pattern). The result arrives later
+    /// as [`Event::CalendarMutationApplied`] /
+    /// [`Event::CalendarMutationError`] / [`Event::CalendarMutationConflict`],
+    /// correlated by `local_id` (the `calendar_events.id` row this
+    /// mutation is for).
+    EnqueueCalendarMutation {
+        account: String,
+        mutation: crate::calsync::CalMutation,
+    },
 }
 
 /// A daemon-to-client response to exactly one [`Request`].
@@ -327,6 +346,50 @@ pub enum Event {
         local_id: i64,
         message: String,
     },
+    /// A calendar sync cycle started for `account` (discovery + one
+    /// `sync_calendar`/`list_all_events` pass per discovered calendar).
+    CalendarSyncing {
+        account: String,
+    },
+    /// One calendar collection finished syncing; `count` is how many
+    /// local rows were changed (upserted or deleted) this cycle.
+    CalendarSynced {
+        account: String,
+        calendar_url: String,
+        count: usize,
+    },
+    /// A calendar sync or discovery error for `account` (connection
+    /// failure, unsupported server, malformed response, etc — see
+    /// `caldav`/`calsync` module docs for what falls into this vs. a
+    /// per-mutation error below).
+    CalendarError {
+        account: String,
+        message: String,
+    },
+    /// A queued [`Request::EnqueueCalendarMutation`] was applied
+    /// successfully.
+    CalendarMutationApplied {
+        account: String,
+        local_id: i64,
+    },
+    /// A queued mutation failed for a reason other than an ETag/UID
+    /// conflict (network error, server rejected the request, etc). The
+    /// local row's `local_status` is left as `pending_*` — see `db`
+    /// module docs — so it stays visible and will be retried next cycle.
+    CalendarMutationError {
+        account: String,
+        local_id: i64,
+        message: String,
+    },
+    /// A queued mutation hit an `If-Match`/`If-None-Match` conflict (the
+    /// server's copy changed, or already exists, since the local copy was
+    /// last read) — never auto-resolved; the local row is marked
+    /// `conflict` (see `db::CAL_STATUS_CONFLICT`) for the user to look at.
+    CalendarMutationConflict {
+        account: String,
+        local_id: i64,
+        message: String,
+    },
 }
 
 /// Envelope for every daemon-to-client frame after the handshake, so a
@@ -382,6 +445,40 @@ pub fn wire_event(account: &str, ev: &crate::sync::SyncEvent) -> Event {
         SyncEvent::UploadError(kind, local_id, message) => Event::UploadError {
             account,
             kind: *kind,
+            local_id: *local_id,
+            message: message.clone(),
+        },
+    }
+}
+
+/// Tag a daemon-internal [`crate::calsync::CalSyncEvent`] with the account
+/// it belongs to, producing the wire [`Event`]. Used by the daemon's
+/// per-account calendar event pump, mirroring [`wire_event`] above.
+pub fn wire_calsync_event(account: &str, ev: &crate::calsync::CalSyncEvent) -> Event {
+    use crate::calsync::CalSyncEvent;
+    let account = account.to_string();
+    match ev {
+        CalSyncEvent::Syncing(_) => Event::CalendarSyncing { account },
+        CalSyncEvent::CalendarSynced(calendar_url, count) => Event::CalendarSynced {
+            account,
+            calendar_url: calendar_url.clone(),
+            count: *count,
+        },
+        CalSyncEvent::Error(message) => Event::CalendarError {
+            account,
+            message: message.clone(),
+        },
+        CalSyncEvent::MutationApplied(local_id) => Event::CalendarMutationApplied {
+            account,
+            local_id: *local_id,
+        },
+        CalSyncEvent::MutationError(local_id, message) => Event::CalendarMutationError {
+            account,
+            local_id: *local_id,
+            message: message.clone(),
+        },
+        CalSyncEvent::MutationConflict(local_id, message) => Event::CalendarMutationConflict {
+            account,
             local_id: *local_id,
             message: message.clone(),
         },
@@ -822,6 +919,41 @@ mod tests {
                 Event::FlagsChanged { account, .. } => account,
                 Event::UploadComplete { account, .. } => account,
                 Event::UploadError { account, .. } => account,
+                Event::CalendarSyncing { account } => account,
+                Event::CalendarSynced { account, .. } => account,
+                Event::CalendarError { account, .. } => account,
+                Event::CalendarMutationApplied { account, .. } => account,
+                Event::CalendarMutationError { account, .. } => account,
+                Event::CalendarMutationConflict { account, .. } => account,
+            };
+            assert_eq!(account, "acct1");
+        }
+    }
+
+    #[test]
+    fn wire_calsync_event_tags_every_variant_with_account() {
+        use crate::calsync::CalSyncEvent;
+        let cases: Vec<CalSyncEvent> = vec![
+            CalSyncEvent::Syncing("personal".to_string()),
+            CalSyncEvent::CalendarSynced("https://cal.example.com/dav/".to_string(), 3),
+            CalSyncEvent::Error("boom".to_string()),
+            CalSyncEvent::MutationApplied(1),
+            CalSyncEvent::MutationError(2, "failed".to_string()),
+            CalSyncEvent::MutationConflict(3, "conflict".to_string()),
+        ];
+        for ev in cases {
+            let wire = wire_calsync_event("acct1", &ev);
+            let account = match &wire {
+                Event::CalendarSyncing { account } => account,
+                Event::CalendarSynced { account, .. } => account,
+                Event::CalendarError { account, .. } => account,
+                Event::CalendarMutationApplied { account, .. } => account,
+                Event::CalendarMutationError { account, .. } => account,
+                Event::CalendarMutationConflict { account, .. } => account,
+                other => panic!(
+                    "wire_calsync_event produced an unexpected variant: {:?}",
+                    other
+                ),
             };
             assert_eq!(account, "acct1");
         }

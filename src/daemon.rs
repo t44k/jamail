@@ -41,7 +41,10 @@
 //! `sync::SyncControl` for why that's an acceptable, pre-existing pattern:
 //! account switches already abandoned sync threads the same way).
 
+use crate::caldav_server;
+use crate::calsync::{self, CalSyncControl, CalSyncEvent};
 use crate::config::{JamailAccount, JamailConfig};
+use crate::db;
 use crate::ipc::{self, ClientHello, Request, Response, ServerHello, ServerMessage};
 use crate::notify;
 use crate::sync::{self, MarkSeenRequest, SyncControl, SyncEvent, UploadRequest};
@@ -69,6 +72,9 @@ pub fn default_notifier() -> Notifier {
 
 struct AccountRuntime {
     control: Arc<SyncControl>,
+    /// `Some` only for accounts with `caldav` configured — see
+    /// `Daemon::start` and `with_cal_account`.
+    cal_control: Option<Arc<CalSyncControl>>,
 }
 
 /// Per-client outgoing queue capacity. A slow/stuck client only ever misses
@@ -81,6 +87,13 @@ pub struct Daemon {
     clients: Mutex<HashMap<u64, mpsc::SyncSender<ServerMessage>>>,
     next_client_id: AtomicU64,
     shutdown_requested: AtomicBool,
+    /// Set via [`Self::set_caldav_server_shutdown`] if the inbound CalDAV
+    /// HTTP server (`caldav_server`) was started; flipped by
+    /// [`Self::trigger_graceful_shutdown`] alongside every account's own
+    /// shutdown flag. A plain `Mutex<Option<..>>` rather than a
+    /// constructor parameter so `Daemon::new`'s existing call sites (and
+    /// its tests) don't need to change.
+    caldav_server_shutdown: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl Daemon {
@@ -90,14 +103,25 @@ impl Daemon {
             clients: Mutex::new(HashMap::new()),
             next_client_id: AtomicU64::new(1),
             shutdown_requested: AtomicBool::new(false),
+            caldav_server_shutdown: Mutex::new(None),
         })
     }
 
+    /// Record the CalDAV server's shutdown flag so
+    /// [`Self::trigger_graceful_shutdown`] also flips it. Called from
+    /// [`run_with_notifier`] only when `daemon.caldav_server_listen` is
+    /// configured and the server actually started.
+    pub(crate) fn set_caldav_server_shutdown(&self, flag: Arc<AtomicBool>) {
+        *self.caldav_server_shutdown.lock().unwrap() = Some(flag);
+    }
+
     /// Spawn a real IMAP sync thread + event pump for every configured
-    /// account and return the daemon that manages them.
+    /// account (plus a calendar sync thread + pump for every account that
+    /// has `caldav` configured) and return the daemon that manages them.
     pub fn start(accounts: &[(String, JamailAccount)], notifier: Notifier) -> Arc<Self> {
         let mut map = HashMap::new();
         let mut pumps = Vec::new();
+        let mut cal_pumps = Vec::new();
         for (name, acct) in accounts {
             // Default IDLE target is INBOX until a client sends
             // SetCurrentFolder; every account still syncs its full
@@ -107,12 +131,40 @@ impl Daemon {
             let (tx, rx) = mpsc::channel::<SyncEvent>();
             let _handle =
                 sync::spawn_sync_thread(acct.clone(), name.clone(), Arc::clone(&control), tx);
-            map.insert(name.clone(), AccountRuntime { control });
+
+            let cal_control = if acct.caldav.is_some() {
+                let cal_control = Arc::new(CalSyncControl::new());
+                let (cal_tx, cal_rx) = mpsc::channel::<CalSyncEvent>();
+                if calsync::spawn_calsync_thread(
+                    acct.clone(),
+                    name.clone(),
+                    Arc::clone(&cal_control),
+                    cal_tx,
+                )
+                .is_some()
+                {
+                    cal_pumps.push((name.clone(), cal_rx));
+                }
+                Some(cal_control)
+            } else {
+                None
+            };
+
+            map.insert(
+                name.clone(),
+                AccountRuntime {
+                    control,
+                    cal_control,
+                },
+            );
             pumps.push((name.clone(), acct.clone(), rx));
         }
         let daemon = Self::new(map);
         for (name, acct, rx) in pumps {
             spawn_pump(Arc::clone(&daemon), name, acct, rx, Arc::clone(&notifier));
+        }
+        for (name, cal_rx) in cal_pumps {
+            spawn_cal_pump(Arc::clone(&daemon), name, cal_rx);
         }
         daemon
     }
@@ -138,6 +190,12 @@ impl Daemon {
         self.shutdown_requested.store(true, Ordering::SeqCst);
         for rt in self.accounts.values() {
             rt.control.shutdown.store(true, Ordering::Relaxed);
+            if let Some(cal) = &rt.cal_control {
+                cal.shutdown.store(true, Ordering::Relaxed);
+            }
+        }
+        if let Some(flag) = self.caldav_server_shutdown.lock().unwrap().as_ref() {
+            flag.store(true, Ordering::Relaxed);
         }
     }
 
@@ -157,6 +215,24 @@ fn spawn_pump(
         while let Ok(ev) = rx.recv() {
             dispatch_sync_event(&account, &cfg, &ev, notifier.as_ref());
             daemon.broadcast(ServerMessage::Event(ipc::wire_event(&account, &ev)));
+        }
+    })
+}
+
+/// Calendar-sync counterpart to [`spawn_pump`]: drains one account's
+/// `CalSyncEvent`s and broadcasts each, tagged, to every connected client.
+/// Unlike mail sync, calendar events currently carry no notification
+/// decision of their own here — calendar alarm notifications are
+/// delivered by `jacal` itself (see `calnotify` module docs for why that's
+/// a different ownership model than mail's daemon-owned notifications).
+fn spawn_cal_pump(
+    daemon: Arc<Daemon>,
+    account: String,
+    rx: mpsc::Receiver<CalSyncEvent>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while let Ok(ev) = rx.recv() {
+            daemon.broadcast(ServerMessage::Event(ipc::wire_calsync_event(&account, &ev)));
         }
     })
 }
@@ -235,6 +311,34 @@ fn handle_request(daemon: &Daemon, req: Request) -> Response {
             daemon.trigger_graceful_shutdown();
             Response::Ok
         }
+        Request::SyncCalendars { account } => with_cal_account(daemon, &account, |cal| {
+            cal.force_sync.store(true, Ordering::Relaxed);
+        }),
+        Request::EnqueueCalendarMutation { account, mutation } => {
+            with_cal_account(daemon, &account, |cal| {
+                cal.enqueue(mutation);
+            })
+        }
+    }
+}
+
+/// Like [`with_account`], but for the calendar sync control — answers
+/// [`Response::Error`] both for an unknown account and for an account with
+/// no `caldav` configured (no calendar sync thread was ever spawned for
+/// it, so there's nothing to nudge).
+fn with_cal_account(daemon: &Daemon, account: &str, f: impl FnOnce(&CalSyncControl)) -> Response {
+    match daemon
+        .accounts
+        .get(account)
+        .and_then(|rt| rt.cal_control.as_ref())
+    {
+        Some(cal) => {
+            f(cal);
+            Response::Ok
+        }
+        None => Response::Error {
+            message: format!("no calendar configured for account: {}", account),
+        },
     }
 }
 
@@ -387,8 +491,43 @@ pub fn run_with_notifier(notifier: Notifier) -> Result<()> {
 
     install_signal_handlers();
 
+    let caldav_server_listen = config
+        .daemon
+        .as_ref()
+        .and_then(|d| d.caldav_server_listen.clone());
     let accounts: Vec<(String, JamailAccount)> = config.accounts.into_iter().collect();
     let daemon = Daemon::start(&accounts, notifier);
+
+    // Optional, opt-in: an inbound CalDAV HTTP server exposing every
+    // caldav-configured account's local calendar cache. Unset (the
+    // default) leaves startup exactly as it was before this existed —
+    // a failure here (bad address, port in use) is logged and otherwise
+    // ignored rather than aborting the rest of jamaild's startup, since
+    // mail sync and the IPC socket are the load-bearing parts of this
+    // process and shouldn't be taken down by an optional feature.
+    if let Some(listen_addr) = caldav_server_listen {
+        let accounts_by_name: HashMap<String, JamailAccount> = accounts.iter().cloned().collect();
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        match db::db_path().and_then(|db_path| {
+            caldav_server::spawn(
+                &listen_addr,
+                db_path,
+                Arc::new(accounts_by_name),
+                Arc::clone(&shutdown_flag),
+            )
+        }) {
+            Ok((_handle, addr)) => {
+                daemon.set_caldav_server_shutdown(shutdown_flag);
+                eprintln!("jamaild: CalDAV server listening on {}", addr);
+            }
+            Err(e) => {
+                eprintln!(
+                    "jamaild: failed to start CalDAV server on {}: {}",
+                    listen_addr, e
+                );
+            }
+        }
+    }
 
     {
         let daemon = Arc::clone(&daemon);
@@ -470,6 +609,7 @@ mod tests {
     use super::*;
     use crate::config::{AuthConfig, ImapConfig};
     use std::sync::Mutex as StdMutex;
+    use std::time::Instant;
 
     fn test_account(notify_folders: Option<Vec<String>>) -> JamailAccount {
         JamailAccount {
@@ -493,6 +633,7 @@ mod tests {
             draft_folder: None,
             notify_folders,
             color: None,
+            caldav: None,
         }
     }
 
@@ -625,6 +766,7 @@ mod tests {
             name.to_string(),
             AccountRuntime {
                 control: Arc::clone(&control),
+                cal_control: None,
             },
         );
         let daemon = Daemon::new(map);
@@ -907,6 +1049,23 @@ mod tests {
         ipc::write_message(&mut client, &client_hello()).unwrap();
         let _: ServerHello = ipc::read_message(&mut client).unwrap();
 
+        // Receiving ServerHello only guarantees handle_client wrote that
+        // response; it registers this client with the broadcast list
+        // (daemon.register_client) a few instructions later, on the same
+        // thread but with no ordering guarantee relative to this thread.
+        // Wait for registration to actually land before sending an event,
+        // otherwise the broadcast below can race ahead of it and be
+        // silently dropped for this client (broadcast uses try_send to
+        // whichever clients are registered *at that moment*).
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while daemon.clients.lock().unwrap().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "client never registered with the daemon's broadcast list"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
         // Drive the (fake, no real IMAP) account's sync-event channel by
         // hand, exactly like a real sync loop would, and confirm the
         // client receives the tagged wire event through the real
@@ -987,5 +1146,164 @@ mod tests {
         assert!(!path.exists());
         let listener = bind_or_recover(&path).unwrap();
         drop(listener);
+    }
+
+    // -- Calendar IPC request handling ---------------------------------
+
+    fn test_daemon_with_cal_account(name: &str) -> Arc<Daemon> {
+        let control = Arc::new(SyncControl::new("INBOX"));
+        let cal_control = Arc::new(CalSyncControl::new());
+        let mut map = HashMap::new();
+        map.insert(
+            name.to_string(),
+            AccountRuntime {
+                control,
+                cal_control: Some(cal_control),
+            },
+        );
+        Daemon::new(map)
+    }
+
+    #[test]
+    fn sync_calendars_request_sets_force_sync_for_the_right_account() {
+        let daemon = test_daemon_with_cal_account("acct1");
+        let (mut client, server) = connect_pair();
+        let d = Arc::clone(&daemon);
+        let handle = thread::spawn(move || handle_client(server, d));
+
+        ipc::write_message(&mut client, &client_hello()).unwrap();
+        let _: ServerHello = ipc::read_message(&mut client).unwrap();
+
+        ipc::write_message(
+            &mut client,
+            &Request::SyncCalendars {
+                account: "acct1".to_string(),
+            },
+        )
+        .unwrap();
+        let resp: ServerMessage = ipc::read_message(&mut client).unwrap();
+        assert!(matches!(resp, ServerMessage::Response(Response::Ok)));
+        assert!(
+            daemon.accounts["acct1"]
+                .cal_control
+                .as_ref()
+                .unwrap()
+                .force_sync
+                .load(Ordering::Relaxed)
+        );
+
+        drop(client);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn sync_calendars_request_errors_for_account_with_no_caldav_configured() {
+        // acct1 here has no cal_control at all (mail-only account).
+        let (daemon, _tx) = test_daemon_with_account("acct1", test_account(None));
+        let (mut client, server) = connect_pair();
+        let d = Arc::clone(&daemon);
+        let handle = thread::spawn(move || handle_client(server, d));
+
+        ipc::write_message(&mut client, &client_hello()).unwrap();
+        let _: ServerHello = ipc::read_message(&mut client).unwrap();
+
+        ipc::write_message(
+            &mut client,
+            &Request::SyncCalendars {
+                account: "acct1".to_string(),
+            },
+        )
+        .unwrap();
+        let resp: ServerMessage = ipc::read_message(&mut client).unwrap();
+        match resp {
+            ServerMessage::Response(Response::Error { message }) => {
+                assert!(message.contains("no calendar configured"));
+            }
+            other => panic!("expected Response::Error, got {:?}", other),
+        }
+
+        drop(client);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn enqueue_calendar_mutation_request_queues_on_the_right_account() {
+        let daemon = test_daemon_with_cal_account("acct1");
+        let (mut client, server) = connect_pair();
+        let d = Arc::clone(&daemon);
+        let handle = thread::spawn(move || handle_client(server, d));
+
+        ipc::write_message(&mut client, &client_hello()).unwrap();
+        let _: ServerHello = ipc::read_message(&mut client).unwrap();
+
+        ipc::write_message(
+            &mut client,
+            &Request::EnqueueCalendarMutation {
+                account: "acct1".to_string(),
+                mutation: crate::calsync::CalMutation::Delete { local_id: 42 },
+            },
+        )
+        .unwrap();
+        let resp: ServerMessage = ipc::read_message(&mut client).unwrap();
+        assert!(matches!(resp, ServerMessage::Response(Response::Ok)));
+
+        let queued = daemon.accounts["acct1"]
+            .cal_control
+            .as_ref()
+            .unwrap()
+            .write_queue
+            .lock()
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(matches!(
+            queued[0],
+            crate::calsync::CalMutation::Delete { local_id: 42 }
+        ));
+
+        drop(client);
+        drop(queued);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn enqueue_calendar_mutation_errors_for_unknown_account() {
+        let daemon = test_daemon_with_cal_account("acct1");
+        let (mut client, server) = connect_pair();
+        let d = Arc::clone(&daemon);
+        let handle = thread::spawn(move || handle_client(server, d));
+
+        ipc::write_message(&mut client, &client_hello()).unwrap();
+        let _: ServerHello = ipc::read_message(&mut client).unwrap();
+
+        ipc::write_message(
+            &mut client,
+            &Request::EnqueueCalendarMutation {
+                account: "no-such-account".to_string(),
+                mutation: crate::calsync::CalMutation::Delete { local_id: 1 },
+            },
+        )
+        .unwrap();
+        let resp: ServerMessage = ipc::read_message(&mut client).unwrap();
+        assert!(matches!(
+            resp,
+            ServerMessage::Response(Response::Error { .. })
+        ));
+
+        drop(client);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn trigger_graceful_shutdown_also_stops_calendar_sync_threads() {
+        let daemon = test_daemon_with_cal_account("acct1");
+        daemon.trigger_graceful_shutdown();
+        assert!(
+            daemon.accounts["acct1"]
+                .cal_control
+                .as_ref()
+                .unwrap()
+                .shutdown
+                .load(Ordering::Relaxed)
+        );
     }
 }
