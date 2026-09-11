@@ -8,6 +8,22 @@
 # takes precedence over this when set.
 # daemon:
 #   socket_path: /run/user/1000/jamail/jamaild.sock
+#
+#   Optional: bind a real inbound CalDAV (RFC 4791) HTTP server, exposing
+#   every account's `caldav`-configured local calendar cache to any CalDAV
+#   client (Basic auth against that account's own caldav.login/caldav.auth
+#   below). Unset (default): no server at all. See `caldav_server` module
+#   docs for exactly what's implemented (one "Default" calendar per
+#   account, GET/PUT/DELETE with ETag/If-Match, PROPFIND discovery, and
+#   REPORT calendar-query/sync-collection).
+#   caldav_server_listen: 127.0.0.1:5232
+
+# Optional: `jacal` (calendar TUI) settings. Unset (default): every field
+# below falls back to its own default.
+# jacal:
+#   # Which day a week starts on in jacal's week/month/year grids.
+#   # "monday" (default) or "sunday".
+#   week_start: sunday
 
 accounts:
   # Account name (used internally, shown in folder selector)
@@ -86,6 +102,37 @@ accounts:
     # default) means no notifications for this account.
     notify_folders:
       - INBOX
+    # Optional: CalDAV calendar sync for this account, used by the
+    # separate `jacal` calendar TUI (jamaild owns the actual sync loop,
+    # same as it owns IMAP — jacal just reads the cache and queues
+    # create/update/delete requests, exactly like jamail does for
+    # Sent/Draft uploads). Unset (the default) means no calendar sync at
+    # all for this account.
+    caldav:
+      # Any URL under the account's CalDAV root — jacal/jamaild attempt
+      # standard discovery (current-user-principal -> calendar-home-set)
+      # from here, falling back to treating this URL itself as the home
+      # set if the server doesn't support that chain. Point this directly
+      # at a calendar collection URL if you already know it.
+      url: https://cal.example.com/dav/
+      login: alice@corp.com
+      auth:
+        type: command
+        value: pass show cal/work
+      # Optional: only sync calendars whose display name is in this list.
+      # Unset (the default): sync every discovered calendar.
+      calendars:
+        - Personal
+        - Work
+      # Optional: how often (seconds) jamaild polls the server for
+      # changes — CalDAV has no IDLE/push equivalent this client
+      # implements. Unset (the default): 300 (5 minutes).
+      poll_interval_secs: 300
+      # Optional: default alarm lead times (minutes before an event's
+      # start) for events that carry no VALARM of their own. Unset (the
+      # default): no notification unless the event itself has an alarm.
+      # Each entry fires its own notification.
+      default_alarm_minutes_before: [30, 5]
 
   # Gmail example
   gmail:

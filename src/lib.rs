@@ -12,9 +12,16 @@
 //! See `ipc` and `daemon` module docs for the protocol/lifecycle details.
 
 pub mod app;
+pub mod calapp;
+pub mod caldav;
+pub mod caldav_server;
+pub mod calendar;
+pub mod calnotify;
+pub mod calsync;
 pub mod config;
 pub mod daemon;
 pub mod db;
+pub mod httpc;
 pub mod ipc;
 pub mod mail;
 pub mod notify;
