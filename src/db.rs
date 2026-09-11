@@ -344,6 +344,17 @@ fn migrate_v5_to_v6_add_sync_log(conn: &Connection) -> Result<()> {
 /// `local_messages`' Sent/Draft upload queue — see `sync::UploadRequest`);
 /// `CONFLICT` means the last write attempt hit a `412`/`409` and needs
 /// user attention (see `calsync` module docs).
+/// Prefix of the `calendar_url` under which `caldav_server.rs` hosts an
+/// account's own inbound calendar. It is a purely local namespace with no
+/// remote counterpart, which is why remote-discovery-driven cleanup
+/// (`prune_calendars_not_in`) must leave it alone.
+pub const SERVER_CALENDAR_URL_PREFIX: &str = "server:";
+
+/// Placeholder `calendar_events.href` for an event created locally and not
+/// yet uploaded: there is no server-assigned path for it yet. Deliberately
+/// not a valid URL or path — a request must never be sent to one.
+pub const LOCAL_HREF_PREFIX: &str = "local:";
+
 pub const CAL_STATUS_SYNCED: &str = "synced";
 pub const CAL_STATUS_PENDING_CREATE: &str = "pending_create";
 pub const CAL_STATUS_PENDING_UPDATE: &str = "pending_update";
@@ -1305,6 +1316,13 @@ impl MailDb {
     /// Remove calendars (and their events) for `account` whose URL is not
     /// in `keep_urls` — used after a discovery pass to drop calendars that
     /// disappeared server-side or fell out of a `calendars:` allowlist.
+    ///
+    /// Calendars in the [`SERVER_CALENDAR_URL_PREFIX`] namespace are never
+    /// pruned: they are hosted by this daemon's own inbound CalDAV server
+    /// and have no remote counterpart, so they can't appear in `keep_urls`
+    /// (which is built purely from remote discovery) and would otherwise be
+    /// wiped — along with every event in them — on the first sync cycle
+    /// after startup.
     pub fn prune_calendars_not_in(&self, account: &str, keep_urls: &[String]) -> Result<()> {
         let mut stmt = self
             .conn
@@ -1314,7 +1332,7 @@ impl MailDb {
             .collect::<rusqlite::Result<_>>()?;
         drop(stmt);
         for url in existing {
-            if !keep_urls.contains(&url) {
+            if !keep_urls.contains(&url) && !url.starts_with(SERVER_CALENDAR_URL_PREFIX) {
                 self.conn.execute(
                     "DELETE FROM calendar_events WHERE account = ?1 AND calendar_url = ?2",
                     params![account, url],
@@ -1332,7 +1350,11 @@ impl MailDb {
 
     /// Insert or replace a synced calendar event, keyed by
     /// `(account, calendar_url, href)`. Sets `local_status` to `synced`
-    /// and clears any prior `local_error` — this is the "the server is now
+    /// and clears any prior `local_error` — except for a row already marked
+    /// [`CAL_STATUS_PENDING_DELETE`], which stays pending: the user has
+    /// deleted it and the `DELETE` simply hasn't reached the server yet, so
+    /// a read pass that still sees it server-side must not resurrect it.
+    /// This is the "the server is now
     /// the source of truth for this row" path, used by `calsync` after a
     /// successful fetch. Compresses the raw ICS text the same way
     /// `emails.text_body_zstd` etc. are compressed.
@@ -1369,7 +1391,10 @@ impl MailDb {
                  rrule = excluded.rrule,
                  sequence = excluded.sequence,
                  raw_ics_zstd = excluded.raw_ics_zstd,
-                 local_status = excluded.local_status,
+                 local_status = CASE
+                     WHEN calendar_events.local_status = ?19 THEN ?19
+                     ELSE excluded.local_status
+                 END,
                  local_error = NULL",
             params![
                 account,
@@ -1390,6 +1415,7 @@ impl MailDb {
                 event.sequence,
                 raw_compressed,
                 CAL_STATUS_SYNCED,
+                CAL_STATUS_PENDING_DELETE,
             ],
         )?;
         self.conn.query_row(
@@ -1410,7 +1436,7 @@ impl MailDb {
         calendar_url: &str,
         event: &VEvent,
     ) -> Result<i64> {
-        let href = format!("local:{}", event.uid);
+        let href = format!("{}{}", LOCAL_HREF_PREFIX, event.uid);
         let ics = event.to_new_ics(Utc::now());
         self.conn.execute(
             "INSERT INTO calendar_events (
@@ -1498,20 +1524,27 @@ impl MailDb {
     /// there's nothing server-side to reconcile; otherwise flag it
     /// `pending_delete` for the sync thread to `DELETE` remotely before
     /// removing the local row.
-    pub fn mark_calendar_event_pending_delete(&self, id: i64) -> Result<()> {
+    ///
+    /// Returns whether a remote `DELETE` is still owed — `false` means the
+    /// row is already gone and the caller must **not** queue a mutation for
+    /// `id`. That matters because SQLite reuses rowids: a queued
+    /// `CalMutation::Delete { local_id }` naming a row that no longer
+    /// exists can be resolved against a *different*, newly created event by
+    /// the time the sync thread drains it.
+    pub fn mark_calendar_event_pending_delete(&self, id: i64) -> Result<bool> {
         let row = self
             .get_calendar_event_by_id(id)?
             .context("calendar event not found")?;
         if row.local_status == CAL_STATUS_PENDING_CREATE {
             self.conn
                 .execute("DELETE FROM calendar_events WHERE id = ?1", params![id])?;
-        } else {
-            self.conn.execute(
-                "UPDATE calendar_events SET local_status = ?1, local_error = NULL WHERE id = ?2",
-                params![CAL_STATUS_PENDING_DELETE, id],
-            )?;
+            return Ok(false);
         }
-        Ok(())
+        self.conn.execute(
+            "UPDATE calendar_events SET local_status = ?1, local_error = NULL WHERE id = ?2",
+            params![CAL_STATUS_PENDING_DELETE, id],
+        )?;
+        Ok(true)
     }
 
     pub fn mark_calendar_event_synced(
@@ -1598,6 +1631,11 @@ impl MailDb {
     /// (not just "is this recurring series relevant at all") must expand
     /// each returned recurring row with [`crate::calendar::expand_occurrences`]
     /// and filter to the same window themselves.
+    ///
+    /// Rows marked [`CAL_STATUS_PENDING_DELETE`] are excluded: the user has
+    /// already deleted them and is only waiting on the server round trip,
+    /// so they must disappear from the UI (and stop firing alarms)
+    /// immediately rather than lingering until the next sync lands.
     pub fn get_calendar_events_in_range(
         &self,
         account: Option<&str>,
@@ -1608,22 +1646,30 @@ impl MailDb {
         match account {
             Some(acct) => {
                 let mut stmt = self.conn.prepare(&format!(
-                    "{} WHERE account = ?1 AND (rrule IS NOT NULL OR (dtstart_utc < ?2 AND dtend_utc > ?3))
+                    "{} WHERE account = ?1 AND local_status != ?4
+                     AND (rrule IS NOT NULL OR (dtstart_utc < ?2 AND dtend_utc > ?3))
                      ORDER BY dtstart_utc",
                     CALENDAR_EVENT_SELECT_BASE
                 ))?;
-                let rows =
-                    stmt.query_map(params![acct, end_utc, start_utc], calendar_event_from_row)?;
+                let rows = stmt.query_map(
+                    params![acct, end_utc, start_utc, CAL_STATUS_PENDING_DELETE],
+                    calendar_event_from_row,
+                )?;
                 for r in rows {
                     out.push(r?);
                 }
             }
             None => {
                 let mut stmt = self.conn.prepare(&format!(
-                    "{} WHERE rrule IS NOT NULL OR (dtstart_utc < ?1 AND dtend_utc > ?2) ORDER BY dtstart_utc",
+                    "{} WHERE local_status != ?3
+                     AND (rrule IS NOT NULL OR (dtstart_utc < ?1 AND dtend_utc > ?2))
+                     ORDER BY dtstart_utc",
                     CALENDAR_EVENT_SELECT_BASE
                 ))?;
-                let rows = stmt.query_map(params![end_utc, start_utc], calendar_event_from_row)?;
+                let rows = stmt.query_map(
+                    params![end_utc, start_utc, CAL_STATUS_PENDING_DELETE],
+                    calendar_event_from_row,
+                )?;
                 for r in rows {
                     out.push(r?);
                 }
@@ -1784,6 +1830,48 @@ impl MailDb {
         )?;
         self.append_sync_log(account, calendar_url, href, true)?;
         Ok(Ok(()))
+    }
+
+    /// Finish a local write (`pending_create`/`pending_update`/
+    /// `pending_delete`) to a calendar this daemon *hosts itself* — one in
+    /// the [`SERVER_CALENDAR_URL_PREFIX`] namespace (see `caldav_server`).
+    ///
+    /// There is no remote server such a write could be pushed to; the local
+    /// row already *is* the authoritative copy. Committing it therefore
+    /// means clearing the pending status — giving a freshly created row
+    /// `new_href` and a real ETag in place of its [`LOCAL_HREF_PREFIX`]
+    /// placeholder — and appending the `calendar_sync_log` entry that tells
+    /// CalDAV clients subscribed to this server that something changed.
+    /// Without it the write would sit pending forever, queued for a CalDAV
+    /// client that has no URL to send it to.
+    pub fn server_commit_local_write(&self, id: i64, new_href: &str) -> Result<()> {
+        let row = self
+            .get_calendar_event_by_id(id)?
+            .context("calendar event not found")?;
+        if row.local_status == CAL_STATUS_PENDING_DELETE {
+            self.conn
+                .execute("DELETE FROM calendar_events WHERE id = ?1", params![id])?;
+            self.append_sync_log(&row.account, &row.calendar_url, &row.href, true)?;
+            return Ok(());
+        }
+        let ics = row
+            .raw_ics
+            .clone()
+            .context("calendar event has no raw ICS to publish")?;
+        let href = if row.href.starts_with(LOCAL_HREF_PREFIX) {
+            new_href.to_string()
+        } else {
+            row.href.clone()
+        };
+        let etag = compute_etag(&ics);
+        self.conn.execute(
+            "UPDATE calendar_events
+                SET href = ?1, etag = ?2, local_status = ?3, local_error = NULL
+              WHERE id = ?4",
+            params![href, etag, CAL_STATUS_SYNCED, id],
+        )?;
+        self.append_sync_log(&row.account, &row.calendar_url, &href, false)?;
+        Ok(())
     }
 
     /// The current sync-token/CTag for `calendar_url` — the highest
@@ -2306,6 +2394,94 @@ mod calendar_event_tests {
     }
 
     #[test]
+    fn prune_never_removes_a_locally_hosted_calendar() {
+        // `keep_urls` comes purely from remote discovery, so a `server:`
+        // calendar can never appear in it — pruning on that basis would
+        // wipe the inbound CalDAV server's own calendar, and every event
+        // in it, on the first sync cycle after startup.
+        let db = MailDb::open_in_memory().unwrap();
+        db.upsert_calendar(ACCOUNT, CAL_URL, "Personal").unwrap();
+        db.upsert_calendar(ACCOUNT, "server:personal", "Default")
+            .unwrap();
+        let event = sample_event("hosted");
+        db.upsert_calendar_event(
+            ACCOUNT,
+            "server:personal",
+            "/dav/personal/calendars/default/hosted.ics",
+            Some("\"v1\""),
+            &event,
+            event.raw.as_ref().unwrap(),
+        )
+        .unwrap();
+
+        db.prune_calendars_not_in(ACCOUNT, &[CAL_URL.to_string()])
+            .unwrap();
+
+        let urls: Vec<String> = db
+            .get_calendars(ACCOUNT)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.url)
+            .collect();
+        assert!(urls.contains(&"server:personal".to_string()));
+        assert_eq!(
+            db.get_calendar_events_in_range(Some(ACCOUNT), 0, i64::MAX)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn server_commit_local_write_publishes_a_created_event_and_logs_it() {
+        let db = MailDb::open_in_memory().unwrap();
+        db.upsert_calendar(ACCOUNT, "server:personal", "Default")
+            .unwrap();
+        let event = sample_event("hosted-new");
+        let id = db
+            .insert_local_calendar_event(ACCOUNT, "server:personal", &event)
+            .unwrap();
+        let before = db.server_current_token(ACCOUNT, "server:personal").unwrap();
+
+        db.server_commit_local_write(id, "/dav/personal/calendars/default/hosted-new.ics")
+            .unwrap();
+
+        let row = db.get_calendar_event_by_id(id).unwrap().unwrap();
+        assert_eq!(row.local_status, CAL_STATUS_SYNCED);
+        assert_eq!(row.href, "/dav/personal/calendars/default/hosted-new.ics");
+        assert!(row.etag.is_some());
+        assert!(
+            db.server_current_token(ACCOUNT, "server:personal").unwrap() > before,
+            "subscribed CalDAV clients learn about the change from the sync log"
+        );
+    }
+
+    #[test]
+    fn server_commit_local_write_removes_a_deleted_event_and_logs_it() {
+        let db = MailDb::open_in_memory().unwrap();
+        db.upsert_calendar(ACCOUNT, "server:personal", "Default")
+            .unwrap();
+        let event = sample_event("hosted-gone");
+        let id = db
+            .upsert_calendar_event(
+                ACCOUNT,
+                "server:personal",
+                "/dav/personal/calendars/default/hosted-gone.ics",
+                Some("\"v1\""),
+                &event,
+                event.raw.as_ref().unwrap(),
+            )
+            .unwrap();
+        db.mark_calendar_event_pending_delete(id).unwrap();
+        let before = db.server_current_token(ACCOUNT, "server:personal").unwrap();
+
+        db.server_commit_local_write(id, "/unused.ics").unwrap();
+
+        assert!(db.get_calendar_event_by_id(id).unwrap().is_none());
+        assert!(db.server_current_token(ACCOUNT, "server:personal").unwrap() > before);
+    }
+
+    #[test]
     fn upsert_and_fetch_calendar_round_trips() {
         let db = MailDb::open_in_memory().unwrap();
         db.upsert_calendar(ACCOUNT, CAL_URL, "Personal").unwrap();
@@ -2560,9 +2736,81 @@ mod calendar_event_tests {
                 event.raw.as_ref().unwrap(),
             )
             .unwrap();
-        db.mark_calendar_event_pending_delete(id).unwrap();
+        assert!(
+            db.mark_calendar_event_pending_delete(id).unwrap(),
+            "a synced event still owes the server a DELETE"
+        );
         let row = db.get_calendar_event_by_id(id).unwrap().unwrap();
         assert_eq!(row.local_status, CAL_STATUS_PENDING_DELETE);
+    }
+
+    #[test]
+    fn an_event_marked_pending_delete_stops_being_listed() {
+        let db = MailDb::open_in_memory().unwrap();
+        let event = sample_event("vanishing");
+        let id = db
+            .upsert_calendar_event(
+                ACCOUNT,
+                CAL_URL,
+                "/vanishing.ics",
+                Some("\"v1\""),
+                &event,
+                event.raw.as_ref().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            db.get_calendar_events_in_range(Some(ACCOUNT), 0, i64::MAX)
+                .unwrap()
+                .len(),
+            1
+        );
+        db.mark_calendar_event_pending_delete(id).unwrap();
+        assert!(
+            db.get_calendar_events_in_range(Some(ACCOUNT), 0, i64::MAX)
+                .unwrap()
+                .is_empty(),
+            "a deleted event must leave the UI at once, not linger until the DELETE lands"
+        );
+        assert!(
+            db.get_calendar_events_in_range(None, 0, i64::MAX)
+                .unwrap()
+                .is_empty(),
+            "the all-accounts query must filter it out too"
+        );
+    }
+
+    #[test]
+    fn a_read_pass_does_not_resurrect_an_event_pending_deletion() {
+        // The DELETE hasn't reached the server yet, so a sync in between
+        // still sees the event and upserts it. That must not clear the
+        // pending_delete flag: the row would come back in the UI and the
+        // queued delete would find nothing to do.
+        let db = MailDb::open_in_memory().unwrap();
+        let event = sample_event("racing");
+        let id = db
+            .upsert_calendar_event(
+                ACCOUNT,
+                CAL_URL,
+                "/racing.ics",
+                Some("\"v1\""),
+                &event,
+                event.raw.as_ref().unwrap(),
+            )
+            .unwrap();
+        db.mark_calendar_event_pending_delete(id).unwrap();
+        db.upsert_calendar_event(
+            ACCOUNT,
+            CAL_URL,
+            "/racing.ics",
+            Some("\"v2\""),
+            &event,
+            event.raw.as_ref().unwrap(),
+        )
+        .unwrap();
+        let row = db.get_calendar_event_by_id(id).unwrap().unwrap();
+        assert_eq!(row.local_status, CAL_STATUS_PENDING_DELETE);
+        // The fresh ETag is still picked up — the delete's If-Match wants it.
+        assert_eq!(row.etag.as_deref(), Some("\"v2\""));
     }
 
     #[test]
@@ -2572,7 +2820,11 @@ mod calendar_event_tests {
         let id = db
             .insert_local_calendar_event(ACCOUNT, CAL_URL, &event)
             .unwrap();
-        db.mark_calendar_event_pending_delete(id).unwrap();
+        assert!(
+            !db.mark_calendar_event_pending_delete(id).unwrap(),
+            "a never-uploaded event owes the server nothing; queueing a \
+             Delete for its freed id could hit a later event that reuses it"
+        );
         assert!(db.get_calendar_event_by_id(id).unwrap().is_none());
     }
 
