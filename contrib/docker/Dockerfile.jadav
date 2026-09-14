@@ -1,0 +1,35 @@
+# Runtime image for jadav, the standalone CalDAV server daemon.
+#
+# Default flow (small hosts, e.g. an arm64 box with little free disk): build
+# the binary natively on the host with the installed Rust toolchain, then
+# package just that binary:
+#
+#     cargo build --release --bin jadav
+#     docker build -f contrib/docker/Dockerfile.jadav -t jadav:local .
+#
+# The binary links the build host's OpenSSL 3.x (native-tls), so the runtime
+# image is Fedora-based to match a Fedora build host. Building on another
+# distro? Use that distro's minimal image with its libssl, or a multi-stage
+# build (commented out below).
+FROM registry.fedoraproject.org/fedora-minimal:43
+RUN microdnf -y install openssl-libs ca-certificates tzdata && microdnf clean all
+ARG JADAV_BIN=target/release/jadav
+COPY ${JADAV_BIN} /usr/local/bin/jadav
+RUN useradd -r -u 1000 -d /state jadav && mkdir -p /state /config && chown jadav /state
+USER jadav
+ENV JAMAIL_CONFIG=/config/config.yaml
+EXPOSE 5232
+HEALTHCHECK --interval=30s --timeout=5s CMD ["jadav", "health"]
+ENTRYPOINT ["jadav"]
+CMD ["serve"]
+
+# --- Alternative: self-contained multi-stage build (needs ~5 GB free) ---
+# FROM rust:1-bookworm AS builder
+# RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+# WORKDIR /src
+# COPY . .
+# RUN cargo build --release --bin jadav
+# FROM debian:bookworm-slim
+# RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates tzdata && rm -rf /var/lib/apt/lists/*
+# COPY --from=builder /src/target/release/jadav /usr/local/bin/jadav
+# ... (same USER/ENV/EXPOSE/HEALTHCHECK/ENTRYPOINT/CMD as above)

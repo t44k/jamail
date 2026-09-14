@@ -12,6 +12,10 @@ pub struct JamailConfig {
     /// Optional `jacal` (calendar TUI) settings. Unset (default): every
     /// `JacalConfig` field falls back to its own default.
     pub jacal: Option<JacalConfig>,
+    /// Optional `jadav` (standalone CalDAV server daemon) settings. Only
+    /// `jadav` reads this; the other binaries ignore it. Unset (default):
+    /// nothing to run. See `jadav::config::JadavConfig`.
+    pub jadav: Option<crate::jadav::config::JadavConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -182,8 +186,13 @@ impl AuthConfig {
 
 impl JamailConfig {
     pub fn load() -> Result<Self> {
-        let config_path = config_path()?;
-        let content = std::fs::read_to_string(&config_path)
+        Self::load_from(&config_path()?)
+    }
+
+    /// Load from an explicit path (what `jadav --config <path>` and tests
+    /// use); [`Self::load`] resolves the default path first.
+    pub fn load_from(config_path: &std::path::Path) -> Result<Self> {
+        let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read config: {}", config_path.display()))?;
         let config: JamailConfig =
             serde_yml::from_str(&content).context("Failed to parse jamail config")?;
@@ -200,7 +209,16 @@ impl JamailConfig {
     }
 }
 
-fn config_path() -> Result<PathBuf> {
+/// Where every binary reads its config from: the `JAMAIL_CONFIG`
+/// environment variable when set and non-blank (an absolute override, the
+/// same convention `JAMAIL_SOCKET` follows for the IPC socket), otherwise
+/// `~/.config/jamail/config.yaml`.
+pub fn config_path() -> Result<PathBuf> {
+    if let Ok(explicit) = std::env::var("JAMAIL_CONFIG")
+        && !explicit.trim().is_empty()
+    {
+        return Ok(PathBuf::from(explicit));
+    }
     let home = std::env::var("HOME").context("HOME not set")?;
     let path = PathBuf::from(home)
         .join(".config")
@@ -516,6 +534,23 @@ mod tests {
         assert!(personal.sent_folder.is_none());
         assert!(personal.notify_folders.is_none());
         assert!(personal.caldav.is_none());
+
+        // The documented `jadav:` section parses through the shared config
+        // and through jadav's own loader alike.
+        let jadav = cfg.jadav.as_ref().expect("jadav section documented");
+        assert_eq!(jadav.listen, "0.0.0.0:5232");
+        assert_eq!(jadav.principal.login, "alice@example.com");
+        assert_eq!(
+            jadav.identities(),
+            vec![
+                "alice@example.com".to_string(),
+                "alice@corp.com".to_string()
+            ]
+        );
+        assert_eq!(jadav.calendars.len(), 2);
+        assert!(jadav.remotes.contains_key("corp"));
+        assert!(jadav.validate().is_ok());
+        assert!(crate::jadav::config::JadavConfig::load_from(&path).is_ok());
     }
 
     #[test]

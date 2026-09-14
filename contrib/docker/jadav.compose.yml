@@ -1,0 +1,34 @@
+# Compose service for jadav. Merge into the host's docker-compose.yml next
+# to the reverse proxy; the traefik labels mirror the ones the previous
+# CalDAV server used so the public hostname stays the same at cutover.
+#
+#   mkdir -p docker-data/jadav/{config,state}
+#   install -m 0600 config.yaml docker-data/jadav/config/config.yaml   # jadav: section only
+#   docker compose run --rm jadav check-config
+#   docker compose up -d jadav
+services:
+  jadav:
+    image: jadav:local
+    container_name: jadav
+    restart: unless-stopped
+    command: ["serve"]
+    environment:
+      - JAMAIL_CONFIG=/config/config.yaml
+      - RUST_BACKTRACE=1
+    volumes:
+      - ./docker-data/jadav/config:/config:ro
+      - ./docker-data/jadav/state:/state
+    # The mail server on the same host presents a certificate for its public
+    # name; reach it by that name (needed from the scheduling milestone on).
+    extra_hosts:
+      - "mail.example.com:host-gateway"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.jadav.rule=Host(`dav.example.com`)
+      - traefik.http.routers.jadav.entrypoints=websecure
+      - traefik.http.routers.jadav.tls.certresolver=letsencrypt
+      - traefik.http.services.jadav.loadbalancer.server.port=5232
+      - traefik.http.routers.jadav-http.rule=Host(`dav.example.com`)
+      - traefik.http.routers.jadav-http.entrypoints=web
+      - traefik.http.routers.jadav-http.middlewares=jadav-redirect
+      - traefik.http.middlewares.jadav-redirect.redirectscheme.scheme=https

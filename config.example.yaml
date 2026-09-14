@@ -159,3 +159,53 @@ accounts:
       - "[Gmail]/Sent Mail"
       - "[Gmail]/Drafts"
       - "[Gmail]/Starred"
+
+# Optional: `jadav`, the standalone self-hosted CalDAV server daemon (a
+# separate binary meant for a server host; jamail/jamaild/jacal ignore this
+# section). jadav can also run from a file that contains ONLY this section.
+# Path resolution for every binary: --config (jadav only), then the
+# JAMAIL_CONFIG environment variable, then ~/.config/jamail/config.yaml.
+jadav:
+  # Plain HTTP; put a TLS-terminating reverse proxy (traefik, nginx) in front.
+  listen: 0.0.0.0:5232
+  # jadav's own SQLite store (not the mail.db cache).
+  store: /var/lib/jadav/jadav.db
+  principal:
+    # The one login every CalDAV client (phone, jamaild, Thunderbird) uses.
+    login: alice@example.com
+    auth:
+      type: command
+      value: pass show jadav/alice
+    # Every address that is "me"; the first is the primary. "Name <addr>"
+    # is accepted. Unset: just the login, when it is an email address.
+    identities:
+      - Alice Smith <alice@example.com>
+      - alice@corp.com
+  # External accounts calendars are mirrored from (used from the mirror
+  # milestone on; validated already).
+  remotes:
+    corp:
+      kind: google           # google | caldav
+      user: alice@corp.com   # the Google account (also its primary calendar id)
+      poll_interval_secs: 120
+  calendars:
+    # slug = URL path segment: /dav/calendars/<login>/<slug>/
+    - slug: personal
+      name: Personal
+      provider: native       # stored only here
+      color: "#3366FF"
+      default_for_identity: true   # where invitations for alice@example.com land
+    - slug: g-corp
+      name: Corp
+      identity: alice@corp.com
+      provider: google
+      remote: corp
+      remote_calendar: alice@corp.com
+      two_way: true          # false = read-only mirror (clients get 403 on writes)
+      send_via: smtp         # who emails invitations/RSVPs: smtp (jadav) | provider
+  scheduling:
+    send_via: smtp
+    history_days: 90         # how far back a mirror's first fill reaches (0 = all)
+  # How long the RFC 6578 change log is kept; older client sync-tokens get a
+  # full resync instead of a delta.
+  sync_log_retention_days: 90

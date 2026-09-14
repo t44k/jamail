@@ -1,0 +1,5 @@
+# Only the release binary and the docker context are needed to build the
+# jadav runtime image (see contrib/docker/Dockerfile.jadav).
+*
+!target/release/jadav
+!contrib/docker/

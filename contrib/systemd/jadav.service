@@ -1,0 +1,30 @@
+# System unit for a native (non-container) jadav install:
+#   install -m 0755 target/release/jadav /usr/local/bin/jadav
+#   install -d -m 0750 -o jadav /etc/jadav && install -m 0600 -o jadav config.yaml /etc/jadav/config.yaml
+#   useradd -r -s /usr/sbin/nologin jadav
+#   systemctl enable --now jadav
+# `systemctl reload jadav` re-resolves the principal password (SIGHUP).
+[Unit]
+Description=jadav CalDAV server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jadav
+Group=jadav
+ExecStart=/usr/local/bin/jadav serve
+ExecReload=/bin/kill -HUP $MAINPID
+Environment=JAMAIL_CONFIG=/etc/jadav/config.yaml
+StateDirectory=jadav
+ConfigurationDirectory=jadav
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/jadav
+
+[Install]
+WantedBy=multi-user.target

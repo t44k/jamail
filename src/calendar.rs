@@ -277,14 +277,14 @@ pub struct EventEdits {
 // Content-line parsing (RFC 5545 §3.1)
 // ---------------------------------------------------------------------
 
-struct ContentLine {
-    name: String,
-    params: Vec<(String, String)>,
-    value: String,
+pub(crate) struct ContentLine {
+    pub(crate) name: String,
+    pub(crate) params: Vec<(String, String)>,
+    pub(crate) value: String,
 }
 
 impl ContentLine {
-    fn param(&self, name: &str) -> Option<&str> {
+    pub(crate) fn param(&self, name: &str) -> Option<&str> {
         self.params
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -295,7 +295,7 @@ impl ContentLine {
 /// Undo RFC 5545 §3.1 line folding: a line starting with a single space or
 /// tab is a continuation of the previous line. Tolerates bare `\n` as well
 /// as `\r\n`.
-fn unfold(raw: &str) -> Vec<String> {
+pub(crate) fn unfold(raw: &str) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     for raw_line in raw.split('\n') {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
@@ -309,7 +309,7 @@ fn unfold(raw: &str) -> Vec<String> {
     lines
 }
 
-fn parse_content_line(line: &str) -> Option<ContentLine> {
+pub(crate) fn parse_content_line(line: &str) -> Option<ContentLine> {
     let bytes = line.as_bytes();
     let mut i = 0;
     while i < bytes.len() && bytes[i] != b';' && bytes[i] != b':' {
