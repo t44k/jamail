@@ -421,8 +421,9 @@ pub fn slugify(name: &str) -> String {
     let mut out = String::new();
     let mut dash = false;
     for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
+        let folded = fold_latin(ch);
+        if folded.is_ascii_alphanumeric() {
+            out.push(folded.to_ascii_lowercase());
             dash = false;
         } else if !dash && !out.is_empty() {
             out.push('-');
@@ -437,6 +438,30 @@ pub fn slugify(name: &str) -> String {
         "calendar".to_string()
     } else {
         out
+    }
+}
+
+/// Strip the accent off a Latin letter (`ü` → `u`, `ő` → `o`, `ß` → `s`)
+/// so a Hungarian or German calendar name still yields a readable slug;
+/// anything else is returned unchanged and dropped by [`slugify`].
+fn fold_latin(ch: char) -> char {
+    match ch {
+        'à'..='å' | 'À'..='Å' | 'ā' | 'Ā' | 'ă' | 'Ă' | 'ą' | 'Ą' => 'a',
+        'æ' | 'Æ' => 'a',
+        'ç' | 'Ç' | 'ć' | 'Ć' | 'č' | 'Č' => 'c',
+        'ď' | 'Ď' | 'đ' | 'Đ' | 'ð' | 'Ð' => 'd',
+        'è'..='ë' | 'È'..='Ë' | 'ē' | 'Ē' | 'ė' | 'Ė' | 'ę' | 'Ę' | 'ě' | 'Ě' => 'e',
+        'ì'..='ï' | 'Ì'..='Ï' | 'ī' | 'Ī' | 'ı' | 'İ' => 'i',
+        'ľ' | 'Ľ' | 'ł' | 'Ł' | 'ĺ' | 'Ĺ' => 'l',
+        'ñ' | 'Ñ' | 'ń' | 'Ń' | 'ň' | 'Ň' => 'n',
+        'ò'..='ö' | 'Ò'..='Ö' | 'ø' | 'Ø' | 'ō' | 'Ō' | 'ő' | 'Ő' => 'o',
+        'ř' | 'Ř' | 'ŕ' | 'Ŕ' => 'r',
+        'ś' | 'Ś' | 'š' | 'Š' | 'ş' | 'Ş' | 'ß' => 's',
+        'ť' | 'Ť' | 'ţ' | 'Ţ' | 'þ' | 'Þ' => 't',
+        'ù'..='ü' | 'Ù'..='Ü' | 'ū' | 'Ū' | 'ů' | 'Ů' | 'ű' | 'Ű' => 'u',
+        'ý' | 'Ý' | 'ÿ' | 'Ÿ' => 'y',
+        'ž' | 'Ž' | 'ź' | 'Ź' | 'ż' | 'Ż' => 'z',
+        other => other,
     }
 }
 
@@ -1270,7 +1295,12 @@ mod tests {
     fn slugify_is_lowercase_ascii_with_single_dashes() {
         assert_eq!(slugify("Anniversaries"), "anniversaries");
         assert_eq!(slugify("Holidays in Hungary!"), "holidays-in-hungary");
-        assert_eq!(slugify("  Été / Ünnep  "), "t-nnep");
+        assert_eq!(slugify("  Été / Ünnep  "), "ete-unnep");
+        assert_eq!(
+            slugify("Ünnepnapok Magyarországon"),
+            "unnepnapok-magyarorszagon"
+        );
+        assert_eq!(slugify("Straße & Øre"), "strase-ore");
         assert_eq!(slugify("***"), "calendar");
         assert!(slugify(&"x".repeat(100)).len() <= 40);
     }
