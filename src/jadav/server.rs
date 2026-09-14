@@ -1648,6 +1648,7 @@ mod tests {
                 token,
                 changed,
                 deleted,
+                ..
             } => {
                 assert_eq!(changed.len(), 1);
                 assert_eq!(changed[0].etag.as_deref(), Some(etag2.as_str()));

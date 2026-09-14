@@ -37,9 +37,11 @@ pub struct JadavConfig {
     /// `mail.db` cache — see `jadav::store` for why the models differ.
     pub store: PathBuf,
     pub principal: PrincipalConfig,
+    /// The Google Cloud OAuth client (Desktop-app type) used by every
+    /// `kind: google` remote. Required when any such remote exists.
+    pub google_oauth: Option<GoogleOauthConfig>,
     /// External accounts calendars can be mirrored from (Google, other
-    /// CalDAV servers). Parsed now so a config written for the mirror
-    /// milestone validates; consumed by `jadav::mirror`.
+    /// CalDAV servers); consumed by `jadav::mirror`.
     #[serde(default)]
     pub remotes: IndexMap<String, RemoteConfig>,
     #[serde(default)]
@@ -63,6 +65,14 @@ pub struct PrincipalConfig {
     /// when the login looks like an email address.
     #[serde(default)]
     pub identities: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct GoogleOauthConfig {
+    pub client_id: String,
+    /// The client secret (a Desktop-app secret is not really secret, but
+    /// `command` keeps it out of the file all the same).
+    pub client_secret: AuthConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -401,6 +411,12 @@ impl JadavConfig {
                 RemoteKind::Google if remote.user.is_none() => {
                     bail!("remote {:?} is google but has no `user`", name)
                 }
+                RemoteKind::Google if self.google_oauth.is_none() => {
+                    bail!(
+                        "remote {:?} is google but `jadav.google_oauth` is not configured",
+                        name
+                    )
+                }
                 RemoteKind::Caldav if remote.url.is_none() => {
                     bail!("remote {:?} is caldav but has no `url`", name)
                 }
@@ -463,7 +479,7 @@ mod tests {
     #[test]
     fn full_config_parses_and_validates() {
         let cfg = parse(
-            "jadav:\n  listen: 127.0.0.1:5232\n  store: /var/lib/jadav/jadav.db\n  principal:\n    login: t@mas.gg\n    auth: {type: command, value: 'echo pw'}\n    identities: [t@mas.gg, tamas@example.com]\n  remotes:\n    work: {kind: google, user: tamas@example.com}\n    cloud: {kind: caldav, url: https://caldav.example.com/, login: u, auth: {type: password, value: p}}\n  calendars:\n    - {slug: personal, name: Personal, provider: native, default_for_identity: true}\n    - {slug: g-work, name: Work, identity: tamas@example.com, provider: google, remote: work, remote_calendar: tamas@example.com, two_way: true}\n    - {slug: cloud-home, name: Home, provider: caldav, remote: cloud, remote_calendar: Home, two_way: false, color: '#ff0000'}\n  scheduling: {send_via: smtp, history_days: 30}\n  sync_log_retention_days: 30\n",
+            "jadav:\n  listen: 127.0.0.1:5232\n  store: /var/lib/jadav/jadav.db\n  principal:\n    login: t@mas.gg\n    auth: {type: command, value: 'echo pw'}\n    identities: [t@mas.gg, tamas@example.com]\n  google_oauth: {client_id: cid, client_secret: {type: password, value: sec}}\n  remotes:\n    work: {kind: google, user: tamas@example.com}\n    cloud: {kind: caldav, url: https://caldav.example.com/, login: u, auth: {type: password, value: p}}\n  calendars:\n    - {slug: personal, name: Personal, provider: native, default_for_identity: true}\n    - {slug: g-work, name: Work, identity: tamas@example.com, provider: google, remote: work, remote_calendar: tamas@example.com, two_way: true}\n    - {slug: cloud-home, name: Home, provider: caldav, remote: cloud, remote_calendar: Home, two_way: false, color: '#ff0000'}\n  scheduling: {send_via: smtp, history_days: 30}\n  sync_log_retention_days: 30\n",
         );
         assert_eq!(cfg.calendars.len(), 3);
         assert_eq!(cfg.calendars[1].provider, Provider::Google);

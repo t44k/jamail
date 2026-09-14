@@ -362,7 +362,7 @@ pub(crate) fn parse_content_line(line: &str) -> Option<ContentLine> {
     })
 }
 
-fn unescape_text(s: &str) -> String {
+pub(crate) fn unescape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -385,7 +385,7 @@ fn unescape_text(s: &str) -> String {
     out
 }
 
-fn escape_text(s: &str) -> String {
+pub(crate) fn escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -519,7 +519,7 @@ fn parse_naive_date(value: &str) -> Result<NaiveDate, CalendarError> {
 /// Parse a `DTSTART`/`DTEND`/`RECURRENCE-ID`-shaped property's value given
 /// its parameters. See module docs for the floating-time and
 /// non-IANA-timezone limitations.
-fn parse_event_time(line: &ContentLine) -> Result<EventTime, CalendarError> {
+pub(crate) fn parse_event_time(line: &ContentLine) -> Result<EventTime, CalendarError> {
     parse_event_time_value(&line.value, line)
 }
 
@@ -587,7 +587,7 @@ fn parse_exdate_line(line: &ContentLine) -> Result<Vec<DateTime<Utc>>, CalendarE
 
 /// Render `name` (e.g. `"DTSTART"`) plus `t` as a full iCalendar property
 /// line (no trailing CRLF).
-fn render_time_property(name: &str, t: &EventTime) -> String {
+pub(crate) fn render_time_property(name: &str, t: &EventTime) -> String {
     if t.all_day {
         format!("{};VALUE=DATE:{}", name, t.utc.format("%Y%m%d"))
     } else if let Some(tzid) = &t.tzid {
@@ -1132,6 +1132,76 @@ fn render_trigger(t: &AlarmTrigger) -> String {
             format!("TRIGGER{}:{}", related_param, format_ical_duration(*offset))
         }
     }
+}
+
+/// The unfolded top-level property lines of a raw `VEVENT` block whose
+/// name is in `names` (case-insensitive), in document order. Lines inside
+/// nested components (`VALARM`) are skipped.
+pub fn raw_property_lines(raw_vevent: &str, names: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    for line in unfold(raw_vevent) {
+        if line.len() >= 6 && line[..6].eq_ignore_ascii_case("BEGIN:") {
+            depth += 1;
+            continue;
+        }
+        if line.len() >= 4 && line[..4].eq_ignore_ascii_case("END:") {
+            depth -= 1;
+            continue;
+        }
+        if depth == 1
+            && let Some(cl) = parse_content_line(&line)
+            && names.iter().any(|n| n.eq_ignore_ascii_case(&cl.name))
+        {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// Parse a date/date-time property line (`RECURRENCE-ID;TZID=…:…`,
+/// `EXDATE:…`, …) into an [`EventTime`].
+pub fn parse_property_time(line: &str) -> Result<EventTime, CalendarError> {
+    let cl = parse_content_line(line)
+        .ok_or_else(|| CalendarError::Malformed(format!("not a content line: {}", line)))?;
+    parse_event_time(&cl)
+}
+
+/// RFC 5545 §3.1 line folding: physical lines of at most 75 octets, broken
+/// on character boundaries, continuation lines starting with one space.
+pub fn fold_line(line: &str) -> String {
+    const LIMIT: usize = 75;
+    if line.len() <= LIMIT {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len() + line.len() / LIMIT * 3);
+    let mut current = 0usize;
+    let mut first = true;
+    for ch in line.chars() {
+        let w = ch.len_utf8();
+        let cap = if first { LIMIT } else { LIMIT - 1 };
+        if current + w > cap {
+            out.push_str("\r\n ");
+            current = 0;
+            first = false;
+        }
+        out.push(ch);
+        current += w;
+    }
+    out
+}
+
+/// Fold every line of an (unfolded, CRLF-separated) iCalendar text.
+pub fn fold_ics(unfolded: &str) -> String {
+    let mut out = String::with_capacity(unfolded.len() + 64);
+    for line in unfolded.split("\r\n") {
+        if line.is_empty() {
+            continue;
+        }
+        out.push_str(&fold_line(line));
+        out.push_str("\r\n");
+    }
+    out
 }
 
 /// Whether this `VEVENT` is a `RECURRENCE-ID` override of a recurring
@@ -1950,5 +2020,53 @@ END:VCALENDAR\r\n";
         assert!(patched.starts_with("BEGIN:VCALENDAR"));
         assert_eq!(patched.matches("BEGIN:VEVENT").count(), 1);
         assert!(patched.contains("UID:fresh"));
+    }
+
+    #[test]
+    fn raw_property_lines_skips_nested_components_and_matches_case_insensitively() {
+        let raw = "BEGIN:VEVENT\r\nUID:x\r\nRRULE:FREQ=DAILY\r\nEXDATE;TZID=Europe/Budapest:20240103T090000\r\nBEGIN:VALARM\r\nTRIGGER:-PT5M\r\nDESCRIPTION:alarm\r\nEND:VALARM\r\nDESCRIPTION:event\r\nEND:VEVENT";
+        let lines = raw_property_lines(raw, &["rrule", "EXDATE", "RDATE"]);
+        assert_eq!(
+            lines,
+            vec![
+                "RRULE:FREQ=DAILY",
+                "EXDATE;TZID=Europe/Budapest:20240103T090000"
+            ]
+        );
+        let desc = raw_property_lines(raw, &["DESCRIPTION"]);
+        assert_eq!(desc, vec!["DESCRIPTION:event"]);
+    }
+
+    #[test]
+    fn parse_property_time_handles_tzid_and_utc_forms() {
+        let t = parse_property_time("RECURRENCE-ID;TZID=Europe/Budapest:20240122T090000").unwrap();
+        assert_eq!(t.utc, utc(2024, 1, 22, 8, 0, 0));
+        assert_eq!(t.tzid.as_deref(), Some("Europe/Budapest"));
+        let u = parse_property_time("RECURRENCE-ID:20240122T090000Z").unwrap();
+        assert_eq!(u.utc, utc(2024, 1, 22, 9, 0, 0));
+        let d = parse_property_time("EXDATE;VALUE=DATE:20240122").unwrap();
+        assert!(d.all_day);
+        assert!(parse_property_time("garbage").is_err());
+    }
+
+    #[test]
+    fn folding_keeps_lines_within_75_octets_and_round_trips() {
+        let long = format!("DESCRIPTION:{}", "ü".repeat(100));
+        let folded = fold_line(&long);
+        for (i, physical) in folded.split("\r\n").enumerate() {
+            assert!(
+                physical.len() <= 75,
+                "line {i} is {} octets",
+                physical.len()
+            );
+            if i > 0 {
+                assert!(physical.starts_with(' '));
+            }
+        }
+        let unfolded = unfold(&folded).join("\r\n");
+        assert_eq!(unfolded, long);
+        assert_eq!(fold_line("SUMMARY:short"), "SUMMARY:short");
+        let doc = "BEGIN:VCALENDAR\r\nX:1\r\nEND:VCALENDAR\r\n";
+        assert_eq!(fold_ics(doc), doc);
     }
 }

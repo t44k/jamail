@@ -241,6 +241,31 @@ pub struct PropPatch {
     pub transparent: Option<bool>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CalendarMirrorState {
+    pub remote_sync_token: Option<String>,
+    pub last_full_fill_at: Option<i64>,
+    pub window_start: Option<i64>,
+    pub mirror_pushed_log_id: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoteStatusRow {
+    pub remote: String,
+    pub needs_reauth: bool,
+    pub last_ok_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub consecutive_failures: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OauthTokenRow {
+    pub refresh_token: String,
+    pub access_token: Option<String>,
+    pub expires_at: Option<i64>,
+    pub needs_reauth: bool,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CompactionReport {
     pub deleted_rows: usize,
@@ -1411,6 +1436,313 @@ impl Store {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    // ------------------------------------------------------------------
+    // Mirror bookkeeping (used by `jadav::mirror`)
+    // ------------------------------------------------------------------
+
+    fn mirror_map_from_row(
+        r: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<crate::jadav::mirror::MirrorMapRow> {
+        Ok(crate::jadav::mirror::MirrorMapRow {
+            calendar_slug: r.get(0)?,
+            uid: r.get(1)?,
+            remote_id: r.get(2)?,
+            remote_version: r.get(3)?,
+            remote_uid: r.get(4)?,
+            fingerprint: r.get(5)?,
+            pushed_rev: r.get(6)?,
+            last_error: r.get(7)?,
+        })
+    }
+
+    const MIRROR_MAP_COLUMNS: &'static str = "calendar_slug, uid, remote_id, remote_version, remote_uid, fingerprint, pushed_rev, last_error";
+
+    pub fn get_mirror_map(
+        &self,
+        slug: &str,
+        uid: &str,
+    ) -> Result<Option<crate::jadav::mirror::MirrorMapRow>> {
+        let sql = format!(
+            "SELECT {} FROM mirror_map WHERE calendar_slug = ?1 AND uid = ?2",
+            Self::MIRROR_MAP_COLUMNS
+        );
+        Ok(self
+            .conn
+            .query_row(&sql, params![slug, uid], Self::mirror_map_from_row)
+            .optional()?)
+    }
+
+    pub fn find_mirror_map_by_remote_id(
+        &self,
+        slug: &str,
+        remote_id: &str,
+    ) -> Result<Option<crate::jadav::mirror::MirrorMapRow>> {
+        let sql = format!(
+            "SELECT {} FROM mirror_map WHERE calendar_slug = ?1 AND remote_id = ?2",
+            Self::MIRROR_MAP_COLUMNS
+        );
+        Ok(self
+            .conn
+            .query_row(&sql, params![slug, remote_id], Self::mirror_map_from_row)
+            .optional()?)
+    }
+
+    pub fn list_mirror_map(&self, slug: &str) -> Result<Vec<crate::jadav::mirror::MirrorMapRow>> {
+        let sql = format!(
+            "SELECT {} FROM mirror_map WHERE calendar_slug = ?1 ORDER BY uid",
+            Self::MIRROR_MAP_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![slug], Self::mirror_map_from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_mirror_map(&self, row: &crate::jadav::mirror::MirrorMapRow) -> Result<()> {
+        // A remote id may move to another UID (adoption); clear any stale
+        // row holding it first so the unique index does not trip.
+        self.conn.execute(
+            "DELETE FROM mirror_map WHERE calendar_slug = ?1 AND remote_id = ?2 AND uid != ?3",
+            params![row.calendar_slug, row.remote_id, row.uid],
+        )?;
+        self.conn.execute(
+            "INSERT INTO mirror_map (calendar_slug, uid, remote_id, remote_version, remote_uid,
+                 fingerprint, pushed_rev, last_error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(calendar_slug, uid) DO UPDATE SET
+                 remote_id = excluded.remote_id, remote_version = excluded.remote_version,
+                 remote_uid = excluded.remote_uid, fingerprint = excluded.fingerprint,
+                 pushed_rev = excluded.pushed_rev, last_error = excluded.last_error",
+            params![
+                row.calendar_slug,
+                row.uid,
+                row.remote_id,
+                row.remote_version,
+                row.remote_uid,
+                row.fingerprint,
+                row.pushed_rev,
+                row.last_error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_mirror_map(&self, slug: &str, uid: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM mirror_map WHERE calendar_slug = ?1 AND uid = ?2",
+            params![slug, uid],
+        )?;
+        Ok(())
+    }
+
+    /// Like [`Self::get_object_by_uid`] but also returns a soft-deleted row.
+    pub fn get_object_including_deleted_by_uid(
+        &self,
+        slug: &str,
+        uid: &str,
+    ) -> Result<Option<ObjectRow>> {
+        Ok(self
+            .query_objects("calendar_slug = ?1 AND uid = ?2", &[&slug, &uid])?
+            .pop())
+    }
+
+    pub fn calendar_mirror_state(&self, slug: &str) -> Result<CalendarMirrorState> {
+        Ok(self.conn.query_row(
+            "SELECT remote_sync_token, last_full_fill_at, window_start, mirror_pushed_log_id
+             FROM calendars WHERE slug = ?1",
+            params![slug],
+            |r| {
+                Ok(CalendarMirrorState {
+                    remote_sync_token: r.get(0)?,
+                    last_full_fill_at: r.get(1)?,
+                    window_start: r.get(2)?,
+                    mirror_pushed_log_id: r.get(3)?,
+                })
+            },
+        )?)
+    }
+
+    pub fn set_calendar_mirror_state(
+        &self,
+        slug: &str,
+        remote_sync_token: Option<&str>,
+        last_full_fill_at: Option<i64>,
+        window_start: Option<i64>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE calendars SET remote_sync_token = ?2, last_full_fill_at = ?3, window_start = ?4
+             WHERE slug = ?1",
+            params![slug, remote_sync_token, last_full_fill_at, window_start],
+        )?;
+        Ok(())
+    }
+
+    /// The change-log position the mirror has reconciled up to; compaction
+    /// never deletes rows past it.
+    pub fn set_mirror_pushed_log_id(&self, slug: &str, log_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE calendars SET mirror_pushed_log_id = MAX(mirror_pushed_log_id, ?2) WHERE slug = ?1",
+            params![slug, log_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mirror_skip_get(&self, slug: &str, remote_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT COALESCE(remote_version, '') FROM mirror_skip WHERE calendar_slug = ?1 AND remote_id = ?2",
+                params![slug, remote_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn mirror_skip_put(
+        &self,
+        slug: &str,
+        remote_id: &str,
+        remote_version: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO mirror_skip (calendar_slug, remote_id, remote_version, reason) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(calendar_slug, remote_id) DO UPDATE SET remote_version = excluded.remote_version,
+                 reason = excluded.reason",
+            params![slug, remote_id, remote_version, reason],
+        )?;
+        Ok(())
+    }
+
+    pub fn mirror_skip_clear(&self, slug: &str, remote_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM mirror_skip WHERE calendar_slug = ?1 AND remote_id = ?2",
+            params![slug, remote_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn remote_needs_reauth(&self, remote: &str) -> Result<bool> {
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT needs_reauth FROM remotes_status WHERE remote = ?1",
+                params![remote],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let tok: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT needs_reauth FROM oauth_tokens WHERE remote_account = ?1",
+                params![remote],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.unwrap_or(0) != 0 || tok.unwrap_or(0) != 0)
+    }
+
+    /// Record the outcome of a mirror cycle: success clears the error and
+    /// failure counter; a failure increments it and stores the message.
+    pub fn set_remote_status(
+        &self,
+        remote: &str,
+        needs_reauth: bool,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let now = now_ts();
+        match error {
+            None => self.conn.execute(
+                "INSERT INTO remotes_status (remote, needs_reauth, last_ok_at, last_error, last_error_at, consecutive_failures)
+                 VALUES (?1, 0, ?2, NULL, NULL, 0)
+                 ON CONFLICT(remote) DO UPDATE SET needs_reauth = 0, last_ok_at = excluded.last_ok_at,
+                     last_error = NULL, last_error_at = NULL, consecutive_failures = 0",
+                params![remote, now],
+            )?,
+            Some(msg) => self.conn.execute(
+                "INSERT INTO remotes_status (remote, needs_reauth, last_ok_at, last_error, last_error_at, consecutive_failures)
+                 VALUES (?1, ?2, NULL, ?3, ?4, 1)
+                 ON CONFLICT(remote) DO UPDATE SET needs_reauth = excluded.needs_reauth,
+                     last_error = excluded.last_error, last_error_at = excluded.last_error_at,
+                     consecutive_failures = remotes_status.consecutive_failures + 1",
+                params![remote, needs_reauth as i32, msg, now],
+            )?,
+        };
+        if needs_reauth {
+            self.conn.execute(
+                "UPDATE oauth_tokens SET needs_reauth = 1, updated_at = ?2 WHERE remote_account = ?1",
+                params![remote, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_remote_status(&self) -> Result<Vec<RemoteStatusRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT remote, needs_reauth, last_ok_at, last_error, consecutive_failures FROM remotes_status ORDER BY remote",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(RemoteStatusRow {
+                remote: r.get(0)?,
+                needs_reauth: r.get::<_, i64>(1)? != 0,
+                last_ok_at: r.get(2)?,
+                last_error: r.get(3)?,
+                consecutive_failures: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_oauth_token(&self, remote: &str) -> Result<Option<OauthTokenRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT refresh_token, access_token, expires_at, needs_reauth FROM oauth_tokens WHERE remote_account = ?1",
+                params![remote],
+                |r| {
+                    Ok(OauthTokenRow {
+                        refresh_token: r.get(0)?,
+                        access_token: r.get(1)?,
+                        expires_at: r.get(2)?,
+                        needs_reauth: r.get::<_, i64>(3)? != 0,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn put_oauth_token(&self, remote: &str, row: &OauthTokenRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO oauth_tokens (remote_account, refresh_token, access_token, expires_at, needs_reauth, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(remote_account) DO UPDATE SET refresh_token = excluded.refresh_token,
+                 access_token = excluded.access_token, expires_at = excluded.expires_at,
+                 needs_reauth = excluded.needs_reauth, updated_at = excluded.updated_at",
+            params![
+                remote,
+                row.refresh_token,
+                row.access_token,
+                row.expires_at,
+                row.needs_reauth as i32,
+                now_ts()
+            ],
+        )?;
+        if !row.needs_reauth {
+            self.conn.execute(
+                "UPDATE remotes_status SET needs_reauth = 0 WHERE remote = ?1",
+                params![remote],
+            )?;
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------

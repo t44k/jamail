@@ -812,6 +812,7 @@ mod tests {
                 token,
                 changed,
                 deleted,
+                ..
             } => {
                 assert!(changed.is_empty());
                 assert!(deleted.is_empty());
@@ -830,6 +831,7 @@ mod tests {
                 token,
                 changed,
                 deleted,
+                ..
             } => {
                 assert_eq!(changed.len(), 1);
                 assert_eq!(changed[0].href, href);

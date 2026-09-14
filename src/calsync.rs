@@ -342,6 +342,7 @@ fn sync_one_calendar(
             token,
             changed,
             deleted,
+            ..
         } => {
             let seen_hrefs: HashSet<String> = changed.iter().map(|e| e.href.clone()).collect();
             for changed_event in changed {

@@ -181,8 +181,16 @@ jadav:
     identities:
       - Alice Smith <alice@example.com>
       - alice@corp.com
-  # External accounts calendars are mirrored from (used from the mirror
-  # milestone on; validated already).
+  # The Google Cloud OAuth client (Desktop-app type) shared by every
+  # `kind: google` remote. Authorise each remote once with
+  # `jadav google auth <remote>` (or import a refresh token from the
+  # previous bridge with `jadav google import-token <remote> <state.json>`).
+  google_oauth:
+    client_id: 1234567890-abc.apps.googleusercontent.com
+    client_secret:
+      type: command
+      value: pass show jadav/google-client-secret
+  # External accounts calendars are mirrored from.
   remotes:
     corp:
       kind: google           # google | caldav

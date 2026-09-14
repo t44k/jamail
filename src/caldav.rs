@@ -118,41 +118,95 @@ pub enum SyncOutcome {
         token: Option<String>,
         changed: Vec<ChangedEvent>,
         deleted: Vec<String>,
+        /// The server paged the answer (RFC 6578 §3.6: a `507` status on
+        /// the collection's own href — Google does this at ~230 members):
+        /// the caller must call again with `token` to get the rest before
+        /// treating the listing as complete.
+        truncated: bool,
     },
     /// The server rejected the token or doesn't support `sync-collection`
     /// at all; the caller should fall back to [`CalDavClient::list_all_events`].
     FullResyncRequired,
 }
 
+/// Supplies bearer tokens for [`AuthScheme::Bearer`]: `token()` returns a
+/// currently-valid access token (refreshing as needed), `invalidate()` is
+/// called after a `401` so the next call fetches a fresh one.
+pub trait TokenSource: Send {
+    fn token(&mut self) -> Result<String>;
+    fn invalidate(&mut self);
+}
+
+pub enum AuthScheme {
+    Basic { login: String, password: String },
+    Bearer(std::sync::Arc<std::sync::Mutex<dyn TokenSource>>),
+}
+
 pub struct CalDavClient {
     base_url: HttpUrl,
-    login: String,
-    password: String,
+    auth: AuthScheme,
     timeout: Duration,
 }
 
 impl CalDavClient {
     pub fn new(base_url: &str, login: &str, password: &str) -> Result<Self> {
+        Self::new_with_auth(
+            base_url,
+            AuthScheme::Basic {
+                login: login.to_string(),
+                password: password.to_string(),
+            },
+        )
+    }
+
+    pub fn new_with_auth(base_url: &str, auth: AuthScheme) -> Result<Self> {
         Ok(Self {
             base_url: HttpUrl::parse(base_url)?,
-            login: login.to_string(),
-            password: password.to_string(),
+            auth,
             timeout: DEFAULT_TIMEOUT,
         })
+    }
+
+    /// The absolute base URL this client resolves relative hrefs against.
+    pub fn base_url(&self) -> &HttpUrl {
+        &self.base_url
+    }
+
+    fn auth_header(&self) -> Result<String> {
+        match &self.auth {
+            AuthScheme::Basic { login, password } => Ok(httpc::basic_auth_header(login, password)),
+            AuthScheme::Bearer(source) => {
+                let mut src = source
+                    .lock()
+                    .map_err(|_| anyhow!("token source poisoned"))?;
+                Ok(format!("Bearer {}", src.token()?))
+            }
+        }
     }
 
     fn request(
         &self,
         method: &str,
         url: &HttpUrl,
-        mut headers: Vec<(String, String)>,
+        headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> Result<HttpResponse> {
-        headers.push((
-            "Authorization".to_string(),
-            httpc::basic_auth_header(&self.login, &self.password),
-        ));
-        httpc::send(method, url, &headers, body.as_deref(), self.timeout)
+        let mut with_auth = headers.clone();
+        with_auth.push(("Authorization".to_string(), self.auth_header()?));
+        let resp = httpc::send(method, url, &with_auth, body.as_deref(), self.timeout)?;
+        if resp.status == 401
+            && let AuthScheme::Bearer(source) = &self.auth
+        {
+            // An expired/revoked access token: drop it and retry once with
+            // a freshly issued one.
+            if let Ok(mut src) = source.lock() {
+                src.invalidate();
+            }
+            let mut retry = headers;
+            retry.push(("Authorization".to_string(), self.auth_header()?));
+            return httpc::send(method, url, &retry, body.as_deref(), self.timeout);
+        }
+        Ok(resp)
     }
 
     fn propfind(&self, url: &HttpUrl, depth: u8, body: &str) -> Result<MultiStatusDoc> {
@@ -249,10 +303,35 @@ impl CalDavClient {
         match resp.status {
             200 | 207 => {
                 let doc = parse_multistatus(&resp.body_str())?;
+                let collection_path =
+                    httpc::percent_decode(url.path_and_query.split('?').next().unwrap_or(""))
+                        .trim_end_matches('/')
+                        .to_string();
                 let mut changed = Vec::new();
                 let mut deleted = Vec::new();
+                let mut truncated = false;
                 for r in doc.responses {
                     let Some(href) = r.href else { continue };
+                    let href_path = httpc::percent_decode(href.split('?').next().unwrap_or(""));
+                    let is_collection = href_path.trim_end_matches('/') == collection_path
+                        || href_path
+                            .find("://")
+                            .and_then(|i| {
+                                href_path[i + 3..]
+                                    .find('/')
+                                    .map(|j| &href_path[i + 3 + j..])
+                            })
+                            .map(|p| p.trim_end_matches('/') == collection_path)
+                            .unwrap_or(false);
+                    if is_collection {
+                        // A status on the collection itself is not a member:
+                        // 507 means "result truncated, continue with the
+                        // returned token" (RFC 6578 §3.6).
+                        if r.response_status == Some(507) {
+                            truncated = true;
+                        }
+                        continue;
+                    }
                     if let Some(code) = r.response_status
                         && code == 404
                     {
@@ -269,6 +348,7 @@ impl CalDavClient {
                     token: doc.sync_token,
                     changed,
                     deleted,
+                    truncated,
                 })
             }
             400 | 403 | 405 | 501 | 507 => Ok(SyncOutcome::FullResyncRequired),
@@ -310,6 +390,112 @@ impl CalDavClient {
         Ok(doc
             .responses
             .into_iter()
+            .filter_map(|r| {
+                r.href.map(|href| ChangedEvent {
+                    href,
+                    etag: r.etag,
+                    calendar_data: r.calendar_data,
+                })
+            })
+            .collect())
+    }
+
+    /// `calendar-query` REPORT restricted to `VEVENT`s overlapping
+    /// `[start, end)` (RFC 4791 §9.9 `time-range`; recurring masters are
+    /// reported when any occurrence overlaps). `end = None` leaves the
+    /// range open-ended.
+    pub fn list_events_in_range(
+        &self,
+        calendar_url: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<ChangedEvent>, CalDavError> {
+        let url = HttpUrl::parse(calendar_url)?;
+        let end_attr = end
+            .map(|e| format!(" end=\"{}\"", e.format("%Y%m%dT%H%M%SZ")))
+            .unwrap_or_default();
+        let body = format!(
+            r#"<?xml version="1.0" encoding="utf-8" ?>
+<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop>
+    <D:getetag/>
+    <C:calendar-data/>
+  </D:prop>
+  <C:filter>
+    <C:comp-filter name="VCALENDAR">
+      <C:comp-filter name="VEVENT">
+        <C:time-range start="{}"{}/>
+      </C:comp-filter>
+    </C:comp-filter>
+  </C:filter>
+</C:calendar-query>"#,
+            start.format("%Y%m%dT%H%M%SZ"),
+            end_attr
+        );
+        self.report_events(&url, body, "calendar-query (time-range) REPORT failed")
+    }
+
+    /// `calendar-multiget` REPORT: fetch `getetag` + `calendar-data` for
+    /// specific hrefs in one round trip (servers that omit `calendar-data`
+    /// from `sync-collection` answers, e.g. Google's CalDAV, hand it out
+    /// this way). Callers batch — 50 hrefs per call is a safe size.
+    pub fn multiget(
+        &self,
+        calendar_url: &str,
+        hrefs: &[String],
+    ) -> Result<Vec<ChangedEvent>, CalDavError> {
+        if hrefs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let url = HttpUrl::parse(calendar_url)?;
+        let mut body = String::from(
+            r#"<?xml version="1.0" encoding="utf-8" ?>
+<C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop>
+    <D:getetag/>
+    <C:calendar-data/>
+  </D:prop>
+"#,
+        );
+        for href in hrefs {
+            body.push_str("  <D:href>");
+            body.push_str(&xml_escape_text(href));
+            body.push_str("</D:href>\n");
+        }
+        body.push_str("</C:calendar-multiget>");
+        self.report_events(&url, body, "calendar-multiget REPORT failed")
+    }
+
+    fn report_events(
+        &self,
+        url: &HttpUrl,
+        body: String,
+        context: &str,
+    ) -> Result<Vec<ChangedEvent>, CalDavError> {
+        let resp = self.request(
+            "REPORT",
+            url,
+            vec![
+                ("Depth".to_string(), "1".to_string()),
+                (
+                    "Content-Type".to_string(),
+                    "application/xml; charset=utf-8".to_string(),
+                ),
+            ],
+            Some(body.into_bytes()),
+        )?;
+        if resp.status != 207 && resp.status != 200 {
+            return Err(CalDavError::Other(httpc::err_status(
+                context,
+                resp.status,
+                &resp.body_str(),
+            )));
+        }
+        let doc = parse_multistatus(&resp.body_str())?;
+        Ok(doc
+            .responses
+            .into_iter()
+            .filter(|r| r.response_status.is_none_or(|c| (200..300).contains(&c)))
             .filter_map(|r| {
                 r.href.map(|href| ChangedEvent {
                     href,
@@ -466,6 +652,12 @@ struct PropStatBuf {
     current_user_principal: Option<String>,
     calendar_home_set: Option<String>,
     status_ok: bool,
+}
+
+fn xml_escape_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn local_name(qname: &str) -> String {
@@ -778,6 +970,7 @@ mod tests {
                 token,
                 changed,
                 deleted,
+                ..
             } => {
                 assert_eq!(token.as_deref(), Some("https://cal.example.com/sync/2"));
                 assert_eq!(changed.len(), 1);
