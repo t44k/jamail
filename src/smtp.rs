@@ -217,10 +217,17 @@ pub fn send_email(
             .context("Failed to build multipart email")?
     };
 
+    send_message_with(smtp_config, &message)
+}
+
+/// Build an authenticated SMTP transport for `smtp_config` (STARTTLS on
+/// `starttls: true`, implicit TLS otherwise). Resolves the password once;
+/// lettre's transport pools connections, so long-lived senders (jadav's
+/// iMIP queue) keep one of these around and rebuild it after a failure.
+pub fn build_transport(smtp_config: &SmtpConfig) -> Result<SmtpTransport> {
     let password = smtp_config.auth.resolve_password()?;
     let creds = Credentials::new(smtp_config.login.clone(), password);
-
-    let transport = if smtp_config.starttls {
+    Ok(if smtp_config.starttls {
         SmtpTransport::starttls_relay(&smtp_config.host)
             .context("Failed to create STARTTLS transport")?
             .port(smtp_config.port)
@@ -232,13 +239,22 @@ pub fn send_email(
             .port(smtp_config.port)
             .credentials(creds)
             .build()
-    };
+    })
+}
 
+/// Send an already-built message over `transport`; returns the raw bytes
+/// that went out (for a Sent-folder copy / audit).
+pub fn send_message(transport: &SmtpTransport, message: &Message) -> Result<Vec<u8>> {
     transport
-        .send(&message)
+        .send(message)
         .context("Failed to send email via SMTP")?;
-
     Ok(message.formatted())
+}
+
+/// Convenience: build a transport and send one message.
+pub fn send_message_with(smtp_config: &SmtpConfig, message: &Message) -> Result<Vec<u8>> {
+    let transport = build_transport(smtp_config)?;
+    send_message(&transport, message)
 }
 
 /// Build a raw RFC-2822-shaped message for uploading a draft to a remote

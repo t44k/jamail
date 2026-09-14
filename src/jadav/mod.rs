@@ -26,6 +26,7 @@
 pub mod caldav_remote;
 pub mod config;
 pub mod google;
+pub mod itip;
 pub mod mirror;
 pub mod server;
 pub mod store;
