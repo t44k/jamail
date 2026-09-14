@@ -239,6 +239,9 @@ pub struct VEvent {
     pub alarms: Vec<Alarm>,
     pub sequence: i64,
     pub dtstamp: Option<DateTime<Utc>>,
+    /// `RECURRENCE-ID` when this component is an override of one occurrence
+    /// of a recurring series; `None` for a series master or a plain event.
+    pub recurrence_id: Option<EventTime>,
     /// The original `BEGIN:VEVENT`..`END:VEVENT` block text, unfolded to
     /// one property per line but otherwise verbatim. `None` for an event
     /// being newly created (not yet round-tripped through a server).
@@ -290,6 +293,15 @@ impl ContentLine {
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
+}
+
+/// Case-insensitive ASCII prefix test that is safe on any UTF-8 input
+/// (byte-indexing a `&str` panics when the index is not a char boundary,
+/// which a `SUMMARY:€…` line can trigger).
+pub fn starts_with_ignore_case(s: impl AsRef<str>, prefix: &str) -> bool {
+    let s = s.as_ref();
+    let p = prefix.as_bytes();
+    s.len() >= p.len() && s.as_bytes()[..p.len()].eq_ignore_ascii_case(p)
 }
 
 /// Undo RFC 5545 §3.1 line folding: a line starting with a single space or
@@ -537,9 +549,18 @@ fn parse_event_time_value(value: &str, line: &ContentLine) -> Result<EventTime, 
         return Ok(EventTime::utc(Utc.from_utc_datetime(&naive)));
     }
     if let Some(tzid) = line.param("TZID") {
-        let tz = chrono_tz::Tz::from_str(tzid)
-            .map_err(|_| CalendarError::UnsupportedTimezone(tzid.to_string()))?;
         let naive = parse_naive_datetime(value)?;
+        let tz = match resolve_tz(tzid) {
+            Some(TzAlias::Iana(tz)) => tz,
+            Some(TzAlias::Fixed(offset_secs)) => {
+                let utc = naive - Duration::seconds(i64::from(offset_secs));
+                return Ok(EventTime::with_tz(
+                    Utc.from_utc_datetime(&utc),
+                    tzid.to_string(),
+                ));
+            }
+            None => return Err(CalendarError::UnsupportedTimezone(tzid.to_string())),
+        };
         let resolved = match tz.from_local_datetime(&naive) {
             chrono::LocalResult::Single(dt) => dt,
             // DST "spring forward" gap or "fall back" ambiguity: pick the
@@ -591,11 +612,745 @@ pub(crate) fn render_time_property(name: &str, t: &EventTime) -> String {
     if t.all_day {
         format!("{};VALUE=DATE:{}", name, t.utc.format("%Y%m%d"))
     } else if let Some(tzid) = &t.tzid {
-        let tz = chrono_tz::Tz::from_str(tzid).unwrap_or(chrono_tz::UTC);
-        let local = t.utc.with_timezone(&tz);
+        let local = match resolve_tz(tzid) {
+            Some(TzAlias::Iana(tz)) => t.utc.with_timezone(&tz).naive_local(),
+            Some(TzAlias::Fixed(offset_secs)) => {
+                t.utc.naive_utc() + Duration::seconds(i64::from(offset_secs))
+            }
+            None => t.utc.naive_utc(),
+        };
         format!("{};TZID={}:{}", name, tzid, local.format("%Y%m%dT%H%M%S"))
     } else {
         format!("{}:{}Z", name, t.utc.format("%Y%m%dT%H%M%S"))
+    }
+}
+
+// ---------------------------------------------------------------------
+// Timezone resolution
+// ---------------------------------------------------------------------
+
+/// How a `TZID` was resolved: a real IANA zone, or a fixed offset
+/// recovered from a `VTIMEZONE` this crate cannot otherwise interpret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TzAlias {
+    Iana(chrono_tz::Tz),
+    /// Seconds east of UTC (an approximation: ignores DST rules).
+    Fixed(i32),
+}
+
+thread_local! {
+    /// `TZID` → alias for the `VTIMEZONE`s of the document currently being
+    /// parsed (set by [`parse_document`]); consulted after the IANA and
+    /// Windows-name lookups fail.
+    static TZ_CONTEXT: std::cell::RefCell<std::collections::HashMap<String, TzAlias>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Microsoft's Windows time-zone names as Outlook/Exchange emit them in
+/// `TZID`, mapped to representative IANA zones.
+pub fn windows_tz_alias(name: &str) -> Option<&'static str> {
+    Some(match name.trim() {
+        "UTC" | "Coordinated Universal Time" => "UTC",
+        "GMT Standard Time" | "Greenwich Standard Time" => "Europe/London",
+        "W. Europe Standard Time" => "Europe/Berlin",
+        "Central Europe Standard Time" => "Europe/Budapest",
+        "Central European Standard Time" => "Europe/Warsaw",
+        "Romance Standard Time" => "Europe/Paris",
+        "E. Europe Standard Time" => "Europe/Bucharest",
+        "FLE Standard Time" => "Europe/Kiev",
+        "GTB Standard Time" => "Europe/Athens",
+        "Russian Standard Time" => "Europe/Moscow",
+        "Turkey Standard Time" => "Europe/Istanbul",
+        "Israel Standard Time" => "Asia/Jerusalem",
+        "Arabian Standard Time" => "Asia/Dubai",
+        "India Standard Time" => "Asia/Kolkata",
+        "SE Asia Standard Time" => "Asia/Bangkok",
+        "China Standard Time" => "Asia/Shanghai",
+        "Singapore Standard Time" => "Asia/Singapore",
+        "Tokyo Standard Time" => "Asia/Tokyo",
+        "Korea Standard Time" => "Asia/Seoul",
+        "AUS Eastern Standard Time" => "Australia/Sydney",
+        "W. Australia Standard Time" => "Australia/Perth",
+        "New Zealand Standard Time" => "Pacific/Auckland",
+        "Eastern Standard Time" => "America/New_York",
+        "Central Standard Time" => "America/Chicago",
+        "Mountain Standard Time" => "America/Denver",
+        "Pacific Standard Time" => "America/Los_Angeles",
+        "Alaskan Standard Time" => "America/Anchorage",
+        "Hawaiian Standard Time" => "Pacific/Honolulu",
+        "Atlantic Standard Time" => "America/Halifax",
+        "SA Pacific Standard Time" => "America/Bogota",
+        "E. South America Standard Time" => "America/Sao_Paulo",
+        "Argentina Standard Time" => "America/Argentina/Buenos_Aires",
+        "South Africa Standard Time" => "Africa/Johannesburg",
+        "Egypt Standard Time" => "Africa/Cairo",
+        _ => return None,
+    })
+}
+
+/// Resolve a `TZID`: IANA name → Windows display name → the current
+/// document's `VTIMEZONE` context. `None` when nothing matches.
+pub fn resolve_tz(tzid: &str) -> Option<TzAlias> {
+    if let Ok(tz) = chrono_tz::Tz::from_str(tzid) {
+        return Some(TzAlias::Iana(tz));
+    }
+    if let Some(iana) = windows_tz_alias(tzid)
+        && let Ok(tz) = chrono_tz::Tz::from_str(iana)
+    {
+        return Some(TzAlias::Iana(tz));
+    }
+    TZ_CONTEXT.with(|ctx| ctx.borrow().get(tzid).copied())
+}
+
+/// Derive an alias from a raw `VTIMEZONE` block: its `X-LIC-LOCATION`
+/// (an IANA name, as Google/Lotus emit), else the IANA/Windows lookup of
+/// the `TZID` itself, else a fixed offset from the first `STANDARD`
+/// `TZOFFSETTO`.
+fn vtimezone_alias(block: &str) -> Option<(String, TzAlias)> {
+    let lines = unfold(block);
+    let mut tzid = None;
+    let mut location = None;
+    let mut standard_off = None;
+    let mut any_off = None;
+    let mut in_standard = false;
+    for line in &lines {
+        if line.eq_ignore_ascii_case("BEGIN:STANDARD") {
+            in_standard = true;
+            continue;
+        }
+        if line.eq_ignore_ascii_case("END:STANDARD") {
+            in_standard = false;
+            continue;
+        }
+        let Some(cl) = parse_content_line(line) else {
+            continue;
+        };
+        match cl.name.as_str() {
+            "TZID" => tzid = Some(cl.value.trim().to_string()),
+            "X-LIC-LOCATION" => location = Some(cl.value.trim().to_string()),
+            "TZOFFSETTO" => {
+                let off = parse_utc_offset(cl.value.trim());
+                if in_standard && standard_off.is_none() {
+                    standard_off = off;
+                }
+                if any_off.is_none() {
+                    any_off = off;
+                }
+            }
+            _ => {}
+        }
+    }
+    let tzid = tzid?;
+    if let Some(loc) = location
+        && let Ok(tz) = chrono_tz::Tz::from_str(&loc)
+    {
+        return Some((tzid, TzAlias::Iana(tz)));
+    }
+    if let Some(alias) = resolve_tz(&tzid) {
+        return Some((tzid, alias));
+    }
+    standard_off
+        .or(any_off)
+        .map(|off| (tzid, TzAlias::Fixed(off)))
+}
+
+fn parse_utc_offset(s: &str) -> Option<i32> {
+    let (sign, rest) = match s.as_bytes().first()? {
+        b'+' => (1, &s[1..]),
+        b'-' => (-1, &s[1..]),
+        _ => (1, s),
+    };
+    if rest.len() < 4 || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let h: i32 = rest[..2].parse().ok()?;
+    let m: i32 = rest[2..4].parse().ok()?;
+    let sec: i32 = if rest.len() >= 6 {
+        rest[4..6].parse().ok()?
+    } else {
+        0
+    };
+    Some(sign * (h * 3600 + m * 60 + sec))
+}
+
+/// Run `f` with the given `VTIMEZONE` blocks registered as the resolution
+/// context (restoring the previous context afterwards).
+pub fn with_tz_context<T>(timezones: &[String], f: impl FnOnce() -> T) -> T {
+    let previous = TZ_CONTEXT.with(|ctx| ctx.borrow().clone());
+    // Resolve first (it consults the context itself), then install.
+    let aliases: Vec<(String, TzAlias)> = timezones
+        .iter()
+        .filter_map(|b| vtimezone_alias(b))
+        .collect();
+    TZ_CONTEXT.with(|ctx| {
+        let mut map = ctx.borrow_mut();
+        for (tzid, alias) in aliases {
+            map.insert(tzid, alias);
+        }
+    });
+    let out = f();
+    TZ_CONTEXT.with(|ctx| *ctx.borrow_mut() = previous);
+    out
+}
+
+// ---------------------------------------------------------------------
+// Whole-document model (VCALENDAR)
+// ---------------------------------------------------------------------
+
+/// A complete iCalendar object: the `VCALENDAR` wrapper's properties, its
+/// `VTIMEZONE`s and other components verbatim, and every `VEVENT` parsed.
+/// Everything not modelled is preserved byte-for-byte so [`Self::to_ics`]
+/// round-trips; edits are made by rewriting individual raw lines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ICalendarDocument {
+    /// Upper-cased `METHOD` value (iTIP), if present.
+    pub method: Option<String>,
+    pub prodid: Option<String>,
+    /// Other top-level `VCALENDAR` property lines (`VERSION`, `CALSCALE`,
+    /// `X-WR-*`), unfolded, in order.
+    pub other_properties: Vec<String>,
+    /// Raw `BEGIN:VTIMEZONE`…`END:VTIMEZONE` blocks (CRLF-joined).
+    pub timezones: Vec<String>,
+    pub events: Vec<VEvent>,
+    /// Any other component (`VTODO`, `VFREEBUSY`, …), raw.
+    pub other_components: Vec<String>,
+}
+
+/// Parse a whole iCalendar document (a bare `VEVENT` is wrapped). Unknown
+/// `TZID`s are resolved against the document's own `VTIMEZONE`s.
+pub fn parse_document(ics: &str) -> Result<ICalendarDocument, CalendarError> {
+    let lines = unfold(ics);
+    let mut method = None;
+    let mut prodid = None;
+    let mut other_properties = Vec::new();
+    let mut timezones: Vec<String> = Vec::new();
+    let mut event_blocks: Vec<Vec<String>> = Vec::new();
+    let mut other_components = Vec::new();
+    let has_wrapper = lines
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case("BEGIN:VCALENDAR"));
+    let mut i = 0;
+    while i < lines.len() {
+        let line = &lines[i];
+        if starts_with_ignore_case(line, "BEGIN:") {
+            let name = line[6..].trim().to_ascii_uppercase();
+            if name == "VCALENDAR" {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let mut depth = 1;
+            i += 1;
+            while i < lines.len() && depth > 0 {
+                if starts_with_ignore_case(&lines[i], "BEGIN:") {
+                    depth += 1;
+                } else if starts_with_ignore_case(&lines[i], "END:") {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            let end = i.min(lines.len().saturating_sub(1));
+            let block: Vec<String> = lines[start..=end].to_vec();
+            match name.as_str() {
+                "VEVENT" => event_blocks.push(block),
+                "VTIMEZONE" => timezones.push(block.join("\r\n")),
+                _ => other_components.push(block.join("\r\n")),
+            }
+            i += 1;
+            continue;
+        }
+        if starts_with_ignore_case(line, "END:") {
+            i += 1;
+            continue;
+        }
+        if line.is_empty() {
+            i += 1;
+            continue;
+        }
+        if has_wrapper {
+            match parse_content_line(line) {
+                Some(cl) if cl.name == "METHOD" => {
+                    method = Some(cl.value.trim().to_ascii_uppercase())
+                }
+                Some(cl) if cl.name == "PRODID" => prodid = Some(cl.value.trim().to_string()),
+                _ => other_properties.push(line.clone()),
+            }
+        }
+        i += 1;
+    }
+    let events = with_tz_context(&timezones, || {
+        event_blocks
+            .into_iter()
+            .map(|block| {
+                let raw = block.join("\r\n");
+                parse_single_vevent(&block, raw)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    Ok(ICalendarDocument {
+        method,
+        prodid,
+        other_properties,
+        timezones,
+        events,
+        other_components,
+    })
+}
+
+impl ICalendarDocument {
+    /// The series master (or the single event): first `VEVENT` without a
+    /// `RECURRENCE-ID`.
+    pub fn master(&self) -> Option<&VEvent> {
+        self.events
+            .iter()
+            .find(|e| !is_recurrence_override(e))
+            .or_else(|| self.events.first())
+    }
+
+    pub fn uid(&self) -> Option<&str> {
+        self.master().map(|e| e.uid.as_str())
+    }
+
+    pub fn overrides(&self) -> impl Iterator<Item = &VEvent> {
+        self.events.iter().filter(|e| is_recurrence_override(e))
+    }
+
+    /// Index of the component for `rid` (`None` = master), matching by
+    /// UTC instant and all-day flag so `TZID=` and `Z` forms compare equal.
+    pub fn component_index(&self, rid: Option<&EventTime>) -> Option<usize> {
+        match rid {
+            None => self
+                .events
+                .iter()
+                .position(|e| !is_recurrence_override(e))
+                .or(if self.events.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                }),
+            Some(r) => self.events.iter().position(|e| {
+                e.recurrence_id
+                    .as_ref()
+                    .is_some_and(|x| x.utc == r.utc && x.all_day == r.all_day)
+            }),
+        }
+    }
+
+    /// Serialise: wrapper, `PRODID`, `METHOD`, other properties, timezones,
+    /// events (raw blocks), other components; folded at 75 octets.
+    pub fn to_ics(&self) -> String {
+        let mut out = String::from("BEGIN:VCALENDAR\r\nVERSION:2.0\r\n");
+        out.push_str(&format!(
+            "PRODID:{}\r\n",
+            self.prodid.as_deref().unwrap_or("-//jamail//jadav//EN")
+        ));
+        if let Some(m) = &self.method {
+            out.push_str(&format!("METHOD:{}\r\n", m));
+        }
+        for p in &self.other_properties {
+            if let Some(cl) = parse_content_line(p)
+                && matches!(cl.name.as_str(), "VERSION" | "PRODID" | "METHOD")
+            {
+                continue;
+            }
+            out.push_str(p);
+            out.push_str("\r\n");
+        }
+        for tz in &self.timezones {
+            out.push_str(tz.trim_end_matches(['\r', '\n']));
+            out.push_str("\r\n");
+        }
+        for ev in &self.events {
+            match &ev.raw {
+                Some(raw) => {
+                    out.push_str(raw.trim_end_matches(['\r', '\n']));
+                    out.push_str("\r\n");
+                }
+                None => {
+                    let fresh = ev.to_new_ics(ev.dtstamp.unwrap_or_else(Utc::now));
+                    for line in unfold(&fresh) {
+                        if line.eq_ignore_ascii_case("BEGIN:VCALENDAR")
+                            || line.eq_ignore_ascii_case("END:VCALENDAR")
+                            || line.starts_with("VERSION:")
+                            || line.starts_with("PRODID:")
+                            || line.is_empty()
+                        {
+                            continue;
+                        }
+                        out.push_str(&line);
+                        out.push_str("\r\n");
+                    }
+                }
+            }
+        }
+        for c in &self.other_components {
+            out.push_str(c.trim_end_matches(['\r', '\n']));
+            out.push_str("\r\n");
+        }
+        out.push_str("END:VCALENDAR\r\n");
+        fold_ics(&out)
+    }
+
+    /// Replace component `idx`'s raw block and re-parse it so the model
+    /// stays in sync.
+    fn replace_component_raw(&mut self, idx: usize, new_raw: String) -> Result<(), CalendarError> {
+        let block = unfold(&new_raw);
+        let parsed = with_tz_context(&self.timezones, || {
+            parse_single_vevent(&block, block.join("\r\n"))
+        })?;
+        self.events[idx] = parsed;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------
+// Raw-line rewriting helpers (byte-preserving except the touched line)
+// ---------------------------------------------------------------------
+
+/// Split a content line into `(name, raw params, value)` at the first `:`
+/// outside double quotes; params keep their raw text.
+pub fn split_content_line(line: &str) -> Option<(String, Vec<String>, String)> {
+    let bytes = line.as_bytes();
+    let mut in_quotes = false;
+    let mut colon = None;
+    for (i, b) in bytes.iter().enumerate() {
+        match b {
+            b'"' => in_quotes = !in_quotes,
+            b':' if !in_quotes => {
+                colon = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let colon = colon?;
+    let head = &line[..colon];
+    let value = line[colon + 1..].to_string();
+    let mut params = Vec::new();
+    let mut cur = String::new();
+    in_quotes = false;
+    let mut name = String::new();
+    let mut first = true;
+    for ch in head.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                cur.push(ch);
+            }
+            ';' if !in_quotes => {
+                if first {
+                    name = cur.clone();
+                    first = false;
+                } else {
+                    params.push(cur.clone());
+                }
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if first {
+        name = cur;
+    } else {
+        params.push(cur);
+    }
+    Some((name, params, value))
+}
+
+pub fn line_has_param(line: &str, param: &str) -> bool {
+    split_content_line(line).is_some_and(|(_, params, _)| {
+        params.iter().any(|p| {
+            p.split_once('=')
+                .is_some_and(|(k, _)| k.eq_ignore_ascii_case(param))
+        })
+    })
+}
+
+/// Set (or, with `None`, remove) one parameter on a content line, keeping
+/// every other parameter byte-for-byte. Values containing `;`, `:` or `,`
+/// are quoted.
+pub fn set_param_on_line(line: &str, param: &str, value: Option<&str>) -> String {
+    let Some((name, params, value_part)) = split_content_line(line) else {
+        return line.to_string();
+    };
+    let mut kept: Vec<String> = params
+        .into_iter()
+        .filter(|p| {
+            !p.split_once('=')
+                .is_some_and(|(k, _)| k.eq_ignore_ascii_case(param))
+        })
+        .collect();
+    if let Some(v) = value {
+        let needs_quotes = v.contains([';', ':', ',']) && !v.starts_with('"');
+        kept.push(if needs_quotes {
+            format!("{}=\"{}\"", param, v)
+        } else {
+            format!("{}={}", param, v)
+        });
+    }
+    let mut head = name;
+    for p in kept {
+        head.push(';');
+        head.push_str(&p);
+    }
+    format!("{}:{}", head, value_part)
+}
+
+/// The bare lower-cased address of a `mailto:` cal-address value.
+pub fn cal_address_email(value: &str) -> String {
+    let v = value.trim().trim_matches('"');
+    let v = if starts_with_ignore_case(v, "mailto:") {
+        &v[7..]
+    } else {
+        v
+    };
+    v.to_ascii_lowercase()
+}
+
+/// Rewrite a raw `VEVENT` block: for every *top-level* property line
+/// (nested components untouched), `f(name, line)` may return a replacement
+/// (`Some(String)`; an empty string drops the line). Returns the new block
+/// and whether anything changed.
+pub fn rewrite_block_lines(
+    raw: &str,
+    mut f: impl FnMut(&str, &str) -> Option<String>,
+) -> (String, bool) {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut changed = false;
+    for line in unfold(raw) {
+        if starts_with_ignore_case(&line, "BEGIN:") {
+            depth += 1;
+            out.push(line);
+            continue;
+        }
+        if starts_with_ignore_case(&line, "END:") {
+            depth -= 1;
+            out.push(line);
+            continue;
+        }
+        if depth == 1
+            && let Some(cl) = parse_content_line(&line)
+            && let Some(new) = f(&cl.name, &line)
+        {
+            changed = true;
+            if !new.is_empty() {
+                out.push(new);
+            }
+            continue;
+        }
+        out.push(line);
+    }
+    (out.join("\r\n"), changed)
+}
+
+/// Replace the first top-level `name` property of a raw block with
+/// `new_line` (or insert it before `END:VEVENT` when absent); `None`
+/// removes every occurrence.
+pub fn replace_block_property(raw: &str, name: &str, new_line: Option<&str>) -> String {
+    let mut seen = false;
+    let (mut out, _) = rewrite_block_lines(raw, |n, _| {
+        if n.eq_ignore_ascii_case(name) {
+            if seen {
+                return Some(String::new());
+            }
+            seen = true;
+            return Some(new_line.map(str::to_string).unwrap_or_default());
+        }
+        None
+    });
+    if !seen && let Some(l) = new_line {
+        let mut lines = unfold(&out);
+        if let Some(pos) = lines
+            .iter()
+            .rposition(|x| x.eq_ignore_ascii_case("END:VEVENT"))
+        {
+            lines.insert(pos, l.to_string());
+        } else {
+            lines.push(l.to_string());
+        }
+        out = lines.join("\r\n");
+    }
+    out
+}
+
+impl ICalendarDocument {
+    /// Set `email`'s `PARTSTAT` on the component for `rid` (`None` =
+    /// master), dropping `RSVP`; `false` when that attendee is absent.
+    pub fn set_attendee_partstat(
+        &mut self,
+        email: &str,
+        partstat: &str,
+        rid: Option<&EventTime>,
+    ) -> Result<bool, CalendarError> {
+        let Some(idx) = self.component_index(rid) else {
+            return Ok(false);
+        };
+        let me = email.to_ascii_lowercase();
+        let raw = self.events[idx].raw.clone().unwrap_or_default();
+        let (new_raw, changed) = rewrite_block_lines(&raw, |name, line| {
+            if name != "ATTENDEE" {
+                return None;
+            }
+            let (_, _, value) = split_content_line(line)?;
+            if cal_address_email(&value) != me {
+                return None;
+            }
+            let l = set_param_on_line(line, "PARTSTAT", Some(&partstat.to_ascii_uppercase()));
+            Some(set_param_on_line(&l, "RSVP", None))
+        });
+        if !changed {
+            return Ok(false);
+        }
+        self.replace_component_raw(idx, new_raw)?;
+        Ok(true)
+    }
+
+    /// Set `SCHEDULE-STATUS` on `email`'s `ATTENDEE` line, or on
+    /// `ORGANIZER` when `email` is the organizer.
+    pub fn set_schedule_status(
+        &mut self,
+        email: &str,
+        status: &str,
+        rid: Option<&EventTime>,
+    ) -> Result<bool, CalendarError> {
+        let Some(idx) = self.component_index(rid) else {
+            return Ok(false);
+        };
+        let me = email.to_ascii_lowercase();
+        let raw = self.events[idx].raw.clone().unwrap_or_default();
+        let (new_raw, changed) = rewrite_block_lines(&raw, |name, line| {
+            if name != "ATTENDEE" && name != "ORGANIZER" {
+                return None;
+            }
+            let (_, _, value) = split_content_line(line)?;
+            if cal_address_email(&value) != me {
+                return None;
+            }
+            Some(set_param_on_line(line, "SCHEDULE-STATUS", Some(status)))
+        });
+        if !changed {
+            return Ok(false);
+        }
+        self.replace_component_raw(idx, new_raw)?;
+        Ok(true)
+    }
+
+    /// Set `STATUS` (and optionally `SEQUENCE`) on every component.
+    pub fn set_status(
+        &mut self,
+        status: EventStatus,
+        sequence: Option<i64>,
+    ) -> Result<(), CalendarError> {
+        for idx in 0..self.events.len() {
+            let raw = self.events[idx].raw.clone().unwrap_or_default();
+            let mut new_raw = replace_block_property(
+                &raw,
+                "STATUS",
+                Some(&format!("STATUS:{}", status.as_ics())),
+            );
+            if let Some(seq) = sequence {
+                new_raw = replace_block_property(
+                    &new_raw,
+                    "SEQUENCE",
+                    Some(&format!("SEQUENCE:{}", seq)),
+                );
+            }
+            self.replace_component_raw(idx, new_raw)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_sequence(&mut self, sequence: i64) -> Result<(), CalendarError> {
+        for idx in 0..self.events.len() {
+            let raw = self.events[idx].raw.clone().unwrap_or_default();
+            let new_raw =
+                replace_block_property(&raw, "SEQUENCE", Some(&format!("SEQUENCE:{}", sequence)));
+            self.replace_component_raw(idx, new_raw)?;
+        }
+        Ok(())
+    }
+
+    /// Refresh `DTSTAMP` and `LAST-MODIFIED` on every component.
+    pub fn touch(&mut self, now: DateTime<Utc>) -> Result<(), CalendarError> {
+        let stamp = now.format("%Y%m%dT%H%M%SZ").to_string();
+        for idx in 0..self.events.len() {
+            let raw = self.events[idx].raw.clone().unwrap_or_default();
+            let new_raw =
+                replace_block_property(&raw, "DTSTAMP", Some(&format!("DTSTAMP:{}", stamp)));
+            let new_raw = replace_block_property(
+                &new_raw,
+                "LAST-MODIFIED",
+                Some(&format!("LAST-MODIFIED:{}", stamp)),
+            );
+            self.replace_component_raw(idx, new_raw)?;
+        }
+        Ok(())
+    }
+
+    /// Remove parameters (e.g. `SCHEDULE-STATUS`, `SCHEDULE-AGENT`,
+    /// `SCHEDULE-FORCE-SEND`) from every `ORGANIZER`/`ATTENDEE` line.
+    pub fn strip_params(&mut self, params: &[&str]) -> Result<(), CalendarError> {
+        for idx in 0..self.events.len() {
+            let raw = self.events[idx].raw.clone().unwrap_or_default();
+            let (new_raw, changed) = rewrite_block_lines(&raw, |name, line| {
+                if name != "ATTENDEE" && name != "ORGANIZER" {
+                    return None;
+                }
+                let mut l = line.to_string();
+                let mut touched = false;
+                for p in params {
+                    if line_has_param(&l, p) {
+                        l = set_param_on_line(&l, p, None);
+                        touched = true;
+                    }
+                }
+                touched.then_some(l)
+            });
+            if changed {
+                self.replace_component_raw(idx, new_raw)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove every `VALARM` sub-component (alarms are private to a
+    /// recipient and never travel in iTIP messages).
+    pub fn strip_alarms(&mut self) -> Result<(), CalendarError> {
+        for idx in 0..self.events.len() {
+            let raw = self.events[idx].raw.clone().unwrap_or_default();
+            let mut out = Vec::new();
+            let mut skipping = 0i32;
+            for line in unfold(&raw) {
+                if line.eq_ignore_ascii_case("BEGIN:VALARM") {
+                    skipping += 1;
+                    continue;
+                }
+                if skipping > 0 {
+                    if line.eq_ignore_ascii_case("END:VALARM") {
+                        skipping -= 1;
+                    }
+                    continue;
+                }
+                out.push(line);
+            }
+            self.replace_component_raw(idx, out.join("\r\n"))?;
+        }
+        Ok(())
+    }
+
+    /// Keep only the components whose index is in `keep` (used to build
+    /// per-recipient iTIP messages).
+    pub fn retain_components(&mut self, keep: &[usize]) {
+        let mut idx = 0usize;
+        self.events.retain(|_| {
+            let k = keep.contains(&idx);
+            idx += 1;
+            k
+        });
     }
 }
 
@@ -617,9 +1372,9 @@ pub fn parse_vevents(ics: &str) -> Result<Vec<VEvent>, CalendarError> {
             let mut depth = 1;
             i += 1;
             while i < lines.len() && depth > 0 {
-                if lines[i].len() >= 6 && lines[i][..6].eq_ignore_ascii_case("BEGIN:") {
+                if starts_with_ignore_case(&lines[i], "BEGIN:") {
                     depth += 1;
-                } else if lines[i].len() >= 4 && lines[i][..4].eq_ignore_ascii_case("END:") {
+                } else if starts_with_ignore_case(&lines[i], "END:") {
                     depth -= 1;
                     if depth == 0 {
                         break;
@@ -653,6 +1408,7 @@ fn parse_single_vevent(lines: &[String], raw: String) -> Result<VEvent, Calendar
     let mut alarms = Vec::new();
     let mut sequence: i64 = 0;
     let mut dtstamp: Option<DateTime<Utc>> = None;
+    let mut recurrence_id: Option<EventTime> = None;
 
     let mut in_valarm = false;
     let mut alarm_trigger: Option<AlarmTrigger> = None;
@@ -661,7 +1417,7 @@ fn parse_single_vevent(lines: &[String], raw: String) -> Result<VEvent, Calendar
     let mut depth = 0i32;
 
     for raw_line in &lines[1..lines.len().saturating_sub(1)] {
-        if raw_line.len() >= 6 && raw_line[..6].eq_ignore_ascii_case("BEGIN:") {
+        if starts_with_ignore_case(raw_line, "BEGIN:") {
             if raw_line[6..].eq_ignore_ascii_case("VALARM") {
                 in_valarm = true;
                 alarm_trigger = None;
@@ -671,7 +1427,7 @@ fn parse_single_vevent(lines: &[String], raw: String) -> Result<VEvent, Calendar
             depth += 1;
             continue;
         }
-        if raw_line.len() >= 4 && raw_line[..4].eq_ignore_ascii_case("END:") {
+        if starts_with_ignore_case(raw_line, "END:") {
             if in_valarm && raw_line[4..].eq_ignore_ascii_case("VALARM") {
                 if let Some(trigger) = alarm_trigger.take() {
                     alarms.push(Alarm {
@@ -729,6 +1485,7 @@ fn parse_single_vevent(lines: &[String], raw: String) -> Result<VEvent, Calendar
             "DTSTAMP" => {
                 dtstamp = parse_event_time(&cl).ok().map(|t| t.utc);
             }
+            "RECURRENCE-ID" => recurrence_id = parse_event_time(&cl).ok(),
             _ => {}
         }
     }
@@ -766,6 +1523,7 @@ fn parse_single_vevent(lines: &[String], raw: String) -> Result<VEvent, Calendar
         alarms,
         sequence,
         dtstamp,
+        recurrence_id,
         raw: Some(raw),
     })
 }
@@ -1141,11 +1899,11 @@ pub fn raw_property_lines(raw_vevent: &str, names: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     for line in unfold(raw_vevent) {
-        if line.len() >= 6 && line[..6].eq_ignore_ascii_case("BEGIN:") {
+        if starts_with_ignore_case(&line, "BEGIN:") {
             depth += 1;
             continue;
         }
-        if line.len() >= 4 && line[..4].eq_ignore_ascii_case("END:") {
+        if starts_with_ignore_case(&line, "END:") {
             depth -= 1;
             continue;
         }
@@ -1209,10 +1967,13 @@ pub fn fold_ics(unfolded: &str) -> String {
 /// `RECURRENCE-ID` is not otherwise modeled; an event without raw text is
 /// never an override (locally-created events are always masters).
 pub fn is_recurrence_override(event: &VEvent) -> bool {
+    if event.recurrence_id.is_some() {
+        return true;
+    }
     event.raw.as_deref().is_some_and(|raw| {
         unfold(raw)
             .iter()
-            .any(|line| line.len() >= 13 && line[..13].eq_ignore_ascii_case("RECURRENCE-ID"))
+            .any(|line| starts_with_ignore_case(line, "RECURRENCE-ID"))
     })
 }
 
@@ -1256,9 +2017,9 @@ pub fn patch_document(
             i += 1;
             while i < doc_lines.len() && depth > 0 {
                 let line = &doc_lines[i];
-                if line.len() >= 6 && line[..6].eq_ignore_ascii_case("BEGIN:") {
+                if starts_with_ignore_case(line, "BEGIN:") {
                     depth += 1;
-                } else if line.len() >= 4 && line[..4].eq_ignore_ascii_case("END:") {
+                } else if starts_with_ignore_case(line, "END:") {
                     depth -= 1;
                     if depth == 0 {
                         break;
@@ -1336,7 +2097,7 @@ fn patch_raw_vevent(
     let mut depth = 0i32;
     let mut inserted_replacements = false;
     for line in &lines {
-        if line.len() >= 6 && line[..6].eq_ignore_ascii_case("BEGIN:") {
+        if starts_with_ignore_case(line, "BEGIN:") {
             if depth > 0 {
                 out.push(line.clone());
             }
@@ -1346,7 +2107,7 @@ fn patch_raw_vevent(
             }
             continue;
         }
-        if line.len() >= 4 && line[..4].eq_ignore_ascii_case("END:") {
+        if starts_with_ignore_case(line, "END:") {
             depth -= 1;
             if depth == 0 {
                 if !inserted_replacements {
@@ -1626,6 +2387,7 @@ END:VEVENT\r\n";
             alarms: vec![],
             sequence: 0,
             dtstamp: None,
+            recurrence_id: None,
             raw: None,
         };
         let ics = ev.to_new_ics(utc(2024, 2, 1, 0, 0, 0));
@@ -1746,6 +2508,7 @@ END:VCALENDAR\r\n";
             alarms: vec![],
             sequence: 0,
             dtstamp: None,
+            recurrence_id: None,
             raw: None,
         }
     }
@@ -2068,5 +2831,208 @@ END:VCALENDAR\r\n";
         assert_eq!(fold_line("SUMMARY:short"), "SUMMARY:short");
         let doc = "BEGIN:VCALENDAR\r\nX:1\r\nEND:VCALENDAR\r\n";
         assert_eq!(fold_ics(doc), doc);
+    }
+
+    const OUTLOOK_DOC: &str = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nPRODID:Microsoft Exchange Server 2010\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:W. Europe Standard Time\r\nBEGIN:STANDARD\r\nDTSTART:16010101T030000\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nRRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=10\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nDTSTART:16010101T020000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200\r\nRRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=3\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nORGANIZER;CN=Boss:mailto:boss@example.com\r\nATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN=Me:mailto:me@example.com\r\nDESCRIPTION:€uro meeting\r\nUID:040000008200E00074C5B7101A82E008\r\nSUMMARY:Ünterhaltung\r\nDTSTART;TZID=W. Europe Standard Time:20240115T090000\r\nDTEND;TZID=W. Europe Standard Time:20240115T100000\r\nSEQUENCE:1\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    #[test]
+    fn parse_document_reads_method_prodid_timezones_and_resolves_windows_tzid() {
+        let doc = parse_document(OUTLOOK_DOC).unwrap();
+        assert_eq!(doc.method.as_deref(), Some("REQUEST"));
+        assert_eq!(
+            doc.prodid.as_deref(),
+            Some("Microsoft Exchange Server 2010")
+        );
+        assert_eq!(doc.timezones.len(), 1);
+        assert_eq!(doc.other_properties, vec!["VERSION:2.0".to_string()]);
+        assert_eq!(doc.events.len(), 1);
+        let ev = doc.master().unwrap();
+        // W. Europe Standard Time → Europe/Berlin: 09:00 CET = 08:00 UTC.
+        assert_eq!(ev.dtstart.utc, utc(2024, 1, 15, 8, 0, 0));
+        assert_eq!(ev.dtstart.tzid.as_deref(), Some("W. Europe Standard Time"));
+        assert_eq!(ev.summary, "Ünterhaltung");
+        assert!(ev.recurrence_id.is_none());
+        // Round trip keeps everything and folds.
+        let out = doc.to_ics();
+        assert!(out.contains("METHOD:REQUEST"));
+        assert!(out.contains("BEGIN:VTIMEZONE"));
+        assert!(out.contains("DESCRIPTION:€uro meeting"));
+        let again = parse_document(&out).unwrap();
+        assert_eq!(again.events[0].raw, doc.events[0].raw);
+    }
+
+    #[test]
+    fn unknown_tzid_falls_back_to_the_documents_vtimezone_offset() {
+        let doc_text = OUTLOOK_DOC.replace("W. Europe Standard Time", "Mars Standard Time");
+        let doc = parse_document(&doc_text).unwrap();
+        // Fixed +0100 from the STANDARD block.
+        assert_eq!(doc.events[0].dtstart.utc, utc(2024, 1, 15, 8, 0, 0));
+        // Outside a document context the same TZID is still unsupported.
+        assert!(matches!(
+            parse_vevents(
+                "BEGIN:VEVENT\r\nUID:x\r\nDTSTART;TZID=Mars Standard Time:20240115T090000\r\nEND:VEVENT\r\n"
+            ),
+            Err(CalendarError::UnsupportedTimezone(_))
+        ));
+        assert_eq!(
+            windows_tz_alias("Eastern Standard Time"),
+            Some("America/New_York")
+        );
+        assert_eq!(parse_utc_offset("+0530"), Some(19800));
+        assert_eq!(parse_utc_offset("-0800"), Some(-28800));
+        assert_eq!(parse_utc_offset("nope"), None);
+    }
+
+    #[test]
+    fn document_rewrite_helpers_touch_only_their_lines() {
+        let mut doc = parse_document(OUTLOOK_DOC).unwrap();
+        assert!(
+            doc.set_attendee_partstat("ME@example.com", "accepted", None)
+                .unwrap()
+        );
+        let raw = doc.events[0].raw.clone().unwrap();
+        assert!(
+            raw.contains(
+                "ATTENDEE;ROLE=REQ-PARTICIPANT;CN=Me;PARTSTAT=ACCEPTED:mailto:me@example.com"
+            ),
+            "{raw}"
+        );
+        assert!(!raw.contains("RSVP=TRUE"));
+        assert_eq!(
+            doc.events[0].attendees[0].partstat.as_deref(),
+            Some("ACCEPTED")
+        );
+        assert!(
+            !doc.set_attendee_partstat("nobody@example.com", "ACCEPTED", None)
+                .unwrap()
+        );
+
+        assert!(
+            doc.set_schedule_status("boss@example.com", "1.1", None)
+                .unwrap()
+        );
+        assert!(
+            doc.events[0]
+                .raw
+                .as_ref()
+                .unwrap()
+                .contains("ORGANIZER;CN=Boss;SCHEDULE-STATUS=1.1:mailto:boss@example.com")
+        );
+        doc.strip_params(&["SCHEDULE-STATUS"]).unwrap();
+        assert!(
+            !doc.events[0]
+                .raw
+                .as_ref()
+                .unwrap()
+                .contains("SCHEDULE-STATUS")
+        );
+
+        doc.set_status(EventStatus::Cancelled, Some(7)).unwrap();
+        let raw = doc.events[0].raw.clone().unwrap();
+        assert!(raw.contains("STATUS:CANCELLED"));
+        assert_eq!(raw.matches("SEQUENCE:").count(), 1);
+        assert!(raw.contains("SEQUENCE:7"));
+        assert_eq!(doc.events[0].status, EventStatus::Cancelled);
+        assert_eq!(doc.events[0].sequence, 7);
+
+        doc.touch(utc(2024, 2, 1, 12, 0, 0)).unwrap();
+        assert!(
+            doc.events[0]
+                .raw
+                .as_ref()
+                .unwrap()
+                .contains("DTSTAMP:20240201T120000Z")
+        );
+        assert!(
+            doc.events[0]
+                .raw
+                .as_ref()
+                .unwrap()
+                .contains("LAST-MODIFIED:20240201T120000Z")
+        );
+
+        doc.strip_alarms().unwrap();
+        assert!(!doc.events[0].raw.as_ref().unwrap().contains("VALARM"));
+        assert!(doc.events[0].alarms.is_empty());
+        // Untouched lines are byte-identical.
+        assert!(
+            doc.events[0]
+                .raw
+                .as_ref()
+                .unwrap()
+                .contains("DESCRIPTION:€uro meeting")
+        );
+        assert!(
+            doc.events[0]
+                .raw
+                .as_ref()
+                .unwrap()
+                .contains("UID:040000008200E00074C5B7101A82E008")
+        );
+    }
+
+    #[test]
+    fn component_index_matches_recurrence_ids_across_forms() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nDTSTART;TZID=Europe/Budapest:20240115T090000\r\nDTEND;TZID=Europe/Budapest:20240115T100000\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:s\r\nRECURRENCE-ID;TZID=Europe/Budapest:20240116T090000\r\nDTSTART;TZID=Europe/Budapest:20240116T110000\r\nDTEND;TZID=Europe/Budapest:20240116T120000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let doc = parse_document(ics).unwrap();
+        assert_eq!(doc.component_index(None), Some(0));
+        assert_eq!(doc.overrides().count(), 1);
+        let rid_utc = parse_property_time("RECURRENCE-ID:20240116T080000Z").unwrap();
+        assert_eq!(doc.component_index(Some(&rid_utc)), Some(1));
+        let other = parse_property_time("RECURRENCE-ID:20240117T080000Z").unwrap();
+        assert_eq!(doc.component_index(Some(&other)), None);
+        assert!(doc.events[1].recurrence_id.is_some());
+        assert!(is_recurrence_override(&doc.events[1]));
+    }
+
+    #[test]
+    fn multibyte_prefixes_never_panic_in_prefix_checks() {
+        // A 3-byte character straddling byte index 6 used to panic the
+        // slice-based BEGIN:/END: checks.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:m\r\nDTSTART:20240115T090000Z\r\nDTEND:20240115T100000Z\r\nSUMMARY:€€€ money\r\nDESCRIPTION:a€€b\r\nX-FOO:€€€€€€€€€\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let events = parse_vevents(ics).unwrap();
+        assert_eq!(events[0].summary, "€€€ money");
+        assert!(!is_recurrence_override(&events[0]));
+        let doc = parse_document(ics).unwrap();
+        assert_eq!(doc.events.len(), 1);
+        assert!(starts_with_ignore_case("begin:VEVENT", "BEGIN:"));
+        assert!(!starts_with_ignore_case("€€", "BEGIN:"));
+        assert!(!starts_with_ignore_case("a€€", "BEGIN:"));
+        let lines = raw_property_lines(events[0].raw.as_ref().unwrap(), &["X-FOO"]);
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn set_param_on_line_and_cal_address_email() {
+        let line = "ATTENDEE;CN=\"Doe; John\";PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:j@example.com";
+        let a = set_param_on_line(line, "PARTSTAT", Some("ACCEPTED"));
+        assert_eq!(
+            a,
+            "ATTENDEE;CN=\"Doe; John\";RSVP=TRUE;PARTSTAT=ACCEPTED:mailto:j@example.com"
+        );
+        assert_eq!(
+            set_param_on_line(&a, "RSVP", None),
+            "ATTENDEE;CN=\"Doe; John\";PARTSTAT=ACCEPTED:mailto:j@example.com"
+        );
+        assert_eq!(set_param_on_line("X:v", "P", Some("a;b")), "X;P=\"a;b\":v");
+        assert!(line_has_param(line, "rsvp"));
+        assert_eq!(cal_address_email("MAILTO:J@Example.com"), "j@example.com");
+        assert_eq!(cal_address_email("\"mailto:x@y\""), "x@y");
+        assert_eq!(
+            replace_block_property(
+                "BEGIN:VEVENT\r\nUID:x\r\nEND:VEVENT",
+                "STATUS",
+                Some("STATUS:CANCELLED")
+            ),
+            "BEGIN:VEVENT\r\nUID:x\r\nSTATUS:CANCELLED\r\nEND:VEVENT"
+        );
+        assert_eq!(
+            replace_block_property(
+                "BEGIN:VEVENT\r\nSTATUS:A\r\nSTATUS:B\r\nEND:VEVENT",
+                "STATUS",
+                None
+            ),
+            "BEGIN:VEVENT\r\nEND:VEVENT"
+        );
     }
 }

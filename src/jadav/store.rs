@@ -1918,8 +1918,8 @@ mod tests {
         let ok = validate_object(&ics("u1", "S")).unwrap();
         assert_eq!(ok.uid, "u1");
         assert!(ok.master.is_some());
-        // Unknown (Windows) TZID: accepted, but unindexed.
-        let win = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:w\r\nDTSTART;TZID=W. Europe Standard Time:20240115T090000\r\nDTEND;TZID=W. Europe Standard Time:20240115T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        // A TZID nothing can resolve (Windows names are aliased): accepted, but unindexed.
+        let win = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:w\r\nDTSTART;TZID=Mars/Olympus Mons:20240115T090000\r\nDTEND;TZID=Mars/Olympus Mons:20240115T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         let v = validate_object(win).unwrap();
         assert_eq!(v.uid, "w");
         assert!(v.master.is_none());
@@ -2380,7 +2380,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let win = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:w\r\nDTSTART;TZID=W. Europe Standard Time:20200101T090000\r\nDTEND;TZID=W. Europe Standard Time:20200101T100000\r\nSUMMARY:W\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let win = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:w\r\nDTSTART;TZID=Mars/Olympus Mons:20200101T090000\r\nDTEND;TZID=Mars/Olympus Mons:20200101T100000\r\nSUMMARY:W\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         s.put_object("personal", "w.ics", win, Precondition::None, Origin::Client)
             .unwrap()
             .unwrap();

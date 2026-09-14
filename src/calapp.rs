@@ -885,6 +885,7 @@ impl DraftEvent {
             alarms: Vec::new(),
             sequence: 0,
             dtstamp: None,
+            recurrence_id: None,
             raw: None,
         })
     }

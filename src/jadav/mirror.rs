@@ -1187,7 +1187,26 @@ pub fn spawn_mirror_thread(
             let mut cycle_error: Option<String> = None;
             let mut reauth = false;
             for (cfg, provider) in providers.iter_mut() {
-                match sync_calendar_once(&store, provider.as_mut(), cfg, &log) {
+                // A bug in one calendar's sync must not take the whole remote
+                // thread down: catch the panic, report it, keep polling.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    sync_calendar_once(&store, provider.as_mut(), cfg, &log)
+                }));
+                let outcome = match outcome {
+                    Ok(o) => o,
+                    Err(payload) => {
+                        let msg = payload
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                            .unwrap_or_else(|| "unknown panic".to_string());
+                        Err(RemoteError::Other(anyhow::anyhow!(
+                            "internal error (panic): {}",
+                            msg
+                        )))
+                    }
+                };
+                match outcome {
                     Ok(stats) => {
                         if stats != SyncStats::default() {
                             log(&format!(

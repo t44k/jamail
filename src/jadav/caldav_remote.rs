@@ -253,9 +253,9 @@ pub fn rewrite_own_partstat(
             let mut depth = 1;
             i += 1;
             while i < lines.len() && depth > 0 {
-                if lines[i].len() >= 6 && lines[i][..6].eq_ignore_ascii_case("BEGIN:") {
+                if crate::calendar::starts_with_ignore_case(&lines[i], "BEGIN:") {
                     depth += 1;
-                } else if lines[i].len() >= 4 && lines[i][..4].eq_ignore_ascii_case("END:") {
+                } else if crate::calendar::starts_with_ignore_case(&lines[i], "END:") {
                     depth -= 1;
                     if depth == 0 {
                         break;
@@ -277,9 +277,9 @@ pub fn rewrite_own_partstat(
             if matches {
                 let mut depth_in = 0i32;
                 for line in &block {
-                    if line.len() >= 6 && line[..6].eq_ignore_ascii_case("BEGIN:") {
+                    if crate::calendar::starts_with_ignore_case(line, "BEGIN:") {
                         depth_in += 1;
-                    } else if line.len() >= 4 && line[..4].eq_ignore_ascii_case("END:") {
+                    } else if crate::calendar::starts_with_ignore_case(line, "END:") {
                         depth_in -= 1;
                     }
                     let is_top_attendee = depth_in == 1
@@ -345,93 +345,7 @@ fn rewrite_lines(ics: &str, mut f: impl FnMut(&str, &str) -> Option<String>) -> 
     calendar::fold_ics(&(out.join("\r\n") + "\r\n"))
 }
 
-/// Split a content line into `(name, params, value)` at the first `:`
-/// outside double quotes; params keep their raw text (quotes included).
-fn split_line(line: &str) -> Option<(String, Vec<String>, String)> {
-    let bytes = line.as_bytes();
-    let mut in_quotes = false;
-    let mut colon = None;
-    for (i, b) in bytes.iter().enumerate() {
-        match b {
-            b'"' => in_quotes = !in_quotes,
-            b':' if !in_quotes => {
-                colon = Some(i);
-                break;
-            }
-            _ => {}
-        }
-    }
-    let colon = colon?;
-    let head = &line[..colon];
-    let value = line[colon + 1..].to_string();
-    let mut params = Vec::new();
-    let mut cur = String::new();
-    in_quotes = false;
-    let mut name = String::new();
-    let mut first = true;
-    for ch in head.chars() {
-        match ch {
-            '"' => {
-                in_quotes = !in_quotes;
-                cur.push(ch);
-            }
-            ';' if !in_quotes => {
-                if first {
-                    name = cur.clone();
-                    first = false;
-                } else {
-                    params.push(cur.clone());
-                }
-                cur.clear();
-            }
-            _ => cur.push(ch),
-        }
-    }
-    if first {
-        name = cur;
-    } else {
-        params.push(cur);
-    }
-    Some((name, params, value))
-}
-
-fn has_param(line: &str, param: &str) -> bool {
-    split_line(line).is_some_and(|(_, params, _)| {
-        params.iter().any(|p| {
-            p.split_once('=')
-                .is_some_and(|(k, _)| k.eq_ignore_ascii_case(param))
-        })
-    })
-}
-
-/// Set (or, with `None`, remove) one parameter on a content line, keeping
-/// every other parameter byte-for-byte.
-pub fn set_param(line: &str, param: &str, value: Option<&str>) -> String {
-    let Some((name, params, value_part)) = split_line(line) else {
-        return line.to_string();
-    };
-    let mut kept: Vec<String> = params
-        .into_iter()
-        .filter(|p| {
-            !p.split_once('=')
-                .is_some_and(|(k, _)| k.eq_ignore_ascii_case(param))
-        })
-        .collect();
-    if let Some(v) = value {
-        let needs_quotes = v.contains([';', ':', ',']) && !v.starts_with('"');
-        kept.push(if needs_quotes {
-            format!("{}=\"{}\"", param, v)
-        } else {
-            format!("{}={}", param, v)
-        });
-    }
-    let mut head = name;
-    for p in kept {
-        head.push(';');
-        head.push_str(&p);
-    }
-    format!("{}:{}", head, value_part)
-}
+use crate::calendar::{line_has_param as has_param, set_param_on_line as set_param};
 
 impl RemoteCalendar for CalDavRemote {
     fn list_changes(

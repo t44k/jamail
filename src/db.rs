@@ -107,6 +107,7 @@ impl CalendarEventRow {
             alarms: Vec::new(),
             sequence: self.sequence,
             dtstamp: None,
+            recurrence_id: None,
             raw: None,
         })
     }
