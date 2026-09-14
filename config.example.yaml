@@ -160,6 +160,22 @@ accounts:
       - "[Gmail]/Drafts"
       - "[Gmail]/Starred"
 
+# Optional: settings for jacal, the calendar TUI.
+jacal:
+  week_start: monday       # monday | sunday
+  # Per-calendar display settings, keyed by the calendar's URL. jacal
+  # rewrites exactly this list when you hide/show a calendar (1-9, or the
+  # C panel) or pick a colour there; the rest of this file is left as is.
+  # A calendar without an entry is shown, coloured as the server says
+  # (or from jacal's palette).
+  calendars:
+    - url: "https://cal.example.com/dav/calendars/alice@example.com/personal/"
+      visible: true
+      color: "#3366FF"
+    - url: "https://cal.example.com/dav/calendars/alice@example.com/g-corp-holidays/"
+      visible: false
+
+
 # Optional: `jadav`, the standalone self-hosted CalDAV server daemon (a
 # separate binary meant for a server host; jamail/jamaild/jacal ignore this
 # section). jadav can also run from a file that contains ONLY this section.
@@ -196,6 +212,14 @@ jadav:
       kind: google           # google | caldav
       user: alice@corp.com   # the Google account (also its primary calendar id)
       poll_interval_secs: 120
+      # Mirror every calendar on the account (shared ones, Birthdays,
+      # holidays…), not only the ones listed under `calendars:` below.
+      # Discovered calendars get slug `<slug_prefix>-<name>` (default
+      # prefix `g-<remote>`), display name `<name> (<remote>)`, and are
+      # read-write when Google grants owner/writer access. Re-listed hourly.
+      mirror_all: true
+      slug_prefix: g-corp
+      skip_calendars: ["Holidays in Hungary"]   # by name or calendar id
   calendars:
     # slug = URL path segment: /dav/calendars/<login>/<slug>/
     - slug: personal

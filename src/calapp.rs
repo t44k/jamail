@@ -15,7 +15,7 @@
 use crate::calendar::{
     EventEdits, EventStatus, EventTime, VEvent, expand_occurrences, validate_rrule,
 };
-use crate::config::WeekStart;
+use crate::config::{JacalCalendarPref, WeekStart};
 use crate::db::{CalendarEventRow, CalendarRow};
 use crate::theme;
 use chrono::{
@@ -28,6 +28,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use std::collections::HashMap;
 
 /// The timeframes `jacal` can show, declared widest-first — the order
 /// `Tab`/`Shift+Tab` walk. [`CalView::Event`] is the narrowest "range" of
@@ -198,18 +199,149 @@ fn month_grid(d: NaiveDate, week_start: WeekStart) -> Vec<[NaiveDate; 7]> {
 const WEEKEND_BG: Color = Color::Rgb(28, 22, 30);
 /// A distinct foreground for weekend day numbers/headers.
 const WEEKEND_FG: Color = Color::Rgb(210, 150, 150);
-/// A distinct background for an all-day event's line, so it reads as a
-/// banner across the day rather than blending in with timed events —
-/// applied instead of (never together with) the cell's own weekend/normal
-/// background, and overridden by the selection background when selected.
-const ALL_DAY_BG: Color = Color::Rgb(40, 55, 35);
 /// The marker glyph for a single event, used everywhere one is drawn: as
 /// the bullet on an event line in Day/3-Day/Week, and as the *entire*
 /// representation of an event in the Month cells and Year mini-months,
 /// where there is no room for text. Its color (see
 /// [`CalApp::event_dot_color`]) is what tells one event's calendar — or an
-/// unresolved sync conflict — apart from another's.
+/// unresolved sync conflict — apart from another's. Its *shape* is our
+/// own answer to the invitation (see [`Participation::glyph`]): this
+/// filled dot for going (or not invited at all), [`GLYPH_MAYBE`],
+/// [`GLYPH_UNANSWERED`] and [`GLYPH_DECLINED`] otherwise.
 const EVENT_DOT: &str = "●";
+/// An empty dot: we answered "maybe" (`PARTSTAT=TENTATIVE`).
+const GLYPH_MAYBE: &str = "○";
+/// A small hollow bullet: invited, not answered yet (`NEEDS-ACTION`).
+const GLYPH_UNANSWERED: &str = "◦";
+/// A cross: we declined, or the organizer cancelled the event.
+const GLYPH_DECLINED: &str = "✕";
+/// How much of a calendar's colour goes into its events' row background
+/// (the rest is the cell's own background), in percent. Strong enough to
+/// read the calendar from the row alone, weak enough to keep text legible.
+const EVENT_TINT_PERCENT: u32 = 28;
+/// The colours the calendar panel (`C`) cycles through for a calendar:
+/// the account palette first, then eight more distinct hues.
+pub const COLOR_PALETTE: &[Color] = &[
+    Color::Rgb(130, 170, 255), // Blue
+    Color::Rgb(200, 130, 255), // Purple
+    Color::Rgb(80, 200, 120),  // Green
+    Color::Rgb(255, 180, 80),  // Orange
+    Color::Rgb(255, 120, 120), // Red
+    Color::Rgb(100, 220, 220), // Cyan
+    Color::Rgb(255, 160, 200), // Pink
+    Color::Rgb(200, 200, 100), // Yellow
+    Color::Rgb(60, 180, 160),  // Teal
+    Color::Rgb(160, 210, 90),  // Lime
+    Color::Rgb(240, 200, 60),  // Amber
+    Color::Rgb(255, 140, 100), // Coral
+    Color::Rgb(230, 100, 200), // Magenta
+    Color::Rgb(120, 120, 240), // Indigo
+    Color::Rgb(110, 200, 255), // Sky
+    Color::Rgb(160, 170, 190), // Slate
+];
+
+/// Our own answer to an event's invitation, derived from the `ATTENDEE`
+/// line that carries one of our identities (see `CalApp::identities`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Participation {
+    /// One of our identities is the `ORGANIZER`.
+    Organizer,
+    /// `PARTSTAT=ACCEPTED`.
+    Going,
+    /// `PARTSTAT=TENTATIVE`.
+    Maybe,
+    /// `PARTSTAT=DECLINED` (or delegated away).
+    Declined,
+    /// Invited, `NEEDS-ACTION` or no `PARTSTAT` at all.
+    NotAnswered,
+    /// No attendee line of ours: a plain event, nothing to answer.
+    NotInvited,
+}
+
+impl Participation {
+    /// The word the event detail shows next to "You".
+    pub fn label(self) -> &'static str {
+        match self {
+            Participation::Organizer => "Organizer",
+            Participation::Going => "Going",
+            Participation::Maybe => "Maybe",
+            Participation::Declined => "Can't go",
+            Participation::NotAnswered => "Not answered",
+            Participation::NotInvited => "",
+        }
+    }
+
+    /// The event marker's shape for this answer.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Participation::Organizer | Participation::Going | Participation::NotInvited => {
+                EVENT_DOT
+            }
+            Participation::Maybe => GLYPH_MAYBE,
+            Participation::NotAnswered => GLYPH_UNANSWERED,
+            Participation::Declined => GLYPH_DECLINED,
+        }
+    }
+}
+
+/// Our participation in `event` given our lower-cased `identities`.
+pub fn participation_of(event: &VEvent, identities: &[String]) -> Participation {
+    let is_ours = |addr: &str| {
+        let addr = crate::calendar::cal_address_email(addr);
+        identities.iter().any(|i| i.eq_ignore_ascii_case(&addr))
+    };
+    if event.organizer.as_deref().is_some_and(is_ours) {
+        return Participation::Organizer;
+    }
+    let Some(me) = event.attendees.iter().find(|a| is_ours(&a.email)) else {
+        return Participation::NotInvited;
+    };
+    match me
+        .partstat
+        .as_deref()
+        .map(str::to_ascii_uppercase)
+        .as_deref()
+    {
+        Some("ACCEPTED") => Participation::Going,
+        Some("TENTATIVE") => Participation::Maybe,
+        Some("DECLINED") | Some("DELEGATED") => Participation::Declined,
+        _ => Participation::NotAnswered,
+    }
+}
+
+/// `color` blended `percent`% into `bg` — the row background of an event
+/// of that calendar. Only RGB colours can be blended; anything else keeps
+/// the plain `bg`.
+pub fn tint(color: Color, bg: Color, percent: u32) -> Color {
+    match (color, bg) {
+        (Color::Rgb(r, g, b), Color::Rgb(br, bgc, bb)) => {
+            let p = percent.min(100);
+            let mix = |c: u8, base: u8| -> u8 {
+                ((u32::from(base) * (100 - p) + u32::from(c) * p) / 100) as u8
+            };
+            Color::Rgb(mix(r, br), mix(g, bgc), mix(b, bb))
+        }
+        _ => bg,
+    }
+}
+
+/// `#rrggbb` (or Apple's `#rrggbbaa`, alpha ignored) to a colour.
+pub fn parse_hex_color(s: &str) -> Option<Color> {
+    let hex = s.trim().trim_start_matches('#');
+    if hex.len() != 6 && hex.len() != 8 {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some(Color::Rgb(byte(0)?, byte(2)?, byte(4)?))
+}
+
+/// The `#rrggbb` form of an RGB colour, for the config file.
+pub fn color_hex(c: Color) -> Option<String> {
+    match c {
+        Color::Rgb(r, g, b) => Some(format!("#{:02X}{:02X}{:02X}", r, g, b)),
+        _ => None,
+    }
+}
 /// Time labels in an *empty* slot of a Day/3-Day/Week time grid:
 /// deliberately very dim, so the grid reads as a ruler behind the events
 /// rather than as content competing with them.
@@ -554,6 +686,11 @@ pub struct CalendarVisibility {
     pub url: String,
     pub display_name: String,
     pub visible: bool,
+    /// The colour chosen in the calendar panel (persisted in
+    /// `jacal.calendars`); `None` = server colour, else palette.
+    pub color: Option<Color>,
+    /// The colour the CalDAV server advertises (`calendar-color`).
+    pub server_color: Option<Color>,
 }
 
 /// Everything that makes up "where you were looking": not just the view,
@@ -579,6 +716,8 @@ pub enum CalMode {
     ConfirmDelete,
     /// The accept/tentative/decline prompt — see [`PendingRsvp`].
     Rsvp,
+    /// The calendar list panel (`C`): show/hide and recolour calendars.
+    Calendars,
 }
 
 /// The event a [`CalMode::ConfirmDelete`] prompt is about, captured when
@@ -958,6 +1097,16 @@ pub struct CalApp {
     /// `caldav.login` and every `senders` entry. An event is answerable
     /// when one of them is on its `ATTENDEE` list.
     pub identities: Vec<String>,
+    /// `jacal.calendars` from the config file: what the user hid and
+    /// which colours they picked, kept in sync with `calendars` and
+    /// written back by `jacal` whenever [`Self::take_prefs_dirty`] says so.
+    pub calendar_prefs: Vec<JacalCalendarPref>,
+    prefs_dirty: bool,
+    /// Cursor row in the calendar panel ([`CalMode::Calendars`]).
+    pub calendar_cursor: usize,
+    /// Our answer per loaded event (by row id), computed once per load so
+    /// rendering never re-parses ICS — see [`participation_of`].
+    participation: HashMap<i64, Participation>,
     pub status: Option<String>,
     pub ipc_connected: bool,
 }
@@ -981,6 +1130,10 @@ impl CalApp {
             pending_delete: None,
             pending_rsvp: None,
             identities: Vec::new(),
+            calendar_prefs: Vec::new(),
+            prefs_dirty: false,
+            calendar_cursor: 0,
+            participation: HashMap::new(),
             status: None,
             ipc_connected: false,
         }
@@ -1240,7 +1393,10 @@ impl CalApp {
             .iter()
             .position(|c| c.url == calendar_url)
             .unwrap_or(0);
-        theme::ACCOUNT_COLORS[idx % theme::ACCOUNT_COLORS.len()]
+        let cal = self.calendars.get(idx);
+        cal.and_then(|c| c.color)
+            .or_else(|| cal.and_then(|c| c.server_color))
+            .unwrap_or(theme::ACCOUNT_COLORS[idx % theme::ACCOUNT_COLORS.len()])
     }
 
     /// Replace the calendar list, preserving each existing calendar's
@@ -1251,18 +1407,150 @@ impl CalApp {
         self.calendars = rows
             .into_iter()
             .map(|r| {
-                let visible = previous
-                    .iter()
-                    .find(|p| p.url == r.url)
+                let known = previous.iter().find(|p| p.url == r.url);
+                let pref = self.calendar_prefs.iter().find(|p| p.url == r.url);
+                let visible = known
                     .map(|p| p.visible)
+                    .or(pref.map(|p| p.visible))
                     .unwrap_or(true);
+                let color = known.map(|p| p.color).unwrap_or_else(|| {
+                    pref.and_then(|p| p.color.as_deref())
+                        .and_then(parse_hex_color)
+                });
                 CalendarVisibility {
+                    server_color: r.color.as_deref().and_then(parse_hex_color),
                     url: r.url,
                     display_name: r.display_name,
                     visible,
+                    color,
                 }
             })
             .collect();
+        if self.calendar_cursor >= self.calendars.len() {
+            self.calendar_cursor = self.calendars.len().saturating_sub(1);
+        }
+    }
+
+    /// Install the `jacal.calendars` settings from the config file. Call
+    /// before the first [`Self::set_calendars`]; later calls re-apply
+    /// visibility and colour to every calendar named in `prefs`.
+    pub fn set_calendar_prefs(&mut self, prefs: Vec<JacalCalendarPref>) {
+        self.calendar_prefs = prefs;
+        for cal in &mut self.calendars {
+            if let Some(p) = self.calendar_prefs.iter().find(|p| p.url == cal.url) {
+                cal.visible = p.visible;
+                cal.color = p.color.as_deref().and_then(parse_hex_color);
+            }
+        }
+        self.refilter();
+    }
+
+    /// Mirror one calendar's current visibility and colour into
+    /// [`Self::calendar_prefs`] and flag the file for saving.
+    fn record_pref(&mut self, url: &str) {
+        let Some(cal) = self.calendars.iter().find(|c| c.url == url) else {
+            return;
+        };
+        let entry = JacalCalendarPref {
+            url: cal.url.clone(),
+            visible: cal.visible,
+            color: cal.color.and_then(color_hex),
+        };
+        match self.calendar_prefs.iter_mut().find(|p| p.url == url) {
+            Some(p) => *p = entry,
+            None => self.calendar_prefs.push(entry),
+        }
+        self.prefs_dirty = true;
+    }
+
+    /// Whether [`Self::calendar_prefs`] changed since the last call — the
+    /// caller then writes them to the config file.
+    pub fn take_prefs_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.prefs_dirty)
+    }
+
+    /// Give a calendar the next (`step = 1`) or previous (`-1`) palette
+    /// colour, starting from its current effective colour when that is a
+    /// palette entry.
+    pub fn cycle_calendar_color(&mut self, url: &str, step: i32) {
+        let current = self.calendar_color(url);
+        let n = COLOR_PALETTE.len() as i32;
+        let next = match COLOR_PALETTE.iter().position(|&c| c == current) {
+            Some(i) => (i as i32 + step).rem_euclid(n),
+            None if step >= 0 => 0,
+            None => n - 1,
+        };
+        if let Some(c) = self.calendars.iter_mut().find(|c| c.url == url) {
+            c.color = Some(COLOR_PALETTE[next as usize]);
+        }
+        self.record_pref(url);
+    }
+
+    /// Drop a calendar's chosen colour (back to the server's, else palette).
+    pub fn clear_calendar_color(&mut self, url: &str) {
+        if let Some(c) = self.calendars.iter_mut().find(|c| c.url == url) {
+            c.color = None;
+        }
+        self.record_pref(url);
+    }
+
+    pub fn begin_calendar_panel(&mut self) {
+        self.calendar_cursor = self
+            .calendar_cursor
+            .min(self.calendars.len().saturating_sub(1));
+        self.mode = CalMode::Calendars;
+    }
+
+    pub fn close_calendar_panel(&mut self) {
+        self.mode = CalMode::Browse;
+    }
+
+    pub fn calendar_panel_move(&mut self, delta: i32) {
+        if self.calendars.is_empty() {
+            return;
+        }
+        let n = self.calendars.len() as i32;
+        self.calendar_cursor = (self.calendar_cursor as i32 + delta).rem_euclid(n) as usize;
+    }
+
+    /// The calendar under the panel cursor.
+    pub fn panel_calendar_url(&self) -> Option<String> {
+        self.calendars
+            .get(self.calendar_cursor)
+            .map(|c| c.url.clone())
+    }
+
+    /// Our answer to `ev`'s invitation (cached per row id at load time).
+    pub fn participation(&self, ev: &CalendarEventRow) -> Participation {
+        self.participation
+            .get(&ev.id)
+            .copied()
+            .unwrap_or(Participation::NotInvited)
+    }
+
+    /// The marker shape for `ev`: a cross for a cancelled event, else the
+    /// shape of our own answer.
+    fn event_glyph(&self, ev: &CalendarEventRow) -> &'static str {
+        if ev.status.eq_ignore_ascii_case("CANCELLED") {
+            GLYPH_DECLINED
+        } else {
+            self.participation(ev).glyph()
+        }
+    }
+
+    fn recompute_participation(&mut self) {
+        let mut map: HashMap<i64, Participation> = HashMap::new();
+        for row in &self.all_events {
+            if map.contains_key(&row.id) {
+                continue;
+            }
+            let p = row
+                .to_vevent()
+                .map(|e| participation_of(&e, &self.identities))
+                .unwrap_or(Participation::NotInvited);
+            map.insert(row.id, p);
+        }
+        self.participation = map;
     }
 
     /// Toggle a calendar's visibility and immediately re-filter the
@@ -1271,6 +1559,7 @@ impl CalApp {
         if let Some(c) = self.calendars.iter_mut().find(|c| c.url == url) {
             c.visible = !c.visible;
         }
+        self.record_pref(url);
         self.refilter();
     }
 
@@ -1286,6 +1575,7 @@ impl CalApp {
     /// calendars (see [`Self::refilter`]), clamping the current selection.
     pub fn set_events(&mut self, events: Vec<CalendarEventRow>) {
         self.all_events = events;
+        self.recompute_participation();
         self.refilter();
     }
 
@@ -1549,8 +1839,82 @@ impl CalApp {
             }
             CalMode::ConfirmDelete => self.render_delete_confirm(frame, area),
             CalMode::Rsvp => self.render_rsvp_prompt(frame, area),
+            CalMode::Calendars => self.render_calendar_panel(frame, area),
             CalMode::Browse => {}
         }
+    }
+
+    /// The calendar panel: one row per calendar with its glyph in its
+    /// effective colour, name, shown/hidden state and where the colour
+    /// comes from. Changes here are saved to `jacal.calendars` by `jacal`.
+    fn render_calendar_panel(&self, frame: &mut Frame, area: Rect) {
+        let rows = self.calendars.len().max(1) as u16;
+        let popup = centered_rect(
+            72.min(area.width.saturating_sub(2)),
+            (rows + 4).min(area.height.saturating_sub(2)),
+            area,
+        );
+        frame.render_widget(Clear, popup);
+        let block = Block::default()
+            .title(" Calendars ")
+            .borders(Borders::ALL)
+            .style(
+                Style::default()
+                    .bg(theme::HELP_BG)
+                    .fg(theme::THREAD_INDICATOR),
+            );
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.calendars.len() + 2);
+        if self.calendars.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No calendars discovered yet — try 's' to sync.",
+                Style::default().fg(theme::FG_DIM),
+            )));
+        }
+        let name_width = (inner.width as usize).saturating_sub(30).max(8);
+        for (i, cal) in self.calendars.iter().enumerate() {
+            let color = self.calendar_color(&cal.url);
+            let bg = if i == self.calendar_cursor {
+                theme::BG_SELECTED
+            } else {
+                theme::HELP_BG
+            };
+            let source = match (cal.color, cal.server_color) {
+                (Some(c), _) => color_hex(c).unwrap_or_else(|| "custom".to_string()),
+                (None, Some(_)) => "server".to_string(),
+                (None, None) => "palette".to_string(),
+            };
+            let name = truncate_str(&cal.display_name, name_width);
+            let pad = name_width.saturating_sub(name.chars().count());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", if i < 9 { (b'1' + i as u8) as char } else { ' ' }),
+                    Style::default().fg(theme::FG_DIM).bg(bg),
+                ),
+                Span::styled(EVENT_DOT, Style::default().fg(color).bg(bg)),
+                Span::styled(
+                    format!(" {}{} ", name, " ".repeat(pad)),
+                    Style::default().fg(theme::FG_TEXT).bg(bg),
+                ),
+                Span::styled(
+                    format!("{:<7}", if cal.visible { "shown" } else { "hidden" }),
+                    Style::default()
+                        .fg(if cal.visible {
+                            theme::STATUS_SUCCESS
+                        } else {
+                            theme::FG_DIM
+                        })
+                        .bg(bg),
+                ),
+                Span::styled(format!(" {:<8}", source), Style::default().fg(color).bg(bg)),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            "j/k move   space show/hide   c/→ next colour   ← previous   x server colour   Esc close",
+            Style::default().fg(theme::FG_DIM),
+        )));
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -1670,7 +2034,7 @@ impl CalApp {
             .take(shown)
             .map(|&i| {
                 Span::styled(
-                    EVENT_DOT,
+                    self.event_glyph(&self.events[i]),
                     Style::default()
                         .fg(self.event_dot_color(&self.events[i]))
                         .bg(bg),
@@ -1755,14 +2119,14 @@ impl CalApp {
     /// ellipsis rather than wrapped -- wrapping would blow out the fixed
     /// line budget every cell/column is laid out around.
     /// The dot's color is stable per calendar (see
-    /// [`Self::calendar_color`]); `selected` highlights the whole line
-    /// with a background, the same way a selected row does elsewhere in
-    /// this crate. An all-day event instead gets [`ALL_DAY_BG`] (unless
-    /// selected, which always wins) so it reads as a banner distinct from
-    /// timed events; anything else explicitly uses `cell_bg` (the
-    /// enclosing day cell's own weekend/normal background) rather than
-    /// relying on transparency, so the dot's tiny background always
-    /// matches its surroundings too.
+    /// [`Self::calendar_color`]) and its shape is our answer (see
+    /// [`Self::event_glyph`]); the whole line — padded to the full cell
+    /// width — sits on that colour [`tint`]ed into `cell_bg` (the
+    /// enclosing day cell's own weekend/normal background), so a row reads
+    /// as its calendar even where the glyph is out of view. `selected`
+    /// replaces the tint with the selection background, the same way a
+    /// selected row does elsewhere in this crate. A cancelled event is
+    /// struck through, a declined one dimmed.
     fn event_cell(
         &self,
         ev: &CalendarEventRow,
@@ -1814,19 +2178,31 @@ impl CalApp {
         let text = truncate_str(&text, avail);
         let line_bg = if selected {
             theme::BG_SELECTED
-        } else if ev.all_day {
-            ALL_DAY_BG
         } else {
-            cell_bg
+            self.event_row_bg(ev, cell_bg)
         };
-        let base_style = Style::default().bg(line_bg).fg(theme::SUBJECT_COLOR);
+        let mut base_style = Style::default().bg(line_bg).fg(theme::SUBJECT_COLOR);
+        if ev.status.eq_ignore_ascii_case("CANCELLED") {
+            base_style = base_style.add_modifier(Modifier::CROSSED_OUT);
+        } else if self.participation(ev) == Participation::Declined {
+            base_style = base_style.add_modifier(Modifier::DIM);
+        }
         let pad = avail.saturating_sub(text.chars().count());
         vec![
-            Span::styled(EVENT_DOT, Style::default().fg(dot_color).bg(line_bg)),
+            Span::styled(
+                self.event_glyph(ev),
+                Style::default().fg(dot_color).bg(line_bg),
+            ),
             Span::styled(" ", base_style),
             Span::styled(text, base_style),
             Span::styled(" ".repeat(pad), base_style),
         ]
+    }
+
+    /// The row background of `ev`: its calendar colour tinted into the
+    /// cell's own background (see [`EVENT_TINT_PERCENT`]).
+    fn event_row_bg(&self, ev: &CalendarEventRow, cell_bg: Color) -> Color {
+        tint(self.event_dot_color(ev), cell_bg, EVENT_TINT_PERCENT)
     }
 
     /// The same cell as a standalone full-width line.
@@ -2047,7 +2423,7 @@ impl CalApp {
                     let bg = if selected == Some(pos) {
                         theme::BG_SELECTED
                     } else {
-                        cell_bg
+                        self.event_row_bg(&self.events[idx], cell_bg)
                     };
                     line.push(Span::styled(
                         SLOT_CONTINUATION,
@@ -2059,15 +2435,29 @@ impl CalApp {
                     continue;
                 }
                 // A run of empty columns up to the next thing on this row.
+                // It belongs to the event whose bar is nearest on the left,
+                // so a running event fills its column in its own tint, not
+                // just its one-character bar.
                 let next = (col + 1..width as usize)
                     .find(|&c| {
                         owner.is_some_and(|o| o.indent == c)
                             || (c < bar_limit && bar_at(c).is_some())
                     })
                     .unwrap_or(width as usize);
+                let fill_bg = (0..col.min(bar_limit))
+                    .rev()
+                    .find_map(bar_at)
+                    .map(|(pos, idx)| {
+                        if selected == Some(pos) {
+                            theme::BG_SELECTED
+                        } else {
+                            self.event_row_bg(&self.events[idx], cell_bg)
+                        }
+                    })
+                    .unwrap_or(cell_bg);
                 line.push(Span::styled(
                     " ".repeat(next - col),
-                    Style::default().bg(cell_bg),
+                    Style::default().bg(fill_bg),
                 ));
                 col = next;
             }
@@ -2522,7 +2912,10 @@ impl CalApp {
 
         let mut lines = vec![
             Line::from(vec![
-                Span::styled(EVENT_DOT, Style::default().fg(self.event_dot_color(ev))),
+                Span::styled(
+                    self.event_glyph(ev),
+                    Style::default().fg(self.event_dot_color(ev)),
+                ),
                 Span::raw(" "),
                 Span::styled(
                     ev.summary.clone(),
@@ -2572,7 +2965,38 @@ impl CalApp {
         if let Some(rrule) = &ev.rrule {
             lines.push(row("Repeats", rrule.clone()));
         }
-        lines.push(row("Status", ev.status.clone()));
+        let mine = self.participation(ev);
+        if mine != Participation::NotInvited {
+            let (label, color) = match mine {
+                Participation::Going | Participation::Organizer => {
+                    (mine.label().to_string(), theme::STATUS_SUCCESS)
+                }
+                Participation::Maybe => (mine.label().to_string(), theme::STATUS_PENDING),
+                Participation::Declined => (mine.label().to_string(), theme::STATUS_ERROR),
+                Participation::NotAnswered => (
+                    format!("{} — r to respond", mine.label()),
+                    theme::STATUS_PENDING,
+                ),
+                Participation::NotInvited => unreachable!(),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<12}", "You"),
+                    Style::default().fg(theme::DETAIL_HEADER_LABEL),
+                ),
+                Span::styled(
+                    format!("{} {}", mine.glyph(), label),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+        let status_label = match ev.status.to_ascii_uppercase().as_str() {
+            "CONFIRMED" => "Confirmed".to_string(),
+            "TENTATIVE" => "Tentative".to_string(),
+            "CANCELLED" => "Cancelled".to_string(),
+            other => other.to_string(),
+        };
+        lines.push(row("Status", status_label));
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{:<12}", "Sync"),
@@ -2605,7 +3029,7 @@ impl CalApp {
         let text = if let Some(status) = &self.status {
             status.clone()
         } else {
-            "hjkl move  [/] jump period  Tab/S-Tab narrow/widen  Enter zoom  Esc back  t today  n new  e edit  d del  r rsvp  1-9 cal  s sync  q quit"
+            "hjkl move  [/] jump period  Tab/S-Tab narrow/widen  Enter zoom  Esc back  t today  n new  e edit  d del  r rsvp  C cals  1-9 cal  s sync  q quit"
                 .to_string()
         };
         frame.render_widget(
@@ -4073,5 +4497,170 @@ mod tests {
         assert_eq!(draft.summary, "Original");
         assert_eq!(draft.location, "Room B");
         assert_eq!(draft.editing_local_id, Some(id));
+    }
+
+    #[test]
+    fn calendar_color_prefers_user_then_server_then_palette_and_persists_prefs() {
+        let mut app = test_app();
+        let mut server = cal_row("c2", "Two");
+        server.color = Some("#112233".to_string());
+        app.set_calendar_prefs(vec![JacalCalendarPref {
+            url: "c1".to_string(),
+            visible: false,
+            color: Some("#FF0000".to_string()),
+        }]);
+        app.set_calendars(vec![cal_row("c1", "One"), server, cal_row("c3", "Three")]);
+        assert_eq!(app.calendar_color("c1"), Color::Rgb(255, 0, 0));
+        assert!(!app.is_calendar_visible("c1"), "hidden by config");
+        assert_eq!(app.calendar_color("c2"), Color::Rgb(0x11, 0x22, 0x33));
+        assert_eq!(app.calendar_color("c3"), theme::ACCOUNT_COLORS[2]);
+        assert!(!app.take_prefs_dirty(), "loading config is not a change");
+
+        app.toggle_calendar_visible("c3");
+        assert!(app.take_prefs_dirty());
+        assert!(!app.take_prefs_dirty());
+        let p = app.calendar_prefs.iter().find(|p| p.url == "c3").unwrap();
+        assert!(!p.visible);
+        assert_eq!(p.color, None);
+
+        app.cycle_calendar_color("c2", 1);
+        assert_eq!(
+            app.calendar_color("c2"),
+            COLOR_PALETTE[0],
+            "not a palette colour: start at 0"
+        );
+        app.cycle_calendar_color("c2", 1);
+        assert_eq!(app.calendar_color("c2"), COLOR_PALETTE[1]);
+        app.cycle_calendar_color("c2", -2);
+        assert_eq!(
+            app.calendar_color("c2"),
+            COLOR_PALETTE[COLOR_PALETTE.len() - 1]
+        );
+        assert_eq!(
+            app.calendar_prefs
+                .iter()
+                .find(|p| p.url == "c2")
+                .unwrap()
+                .color
+                .as_deref(),
+            color_hex(COLOR_PALETTE[COLOR_PALETTE.len() - 1]).as_deref()
+        );
+        app.clear_calendar_color("c2");
+        assert_eq!(app.calendar_color("c2"), Color::Rgb(0x11, 0x22, 0x33));
+        assert!(app.take_prefs_dirty());
+
+        // A re-discovery keeps what the user set.
+        app.set_calendars(vec![cal_row("c1", "One"), cal_row("c3", "Three")]);
+        assert!(!app.is_calendar_visible("c1"));
+        assert_eq!(app.calendar_color("c1"), Color::Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn hex_colours_and_tints_round_trip() {
+        assert_eq!(
+            parse_hex_color("#3366FF"),
+            Some(Color::Rgb(0x33, 0x66, 0xFF))
+        );
+        assert_eq!(
+            parse_hex_color("3366ff"),
+            Some(Color::Rgb(0x33, 0x66, 0xFF))
+        );
+        assert_eq!(
+            parse_hex_color("#3366FFAA"),
+            Some(Color::Rgb(0x33, 0x66, 0xFF))
+        );
+        assert_eq!(parse_hex_color("blue"), None);
+        assert_eq!(color_hex(Color::Rgb(1, 2, 255)).as_deref(), Some("#0102FF"));
+        assert_eq!(color_hex(Color::Red), None);
+        assert_eq!(
+            tint(Color::Rgb(100, 200, 0), Color::Rgb(0, 0, 100), 50),
+            Color::Rgb(50, 100, 50)
+        );
+        assert_eq!(
+            tint(Color::Rgb(100, 200, 0), Color::Rgb(0, 0, 100), 0),
+            Color::Rgb(0, 0, 100)
+        );
+        assert_eq!(
+            tint(Color::Red, Color::Rgb(1, 2, 3), 50),
+            Color::Rgb(1, 2, 3)
+        );
+    }
+
+    #[test]
+    fn participation_follows_our_attendee_line_and_drives_the_glyph() {
+        let ev = |organizer: &str, partstat: Option<&str>| {
+            let att = match partstat {
+                Some(p) => format!("ATTENDEE;PARTSTAT={p}:mailto:Me@Example.com\r\n"),
+                None => "ATTENDEE:mailto:me@example.com\r\n".to_string(),
+            };
+            crate::calendar::parse_vevents(&format!(
+                "BEGIN:VEVENT\r\nUID:p\r\nDTSTART:20240115T120000Z\r\nDTEND:20240115T130000Z\r\nSUMMARY:p\r\nORGANIZER:mailto:{organizer}\r\n{att}END:VEVENT\r\n"
+            ))
+            .unwrap()
+            .remove(0)
+        };
+        let ids = vec!["me@example.com".to_string()];
+        assert_eq!(
+            participation_of(&ev("boss@x", Some("ACCEPTED")), &ids),
+            Participation::Going
+        );
+        assert_eq!(
+            participation_of(&ev("boss@x", Some("tentative")), &ids),
+            Participation::Maybe
+        );
+        assert_eq!(
+            participation_of(&ev("boss@x", Some("DECLINED")), &ids),
+            Participation::Declined
+        );
+        assert_eq!(
+            participation_of(&ev("boss@x", Some("NEEDS-ACTION")), &ids),
+            Participation::NotAnswered
+        );
+        assert_eq!(
+            participation_of(&ev("boss@x", None), &ids),
+            Participation::NotAnswered
+        );
+        assert_eq!(
+            participation_of(&ev("me@example.com", Some("ACCEPTED")), &ids),
+            Participation::Organizer
+        );
+        assert_eq!(
+            participation_of(&ev("boss@x", Some("ACCEPTED")), &[]),
+            Participation::NotInvited
+        );
+        assert_eq!(Participation::Maybe.glyph(), GLYPH_MAYBE);
+        assert_eq!(Participation::NotAnswered.glyph(), GLYPH_UNANSWERED);
+        assert_eq!(Participation::Declined.glyph(), GLYPH_DECLINED);
+        assert_eq!(Participation::Going.glyph(), EVENT_DOT);
+        assert_eq!(Participation::Declined.label(), "Can't go");
+
+        // Loaded events get their answer cached by row id, cancelled wins.
+        let mut app = test_app();
+        app.identities = ids;
+        let mut row = invited_row("boss@example.com", "TENTATIVE");
+        row.id = 7;
+        let mut cancelled = invited_row("boss@example.com", "ACCEPTED");
+        cancelled.id = 8;
+        cancelled.status = "CANCELLED".to_string();
+        app.set_events(vec![row.clone(), cancelled.clone()]);
+        assert_eq!(app.participation(&row), Participation::Maybe);
+        assert_eq!(app.event_glyph(&row), GLYPH_MAYBE);
+        assert_eq!(app.participation(&cancelled), Participation::Going);
+        assert_eq!(app.event_glyph(&cancelled), GLYPH_DECLINED);
+    }
+
+    #[test]
+    fn calendar_panel_cursor_wraps_and_closes() {
+        let mut app = test_app();
+        app.set_calendars(vec![cal_row("c1", "One"), cal_row("c2", "Two")]);
+        app.begin_calendar_panel();
+        assert_eq!(app.mode, CalMode::Calendars);
+        assert_eq!(app.panel_calendar_url().as_deref(), Some("c1"));
+        app.calendar_panel_move(-1);
+        assert_eq!(app.panel_calendar_url().as_deref(), Some("c2"));
+        app.calendar_panel_move(1);
+        assert_eq!(app.panel_calendar_url().as_deref(), Some("c1"));
+        app.close_calendar_panel();
+        assert_eq!(app.mode, CalMode::Browse);
     }
 }

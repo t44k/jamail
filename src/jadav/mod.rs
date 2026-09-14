@@ -37,7 +37,9 @@ use crate::caldav::CalDavClient;
 use crate::config::AuthConfig;
 use anyhow::{Context, Result, bail};
 use config::{CalendarConfig, JadavConfig, Provider, RemoteConfig, RemoteKind};
-use mirror::{CalendarMirrorCfg, MirrorControl, MirrorHub, ProviderFactory};
+use google::GCalendarListEntry;
+use mirror::{CalendarMirrorCfg, Discoverer, MirrorControl, MirrorHub, ProviderFactory};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -370,10 +372,222 @@ fn mirror_cfgs(cfg: &JadavConfig, remote_name: &str) -> Result<Vec<CalendarMirro
         .collect())
 }
 
+/// Mirror configs for the calendars `mirror_all` discovered on
+/// `remote_name` and recorded in the store, so a restart mirrors them
+/// straight away instead of waiting for the next calendar-list lookup.
+fn discovered_mirror_cfgs(
+    cfg: &JadavConfig,
+    store: &Store,
+    remote_name: &str,
+) -> Result<Vec<CalendarMirrorCfg>> {
+    let remote = cfg
+        .remotes
+        .get(remote_name)
+        .with_context(|| format!("no remote {:?}", remote_name))?;
+    let history_days = remote.history_days.unwrap_or(cfg.scheduling.history_days);
+    Ok(store
+        .list_discovered_calendars(remote_name)?
+        .into_iter()
+        .map(|row| CalendarMirrorCfg {
+            remote_calendar: row.remote_calendar_id.clone().unwrap_or_default(),
+            slug: row.slug,
+            identity: row.identity,
+            two_way: row.two_way,
+            send_via: row.send_via,
+            history_days,
+        })
+        .collect())
+}
+
+/// Configured plus discovered mirror configs for one remote.
+fn all_mirror_cfgs(
+    cfg: &JadavConfig,
+    store: &Store,
+    remote_name: &str,
+) -> Result<Vec<CalendarMirrorCfg>> {
+    let mut cals = mirror_cfgs(cfg, remote_name)?;
+    for extra in discovered_mirror_cfgs(cfg, store, remote_name)? {
+        if !cals.iter().any(|c| c.slug == extra.slug) {
+            cals.push(extra);
+        }
+    }
+    Ok(cals)
+}
+
+/// A URL-safe slug fragment from a calendar name: lower-case ASCII
+/// letters and digits, runs of anything else collapsed to one `-`, at most
+/// 40 characters, never empty.
+pub fn slugify(name: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+        if out.len() >= 40 {
+            break;
+        }
+    }
+    let out = out.trim_end_matches('-').to_string();
+    if out.is_empty() {
+        "calendar".to_string()
+    } else {
+        out
+    }
+}
+
+/// Whether a configured calendar already covers Google calendar `id` of
+/// `remote_name` (so `mirror_all` must leave it alone).
+fn configured_covers(cfg: &JadavConfig, remote_name: &str, entry: &GCalendarListEntry) -> bool {
+    let remote_user = cfg
+        .remotes
+        .get(remote_name)
+        .and_then(|r| r.user.as_deref())
+        .map(str::to_ascii_lowercase);
+    cfg.calendars.iter().any(|c| {
+        if c.remote.as_deref() != Some(remote_name) {
+            return false;
+        }
+        // An explicit calendar without `remote_calendar` means the primary.
+        let configured_id = c
+            .remote_calendar
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .or_else(|| remote_user.clone());
+        let is_primary =
+            entry.primary == Some(true) && configured_id.as_deref() == remote_user.as_deref();
+        configured_id.as_deref() == Some(entry.id.to_ascii_lowercase().as_str()) || is_primary
+    })
+}
+
+/// The store spec `mirror_all` creates for one Google calendar-list
+/// entry, or `None` when the entry is not mirrored: deleted or hidden on
+/// Google, free/busy-only, excluded by `skip_calendars`, or already
+/// configured explicitly. `taken` holds the slugs already in use; a
+/// clash gets a short hash of the remote id appended.
+pub fn discovered_spec(
+    cfg: &JadavConfig,
+    remote_name: &str,
+    entry: &GCalendarListEntry,
+    taken: &HashSet<String>,
+) -> Option<CalendarSpec> {
+    let remote = cfg.remotes.get(remote_name)?;
+    if entry.deleted == Some(true) || entry.hidden == Some(true) {
+        return None;
+    }
+    if !matches!(
+        entry.access_role.as_deref(),
+        Some("owner") | Some("writer") | Some("reader")
+    ) {
+        return None;
+    }
+    let name = entry.name();
+    if remote
+        .skip_calendars
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(&entry.id) || s.eq_ignore_ascii_case(name))
+    {
+        return None;
+    }
+    if configured_covers(cfg, remote_name, entry) {
+        return None;
+    }
+    let prefix = remote
+        .slug_prefix
+        .clone()
+        .unwrap_or_else(|| format!("g-{}", slugify(remote_name)));
+    let base = format!("{}-{}", prefix, slugify(name));
+    let slug = if taken.contains(&base) {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(entry.id.as_bytes());
+        format!(
+            "{}-{:02x}{:02x}{:02x}",
+            base, digest[0], digest[1], digest[2]
+        )
+    } else {
+        base
+    };
+    let identity = remote
+        .user
+        .as_deref()
+        .map(|u| u.to_ascii_lowercase())
+        .or_else(|| cfg.primary_identity())?;
+    Some(CalendarSpec {
+        slug,
+        display_name: format!("{} ({})", name, remote_name),
+        description: entry.description.clone().filter(|d| !d.trim().is_empty()),
+        color: entry.background_color.clone(),
+        timezone: None,
+        identity,
+        provider: Provider::Google,
+        remote_account: Some(remote_name.to_string()),
+        remote_calendar_id: Some(entry.id.clone()),
+        two_way: entry.writable(),
+        send_via: cfg.scheduling.send_via,
+        is_default_for_identity: false,
+    })
+}
+
+/// Apply one calendar-list lookup: record every newly discovered calendar
+/// in the store and return the mirror configs of all discovered ones.
+fn apply_discovery(
+    cfg: &JadavConfig,
+    store: &Store,
+    remote_name: &str,
+    entries: &[GCalendarListEntry],
+) -> Result<Vec<CalendarMirrorCfg>> {
+    let existing = store.list_calendars()?;
+    let mut taken: HashSet<String> = existing.iter().map(|c| c.slug.clone()).collect();
+    for entry in entries {
+        // Already known under some slug (configured or discovered before).
+        if existing.iter().any(|c| {
+            c.remote_account.as_deref() == Some(remote_name)
+                && c.remote_calendar_id.as_deref() == Some(entry.id.as_str())
+        }) {
+            continue;
+        }
+        if let Some(spec) = discovered_spec(cfg, remote_name, entry, &taken) {
+            taken.insert(spec.slug.clone());
+            store.upsert_discovered_calendar(&spec)?;
+        }
+    }
+    discovered_mirror_cfgs(cfg, store, remote_name)
+}
+
 /// Build the per-calendar provider factory for one remote. Providers are
 /// created on the mirror thread; Google calendars of one remote share a
 /// single token holder.
-fn provider_factory(cfg: &JadavConfig, remote_name: &str) -> Result<ProviderFactory> {
+/// The lazily-built, shared Google token holder of one remote: every
+/// calendar's provider and the calendar-list discovery refresh through
+/// the same `GoogleAuth`, so a remote refreshes its access token once.
+type SharedGoogleAuth = Arc<Mutex<Option<Arc<Mutex<google::GoogleAuth>>>>>;
+
+fn shared_google_auth(
+    shared: &SharedGoogleAuth,
+    store_path: &Path,
+    remote_name: &str,
+    client_id: &str,
+    secret: &str,
+) -> Result<Arc<Mutex<google::GoogleAuth>>> {
+    let mut slot = shared
+        .lock()
+        .map_err(|_| anyhow::anyhow!("auth slot poisoned"))?;
+    if slot.is_none() {
+        let store = Store::open(store_path)?;
+        let a = google::GoogleAuth::from_store(&store, store_path, remote_name, client_id, secret)?;
+        *slot = Some(Arc::new(Mutex::new(a)));
+    }
+    Ok(slot.as_ref().cloned().expect("just set"))
+}
+
+fn provider_factory(
+    cfg: &JadavConfig,
+    remote_name: &str,
+) -> Result<(ProviderFactory, Option<Discoverer>)> {
     let remote = cfg
         .remotes
         .get(remote_name)
@@ -384,26 +598,26 @@ fn provider_factory(cfg: &JadavConfig, remote_name: &str) -> Result<ProviderFact
     match remote.kind {
         RemoteKind::Google => {
             let (client_id, secret) = google_oauth_secret(cfg)?;
-            let shared: Arc<Mutex<Option<Arc<Mutex<google::GoogleAuth>>>>> =
-                Arc::new(Mutex::new(None));
-            Ok(Box::new(move |cal: &CalendarMirrorCfg| {
-                let auth = {
-                    let mut slot = shared
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("auth slot poisoned"))?;
-                    if slot.is_none() {
-                        let store = Store::open(&store_path)?;
-                        let a = google::GoogleAuth::from_store(
-                            &store,
-                            &store_path,
-                            &name,
-                            &client_id,
-                            &secret,
-                        )?;
-                        *slot = Some(Arc::new(Mutex::new(a)));
-                    }
-                    slot.as_ref().cloned().expect("just set")
-                };
+            let shared: SharedGoogleAuth = Arc::new(Mutex::new(None));
+            let discoverer: Option<Discoverer> = if remote.mirror_all {
+                let cfg = cfg.clone();
+                let shared = Arc::clone(&shared);
+                let store_path = store_path.clone();
+                let name = name.clone();
+                let client_id = client_id.clone();
+                let secret = secret.clone();
+                Some(Box::new(move |store: &Store| {
+                    let auth =
+                        shared_google_auth(&shared, &store_path, &name, &client_id, &secret)?;
+                    let mut client = google::GoogleClient::new(auth);
+                    let entries = google::list_calendars(&mut client)?;
+                    apply_discovery(&cfg, store, &name, &entries)
+                }))
+            } else {
+                None
+            };
+            let factory: ProviderFactory = Box::new(move |cal: &CalendarMirrorCfg| {
+                let auth = shared_google_auth(&shared, &store_path, &name, &client_id, &secret)?;
                 let client = google::GoogleClient::new(auth);
                 Ok(Box::new(google::GoogleRest::new(
                     client,
@@ -411,13 +625,14 @@ fn provider_factory(cfg: &JadavConfig, remote_name: &str) -> Result<ProviderFact
                     &cal.identity,
                     cal.send_via,
                 )) as Box<dyn mirror::RemoteCalendar>)
-            }))
+            });
+            Ok((factory, discoverer))
         }
         RemoteKind::Caldav => {
             let url = remote.url.clone().context("caldav remote needs `url`")?;
             let login = remote.login.clone().unwrap_or_default();
             let auth = remote.auth.clone();
-            Ok(Box::new(move |cal: &CalendarMirrorCfg| {
+            let factory: ProviderFactory = Box::new(move |cal: &CalendarMirrorCfg| {
                 let password = match &auth {
                     Some(a) => a.resolve_password()?,
                     None => String::new(),
@@ -459,7 +674,8 @@ fn provider_factory(cfg: &JadavConfig, remote_name: &str) -> Result<ProviderFact
                     store_path.clone(),
                     cal.send_via,
                 )) as Box<dyn mirror::RemoteCalendar>)
-            }))
+            });
+            Ok((factory, None))
         }
     }
 }
@@ -467,11 +683,19 @@ fn provider_factory(cfg: &JadavConfig, remote_name: &str) -> Result<ProviderFact
 fn mirror_run_once(config_path: &Path, remote_name: &str) -> Result<()> {
     let cfg = load(config_path)?;
     let store = open_store(&cfg)?;
-    let cals = mirror_cfgs(&cfg, remote_name)?;
+    let (factory, mut discover) = provider_factory(&cfg, remote_name)?;
+    let mut cals = all_mirror_cfgs(&cfg, &store, remote_name)?;
+    if let Some(d) = discover.as_mut() {
+        for extra in d(&store)? {
+            if !cals.iter().any(|c| c.slug == extra.slug) {
+                println!("discovered {} ({})", extra.slug, extra.remote_calendar);
+                cals.push(extra);
+            }
+        }
+    }
     if cals.is_empty() {
         bail!("no calendars are mirrored from remote {:?}", remote_name);
     }
-    let factory = provider_factory(&cfg, remote_name)?;
     let log = |msg: &str| eprintln!("jadav: mirror[{}] {}", remote_name, msg);
     for cal in &cals {
         let mut provider = factory(cal)?;
@@ -570,9 +794,10 @@ fn serve(config_path: &std::path::Path) -> Result<()> {
     let mut mirror_threads = Vec::new();
     let mut mirror_plan: Vec<(String, Vec<CalendarMirrorCfg>, Arc<MirrorControl>, Duration)> =
         Vec::new();
+    let store = Store::open(&cfg.store)?;
     for (remote_name, remote_cfg) in &cfg.remotes {
-        let cals = mirror_cfgs(&cfg, remote_name)?;
-        if cals.is_empty() {
+        let cals = all_mirror_cfgs(&cfg, &store, remote_name)?;
+        if cals.is_empty() && !remote_cfg.mirror_all {
             continue;
         }
         let control = Arc::new(MirrorControl::new());
@@ -585,6 +810,7 @@ fn serve(config_path: &std::path::Path) -> Result<()> {
             Duration::from_secs(remote_cfg.poll_interval_secs.max(15)),
         ));
     }
+    drop(store);
     let hub = Arc::new(hub);
 
     let mut state = server::ServerState::new(
@@ -640,12 +866,17 @@ fn serve(config_path: &std::path::Path) -> Result<()> {
         eprintln!("jadav: no mail: section — scheduling stores documents as received, no iMIP");
     }
     for (remote_name, cals, control, interval) in mirror_plan {
-        let factory = provider_factory(&cfg, &remote_name)?;
+        let (factory, discover) = provider_factory(&cfg, &remote_name)?;
         eprintln!(
-            "jadav: mirroring {} calendar(s) from remote {} every {}s",
+            "jadav: mirroring {} calendar(s) from remote {} every {}s{}",
             cals.len(),
             remote_name,
-            interval.as_secs()
+            interval.as_secs(),
+            if discover.is_some() {
+                " (+ every calendar on the account, re-listed hourly)"
+            } else {
+                ""
+            }
         );
         mirror_threads.push(mirror::spawn_mirror_thread(
             remote_name,
@@ -653,6 +884,7 @@ fn serve(config_path: &std::path::Path) -> Result<()> {
             cfg.store.clone(),
             interval,
             factory,
+            discover,
             control,
         ));
     }
@@ -777,11 +1009,22 @@ fn check_config(config_path: &std::path::Path) -> Result<()> {
     }
     for (name, remote) in &cfg.remotes {
         println!(
-            "remote:    {} kind={:?} user={} poll={}s",
+            "remote:    {} kind={:?} user={} poll={}s{}",
             name,
             remote.kind,
             remote.user.as_deref().unwrap_or("-"),
-            remote.poll_interval_secs
+            remote.poll_interval_secs,
+            if remote.mirror_all {
+                format!(
+                    " mirror_all (slugs {}-*)",
+                    remote
+                        .slug_prefix
+                        .clone()
+                        .unwrap_or_else(|| format!("g-{}", slugify(name)))
+                )
+            } else {
+                String::new()
+            }
         );
     }
     match &cfg.mail {
@@ -1002,5 +1245,140 @@ mod tests {
         assert!(!specs[1].two_way);
         assert_eq!(specs[1].send_via, store::SendVia::Smtp);
         assert_eq!(specs[1].remote_account.as_deref(), Some("g"));
+    }
+
+    fn mirror_all_cfg(extra_calendars: &str) -> JadavConfig {
+        let yaml = format!(
+            "jadav:\n  store: /tmp/x.db\n  principal:\n    login: a@example.com\n    auth: {{type: password, value: p}}\n    identities: [a@example.com, w@example.com]\n  google_oauth: {{client_id: c, client_secret: {{type: password, value: s}}}}\n  remotes:\n    work: {{kind: google, user: W@example.com, mirror_all: true, skip_calendars: [\"Holidays in Hungary\"]}}\n  calendars:\n    - {{slug: personal, name: Personal}}\n    - {{slug: g-work, name: Work, identity: w@example.com, provider: google, remote: work, two_way: true}}\n{}",
+            extra_calendars
+        );
+        let file: serde_yml::Value = serde_yml::from_str(&yaml).unwrap();
+        serde_yml::from_value(file["jadav"].clone()).unwrap()
+    }
+
+    fn entry(id: &str, summary: &str, role: &str) -> GCalendarListEntry {
+        GCalendarListEntry {
+            id: id.to_string(),
+            summary: Some(summary.to_string()),
+            access_role: Some(role.to_string()),
+            background_color: Some("#9fe1e7".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn slugify_is_lowercase_ascii_with_single_dashes() {
+        assert_eq!(slugify("Anniversaries"), "anniversaries");
+        assert_eq!(slugify("Holidays in Hungary!"), "holidays-in-hungary");
+        assert_eq!(slugify("  Été / Ünnep  "), "t-nnep");
+        assert_eq!(slugify("***"), "calendar");
+        assert!(slugify(&"x".repeat(100)).len() <= 40);
+    }
+
+    #[test]
+    fn discovered_spec_maps_google_calendars_and_skips_what_it_should() {
+        let cfg = mirror_all_cfg("");
+        let taken: HashSet<String> = ["g-work".to_string(), "personal".to_string()].into();
+
+        // The primary is already configured as g-work: left alone.
+        let mut primary = entry("w@example.com", "W", "owner");
+        primary.primary = Some(true);
+        assert!(discovered_spec(&cfg, "work", &primary, &taken).is_none());
+
+        // A shared read-only calendar becomes a read-only mirror.
+        let anniv = entry("abc@group.calendar.google.com", "Anniversaries", "reader");
+        let spec = discovered_spec(&cfg, "work", &anniv, &taken).unwrap();
+        assert_eq!(spec.slug, "g-work-anniversaries");
+        assert_eq!(spec.display_name, "Anniversaries (work)");
+        assert_eq!(spec.identity, "w@example.com");
+        assert_eq!(spec.provider, Provider::Google);
+        assert_eq!(spec.remote_account.as_deref(), Some("work"));
+        assert_eq!(
+            spec.remote_calendar_id.as_deref(),
+            Some("abc@group.calendar.google.com")
+        );
+        assert!(!spec.two_way);
+        assert_eq!(spec.color.as_deref(), Some("#9fe1e7"));
+        assert!(!spec.is_default_for_identity);
+
+        // Writer access: two-way.
+        let team = entry("team@group.calendar.google.com", "Team", "writer");
+        assert!(
+            discovered_spec(&cfg, "work", &team, &taken)
+                .unwrap()
+                .two_way
+        );
+
+        // Free/busy only, deleted, hidden and skipped-by-name are not mirrored.
+        assert!(
+            discovered_spec(&cfg, "work", &entry("fb@x", "FB", "freeBusyReader"), &taken).is_none()
+        );
+        let mut gone = entry("gone@x", "Gone", "owner");
+        gone.deleted = Some(true);
+        assert!(discovered_spec(&cfg, "work", &gone, &taken).is_none());
+        let mut hidden = entry("hid@x", "Hidden", "owner");
+        hidden.hidden = Some(true);
+        assert!(discovered_spec(&cfg, "work", &hidden, &taken).is_none());
+        let holidays = entry(
+            "hu.hungarian#holiday@group.v.calendar.google.com",
+            "Holidays in Hungary",
+            "reader",
+        );
+        assert!(discovered_spec(&cfg, "work", &holidays, &taken).is_none());
+
+        // A slug clash gets a stable suffix from the remote id.
+        let taken2: HashSet<String> = ["g-work-anniversaries".to_string()].into();
+        let clash = discovered_spec(&cfg, "work", &anniv, &taken2).unwrap();
+        assert!(clash.slug.starts_with("g-work-anniversaries-"));
+        assert_eq!(clash.slug.len(), "g-work-anniversaries-".len() + 6);
+        assert_eq!(
+            discovered_spec(&cfg, "work", &anniv, &taken2).unwrap().slug,
+            clash.slug
+        );
+
+        // An explicitly configured non-primary calendar is covered too.
+        let cfg2 = mirror_all_cfg(
+            "    - {slug: my-anniv, name: A, identity: w@example.com, provider: google, remote: work, remote_calendar: abc@group.calendar.google.com}\n",
+        );
+        assert!(discovered_spec(&cfg2, "work", &anniv, &taken).is_none());
+    }
+
+    #[test]
+    fn apply_discovery_records_new_calendars_once_and_returns_all_discovered() {
+        let dir = std::env::temp_dir().join(format!("jadav-discover-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let store = Store::open(&dir).unwrap();
+        let cfg = mirror_all_cfg("");
+        store
+            .set_principal("a@example.com", &cfg.identities())
+            .unwrap();
+        store
+            .reconcile_calendars(&calendar_specs(&cfg).unwrap())
+            .unwrap();
+        let entries = vec![
+            entry("abc@group.calendar.google.com", "Anniversaries", "reader"),
+            entry("team@group.calendar.google.com", "Team", "writer"),
+        ];
+        let first = apply_discovery(&cfg, &store, "work", &entries).unwrap();
+        let mut slugs: Vec<&str> = first.iter().map(|c| c.slug.as_str()).collect();
+        slugs.sort();
+        assert_eq!(slugs, vec!["g-work-anniversaries", "g-work-team"]);
+        // Renamed on Google: the slug stays, nothing is duplicated.
+        let renamed = vec![entry(
+            "abc@group.calendar.google.com",
+            "Anniversaries & more",
+            "reader",
+        )];
+        let second = apply_discovery(&cfg, &store, "work", &renamed).unwrap();
+        assert_eq!(second.len(), 2);
+        // Reconciliation from config does not complain about discovered rows.
+        let warnings = store
+            .reconcile_calendars(&calendar_specs(&cfg).unwrap())
+            .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(all_mirror_cfgs(&cfg, &store, "work").unwrap().len(), 3);
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(format!("{}-wal", dir.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", dir.display()));
     }
 }

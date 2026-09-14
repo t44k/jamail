@@ -46,7 +46,7 @@ use std::path::Path;
 
 pub use crate::jadav::config::{Provider, SendVia};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 1;
+pub const CURRENT_SCHEMA_VERSION: i32 = 2;
 
 /// Who performed a write. Stored on every object and change-log row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,6 +347,7 @@ CREATE TABLE IF NOT EXISTS calendars (
     two_way                 INTEGER NOT NULL DEFAULT 1,
     send_via                TEXT NOT NULL DEFAULT 'smtp' CHECK (send_via IN ('smtp','provider')),
     is_default_for_identity INTEGER NOT NULL DEFAULT 0,
+    discovered              INTEGER NOT NULL DEFAULT 0,
     sync_baseline_id        INTEGER NOT NULL DEFAULT 0,
     remote_sync_token       TEXT,
     last_full_fill_at       INTEGER,
@@ -814,7 +815,8 @@ impl Store {
         }
         let mut warnings = Vec::new();
         {
-            let mut stmt = tx.prepare("SELECT slug, provider FROM calendars")?;
+            let mut stmt =
+                tx.prepare("SELECT slug, provider FROM calendars WHERE discovered = 0")?;
             let rows =
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             for row in rows {
@@ -829,6 +831,79 @@ impl Store {
         }
         tx.commit()?;
         Ok(warnings)
+    }
+
+    /// Insert or refresh a calendar a remote's `mirror_all` discovered.
+    /// Facts (identity, two-way, remote id) follow the remote on every
+    /// call; presentation (name, colour, description) is seeded on
+    /// creation only, exactly like [`Self::reconcile_calendars`]. Returns
+    /// `true` when the calendar was created.
+    pub fn upsert_discovered_calendar(&self, spec: &CalendarSpec) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM calendars WHERE slug = ?1",
+                params![spec.slug],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let created = exists.is_none();
+        if created {
+            let baseline: i64 = change_log_high_water(&tx)?;
+            tx.execute(
+                "INSERT INTO calendars (slug, display_name, description, color, timezone,
+                     identity, provider, remote_account, remote_calendar_id, two_way,
+                     send_via, is_default_for_identity, discovered, sync_baseline_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14)",
+                params![
+                    spec.slug,
+                    spec.display_name,
+                    spec.description.clone().unwrap_or_default(),
+                    spec.color,
+                    spec.timezone,
+                    spec.identity,
+                    spec.provider.as_str(),
+                    spec.remote_account,
+                    spec.remote_calendar_id,
+                    spec.two_way as i32,
+                    spec.send_via.as_str(),
+                    spec.is_default_for_identity as i32,
+                    baseline,
+                    now_ts(),
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE calendars SET identity = ?2, provider = ?3, remote_account = ?4,
+                     remote_calendar_id = ?5, two_way = ?6, send_via = ?7, discovered = 1
+                 WHERE slug = ?1",
+                params![
+                    spec.slug,
+                    spec.identity,
+                    spec.provider.as_str(),
+                    spec.remote_account,
+                    spec.remote_calendar_id,
+                    spec.two_way as i32,
+                    spec.send_via.as_str(),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(created)
+    }
+
+    /// The calendars `mirror_all` created for one remote.
+    pub fn list_discovered_calendars(&self, remote: &str) -> Result<Vec<CalendarRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM calendars WHERE discovered = 1 AND remote_account = ?1
+             ORDER BY \"order\", display_name",
+        )?;
+        let rows = stmt.query_map(params![remote], Self::calendar_from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     fn calendar_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CalendarRow> {
@@ -2166,7 +2241,14 @@ fn upgrade_schema(conn: &Connection) -> Result<()> {
             params![CURRENT_SCHEMA_VERSION],
         )?;
     }
-    // Future versions: `if version < 2 { ...ALTER/CREATE IF NOT EXISTS...; UPDATE schema_version SET version = 2 }`
+    if version == 1 {
+        // v2: calendars found by a remote's `mirror_all` are marked so
+        // reconciliation never warns about them being absent from config.
+        tx.execute_batch(
+            "ALTER TABLE calendars ADD COLUMN discovered INTEGER NOT NULL DEFAULT 0;
+             UPDATE schema_version SET version = 2;",
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -2816,5 +2898,47 @@ mod tests {
         assert_eq!(get_schema_version(&s.conn).unwrap(), CURRENT_SCHEMA_VERSION);
         upgrade_schema(&s.conn).unwrap();
         assert_eq!(s.principal().unwrap().unwrap().0, "alice@example.com");
+    }
+
+    #[test]
+    fn discovered_calendars_are_upserted_listed_and_not_warned_about() {
+        let s = store();
+        let spec = CalendarSpec {
+            slug: "g-work-team".to_string(),
+            display_name: "Team (work)".to_string(),
+            description: None,
+            color: Some("#112233".to_string()),
+            timezone: None,
+            identity: "w@example.com".to_string(),
+            provider: Provider::Google,
+            remote_account: Some("work".to_string()),
+            remote_calendar_id: Some("team@group.calendar.google.com".to_string()),
+            two_way: false,
+            send_via: SendVia::Smtp,
+            is_default_for_identity: false,
+        };
+        assert!(s.upsert_discovered_calendar(&spec).unwrap());
+        let mut again = spec.clone();
+        again.two_way = true;
+        again.display_name = "renamed".to_string();
+        assert!(!s.upsert_discovered_calendar(&again).unwrap());
+        let listed = s.list_discovered_calendars("work").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].two_way, "facts follow the remote");
+        assert_eq!(
+            listed[0].display_name, "Team (work)",
+            "presentation is seeded once"
+        );
+        assert_eq!(listed[0].color.as_deref(), Some("#112233"));
+        assert!(s.list_discovered_calendars("other").unwrap().is_empty());
+        // Reconciling the configured set leaves the discovered calendar
+        // alone and says nothing about it.
+        let before = s.list_calendars().unwrap().len();
+        let warnings = s.reconcile_calendars(&[]).unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("g-work-team")),
+            "{warnings:?}"
+        );
+        assert_eq!(s.list_calendars().unwrap().len(), before);
     }
 }

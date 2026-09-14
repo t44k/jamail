@@ -95,6 +95,20 @@ pub struct RemoteConfig {
     /// How far back the first fill and any full resync reach; `0` means
     /// everything.
     pub history_days: Option<u32>,
+    /// Google remotes only: mirror *every* calendar on the account's
+    /// calendar list, not just the ones listed under `calendars:`. Each
+    /// discovered calendar becomes a mirror with slug `<slug_prefix>-<name>`
+    /// and display name `<name> (<remote>)`, read-write when Google grants
+    /// owner/writer access and read-only otherwise; free/busy-only
+    /// calendars are never mirrored. Calendars listed explicitly under
+    /// `calendars:` keep their own slug and settings.
+    #[serde(default)]
+    pub mirror_all: bool,
+    /// Slug prefix for discovered calendars; default `g-<remote name>`.
+    pub slug_prefix: Option<String>,
+    /// Calendar ids or names `mirror_all` leaves alone.
+    #[serde(default)]
+    pub skip_calendars: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -491,7 +505,24 @@ impl JadavConfig {
                 RemoteKind::Caldav if remote.url.is_none() => {
                     bail!("remote {:?} is caldav but has no `url`", name)
                 }
+                RemoteKind::Caldav if remote.mirror_all => {
+                    bail!(
+                        "remote {:?}: `mirror_all` is only supported for google remotes",
+                        name
+                    )
+                }
                 _ => {}
+            }
+            if let Some(prefix) = &remote.slug_prefix
+                && !prefix
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+            {
+                bail!(
+                    "remote {:?}: slug_prefix {:?} may only contain a-z, 0-9, '-' and '_'",
+                    name,
+                    prefix
+                );
             }
         }
         Ok(warnings)
@@ -612,5 +643,36 @@ mod tests {
         let yaml2 = "accounts:\n  main:\n    email: a@example.com\n    imap: {host: h, port: 993, login: l, auth: {type: password, value: p}}\n";
         let cfg2: crate::config::JamailConfig = serde_yml::from_str(yaml2).unwrap();
         assert!(cfg2.jadav.is_none());
+    }
+
+    #[test]
+    fn mirror_all_is_google_only_and_slug_prefix_is_checked() {
+        let base = "jadav:\n  store: /tmp/x.db\n  principal:\n    login: a@example.com\n    auth: {type: password, value: p}\n  google_oauth: {client_id: c, client_secret: {type: password, value: s}}\n  remotes:\n";
+        let caldav = parse(&format!(
+            "{base}    c: {{kind: caldav, url: https://x/, login: u, auth: {{type: password, value: p}}, mirror_all: true}}\n  calendars: []\n"
+        ));
+        assert!(
+            caldav
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("mirror_all")
+        );
+        let bad_prefix = parse(&format!(
+            "{base}    g: {{kind: google, user: g@example.com, mirror_all: true, slug_prefix: \"Bad Prefix\"}}\n  calendars: []\n"
+        ));
+        assert!(
+            bad_prefix
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("slug_prefix")
+        );
+        let ok = parse(&format!(
+            "{base}    g: {{kind: google, user: g@example.com, mirror_all: true, slug_prefix: work, skip_calendars: [Holidays]}}\n  calendars: []\n"
+        ));
+        ok.validate().unwrap();
+        assert!(ok.remotes["g"].mirror_all);
+        assert_eq!(ok.remotes["g"].skip_calendars, vec!["Holidays".to_string()]);
     }
 }

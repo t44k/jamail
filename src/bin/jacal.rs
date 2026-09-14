@@ -63,6 +63,11 @@ fn main() -> Result<()> {
         .as_ref()
         .map(|j| j.week_start)
         .unwrap_or_default();
+    let jacal_prefs = config
+        .jacal
+        .as_ref()
+        .map(|j| j.calendars.clone())
+        .unwrap_or_default();
     let accounts: Vec<(String, config::JamailAccount)> = config.accounts.into_iter().collect();
 
     let caldav_accounts: Vec<&(String, config::JamailAccount)> = accounts
@@ -87,6 +92,7 @@ fn main() -> Result<()> {
 
     let mut app = CalApp::new(current_account.clone(), week_start);
     app.identities = own_identities(&caldav_accounts[0].1);
+    app.set_calendar_prefs(jacal_prefs);
     reload_calendars(&mut app, &db);
     reload_events(&mut app, &db);
 
@@ -290,7 +296,9 @@ fn run_app(
                 CalMode::Rsvp => {
                     handle_rsvp_key(app, db, ipc_client, key.code);
                 }
+                CalMode::Calendars => handle_calendar_panel_key(app, key.code),
             }
+            persist_calendar_prefs(app);
         }
     }
 }
@@ -438,6 +446,7 @@ fn handle_browse_key(
                 app.set_status(e);
             }
         }
+        KeyCode::Char('C') => app.begin_calendar_panel(),
         KeyCode::Char(digit @ '1'..='9') => {
             let idx = digit as usize - '1' as usize;
             if let Some(cal) = app.calendars.get(idx).cloned() {
@@ -554,6 +563,56 @@ fn submit_form(app: &mut CalApp, db: &MailDb, ipc_client: &ipc::IpcClient) {
             }
             Err(e) => app.set_status(e),
         }
+    }
+}
+
+/// Keys in the calendar panel (`C`): move, show/hide, recolour, close.
+fn handle_calendar_panel_key(app: &mut CalApp, code: KeyCode) {
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => app.calendar_panel_move(1),
+        KeyCode::Char('k') | KeyCode::Up => app.calendar_panel_move(-1),
+        KeyCode::Char(' ') | KeyCode::Enter => {
+            if let Some(url) = app.panel_calendar_url() {
+                app.toggle_calendar_visible(&url);
+            }
+        }
+        KeyCode::Char('c') | KeyCode::Char('l') | KeyCode::Right => {
+            if let Some(url) = app.panel_calendar_url() {
+                app.cycle_calendar_color(&url, 1);
+            }
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            if let Some(url) = app.panel_calendar_url() {
+                app.cycle_calendar_color(&url, -1);
+            }
+        }
+        KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete => {
+            if let Some(url) = app.panel_calendar_url() {
+                app.clear_calendar_color(&url);
+            }
+        }
+        KeyCode::Char(digit @ '1'..='9') => {
+            let idx = digit as usize - '1' as usize;
+            if let Some(cal) = app.calendars.get(idx).cloned() {
+                app.toggle_calendar_visible(&cal.url);
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('C') => app.close_calendar_panel(),
+        _ => {}
+    }
+}
+
+/// Write `jacal.calendars` back to the config file when a toggle or a
+/// colour change flagged it (see `CalApp::take_prefs_dirty`). Only that
+/// list is rewritten; the rest of the file stays byte for byte.
+fn persist_calendar_prefs(app: &mut CalApp) {
+    if !app.take_prefs_dirty() {
+        return;
+    }
+    let result = config::config_path()
+        .and_then(|path| config::save_jacal_calendar_prefs(&path, &app.calendar_prefs));
+    if let Err(e) = result {
+        app.set_status(format!("Could not save calendar settings: {:#}", e));
     }
 }
 

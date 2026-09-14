@@ -41,7 +41,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------
 // Remote-side types
@@ -1135,6 +1135,14 @@ impl MirrorHub {
 pub type ProviderFactory =
     Box<dyn Fn(&CalendarMirrorCfg) -> Result<Box<dyn RemoteCalendar>> + Send>;
 
+/// Finds the calendars a remote should mirror beyond the configured ones
+/// (`mirror_all`): lists the remote's calendars, records new ones in the
+/// store and returns the mirror config of every discovered calendar.
+pub type Discoverer = Box<dyn FnMut(&Store) -> Result<Vec<CalendarMirrorCfg>> + Send>;
+
+/// How often a remote's calendar list is re-read for new calendars.
+const DISCOVERY_INTERVAL: Duration = Duration::from_secs(3600);
+
 fn sleep_or_wake(control: &MirrorControl, total: Duration) {
     let step = Duration::from_millis(250);
     let mut waited = Duration::ZERO;
@@ -1153,12 +1161,15 @@ pub fn spawn_mirror_thread(
     store_path: PathBuf,
     poll_interval: Duration,
     make_provider: ProviderFactory,
+    mut discover: Option<Discoverer>,
     control: Arc<MirrorControl>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let log = |msg: &str| eprintln!("jadav: mirror[{}] {}", remote_name, msg);
+        let mut calendars = calendars;
         let mut providers: Vec<(CalendarMirrorCfg, Box<dyn RemoteCalendar>)> = Vec::new();
         let mut failures: u32 = 0;
+        let mut last_discovery: Option<Instant> = None;
         loop {
             if control.shutdown.load(Ordering::Relaxed) {
                 return;
@@ -1182,6 +1193,40 @@ pub fn spawn_mirror_thread(
                         Ok(p) => providers.push((cfg.clone(), p)),
                         Err(e) => log(&format!("{}: cannot build provider: {:#}", cfg.slug, e)),
                     }
+                }
+            }
+            // `mirror_all`: pick up calendars added on the remote since the
+            // last look, hourly. A failed listing only delays discovery.
+            if let Some(d) = discover.as_mut()
+                && last_discovery.is_none_or(|t| t.elapsed() >= DISCOVERY_INTERVAL)
+            {
+                last_discovery = Some(Instant::now());
+                match d(&store) {
+                    Ok(found) => {
+                        for cfg in found {
+                            if calendars.iter().any(|c| c.slug == cfg.slug) {
+                                continue;
+                            }
+                            log(&format!(
+                                "discovered calendar {} ({}, {})",
+                                cfg.slug,
+                                cfg.remote_calendar,
+                                if cfg.two_way {
+                                    "read-write"
+                                } else {
+                                    "read-only"
+                                }
+                            ));
+                            match make_provider(&cfg) {
+                                Ok(p) => providers.push((cfg.clone(), p)),
+                                Err(e) => {
+                                    log(&format!("{}: cannot build provider: {:#}", cfg.slug, e))
+                                }
+                            }
+                            calendars.push(cfg);
+                        }
+                    }
+                    Err(e) => log(&format!("calendar discovery failed: {:#}", e)),
                 }
             }
             let mut cycle_error: Option<String> = None;

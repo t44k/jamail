@@ -513,9 +513,36 @@ pub struct GListResponse {
 pub struct GCalendarListEntry {
     pub id: String,
     pub summary: Option<String>,
+    /// The user's own rename of a shared calendar; wins over `summary`.
+    pub summary_override: Option<String>,
+    pub description: Option<String>,
     pub primary: Option<bool>,
     pub access_role: Option<String>,
+    pub background_color: Option<String>,
+    pub time_zone: Option<String>,
+    pub deleted: Option<bool>,
+    pub hidden: Option<bool>,
 }
+
+impl GCalendarListEntry {
+    /// The name to show: the user's override, else the owner's summary,
+    /// else the id.
+    pub fn name(&self) -> &str {
+        self.summary_override
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or(self.summary.as_deref().filter(|s| !s.trim().is_empty()))
+            .unwrap_or(&self.id)
+    }
+
+    /// Whether Google lets this account change events here.
+    pub fn writable(&self) -> bool {
+        matches!(self.access_role.as_deref(), Some("owner") | Some("writer"))
+    }
+}
+
+/// The special "Birthdays" calendar Google derives from contacts.
+pub const CONTACTS_CALENDAR_SUFFIX: &str = "#contacts@group.v.calendar.google.com";
 
 #[derive(Deserialize, Default, Debug)]
 #[serde(rename_all = "camelCase", default)]
@@ -1003,12 +1030,7 @@ impl GoogleRest {
             calendar_id: calendar_id.to_string(),
             identity: identity.to_ascii_lowercase(),
             send_updates: send_updates_for(send_via),
-            skip_event_types: vec![
-                "workingLocation".to_string(),
-                "birthday".to_string(),
-                "outOfOffice".to_string(),
-                "focusTime".to_string(),
-            ],
+            skip_event_types: default_skip_event_types(calendar_id),
         }
     }
 
@@ -1547,6 +1569,22 @@ pub fn auth_interactive(
     Ok(())
 }
 
+/// Event types a mirror leaves out: Google's own status-like events
+/// (working location, out of office, focus time) everywhere, and birthday
+/// events too — except on the contacts "Birthdays" calendar, where they
+/// are the whole content.
+pub fn default_skip_event_types(calendar_id: &str) -> Vec<String> {
+    let mut v = vec![
+        "workingLocation".to_string(),
+        "outOfOffice".to_string(),
+        "focusTime".to_string(),
+    ];
+    if !calendar_id.ends_with(CONTACTS_CALENDAR_SUFFIX) {
+        v.push("birthday".to_string());
+    }
+    v
+}
+
 pub fn list_calendars(client: &mut GoogleClient) -> Result<Vec<GCalendarListEntry>> {
     let list: GCalendarList = client
         .call_json("GET", "/users/me/calendarList?maxResults=250", None)
@@ -1761,5 +1799,24 @@ mod tests {
         assert_eq!(body, serde_json::json!({"summary": "x"}));
         let a: GAttendee = serde_json::from_str(r#"{"email":"a@b","self":true}"#).unwrap();
         assert_eq!(a.self_, Some(true));
+    }
+
+    #[test]
+    fn birthday_events_are_kept_only_on_the_contacts_calendar() {
+        let normal = default_skip_event_types("w@example.com");
+        assert!(normal.iter().any(|t| t == "birthday"));
+        assert!(normal.iter().any(|t| t == "workingLocation"));
+        let contacts = default_skip_event_types("addressbook#contacts@group.v.calendar.google.com");
+        assert!(!contacts.iter().any(|t| t == "birthday"));
+        assert!(contacts.iter().any(|t| t == "workingLocation"));
+        let e = GCalendarListEntry {
+            id: "x".to_string(),
+            summary: Some("Owner name".to_string()),
+            summary_override: Some("My name".to_string()),
+            access_role: Some("writer".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(e.name(), "My name");
+        assert!(e.writable());
     }
 }
