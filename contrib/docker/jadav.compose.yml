@@ -18,10 +18,13 @@ services:
     volumes:
       - ./docker-data/jadav/config:/config:ro
       - ./docker-data/jadav/state:/state
-    # The mail server on the same host presents a certificate for its public
-    # name; reach it by that name (needed from the scheduling milestone on).
-    extra_hosts:
-      - "mail.example.com:host-gateway"
+    # The mail server jadav reads iTIP mail from and sends iMIP through
+    # (jadav.mail.imap/smtp) presents a certificate for its public name, so
+    # jadav must reach it by that name. A container cannot rely on hairpinning
+    # through the host's published ports on every Docker setup, so give the
+    # mail server that name as a network alias on the shared network instead
+    # (see the `mailserver` service below). Do not use `extra_hosts` with
+    # `host-gateway` for this — it hangs where the hairpin is blocked.
     labels:
       - traefik.enable=true
       - traefik.http.routers.jadav.rule=Host(`dav.example.com`)
@@ -32,3 +35,10 @@ services:
       - traefik.http.routers.jadav-http.entrypoints=web
       - traefik.http.routers.jadav-http.middlewares=jadav-redirect
       - traefik.http.middlewares.jadav-redirect.redirectscheme.scheme=https
+  # The operator's mail server, already defined in the host's compose file;
+  # this fragment only adds the alias jadav connects by.
+  mailserver:
+    networks:
+      default:
+        aliases:
+          - mail.example.com

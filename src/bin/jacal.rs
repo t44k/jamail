@@ -28,7 +28,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use jamail::calapp::{CalApp, CalField, CalMode};
-use jamail::calendar::{EventTime, VEvent, expand_occurrences};
+use jamail::calendar::{EventEdits, EventTime, Rsvp, VEvent, expand_occurrences};
 use jamail::calnotify::{AlarmScheduler, DesktopAlarmSink};
 use jamail::calsync::CalMutation;
 use jamail::db::MailDb;
@@ -86,6 +86,7 @@ fn main() -> Result<()> {
     let db = MailDb::open().context("Failed to open mail database")?;
 
     let mut app = CalApp::new(current_account.clone(), week_start);
+    app.identities = own_identities(&caldav_accounts[0].1);
     reload_calendars(&mut app, &db);
     reload_events(&mut app, &db);
 
@@ -286,6 +287,9 @@ fn run_app(
                 CalMode::ConfirmDelete => {
                     handle_delete_confirm_key(app, db, ipc_client, key.code);
                 }
+                CalMode::Rsvp => {
+                    handle_rsvp_key(app, db, ipc_client, key.code);
+                }
             }
         }
     }
@@ -429,6 +433,11 @@ fn handle_browse_key(
                 app.set_status(e);
             }
         }
+        KeyCode::Char('r') => {
+            if let Err(e) = app.begin_rsvp() {
+                app.set_status(e);
+            }
+        }
         KeyCode::Char(digit @ '1'..='9') => {
             let idx = digit as usize - '1' as usize;
             if let Some(cal) = app.calendars.get(idx).cloned() {
@@ -545,6 +554,70 @@ fn submit_form(app: &mut CalApp, db: &MailDb, ipc_client: &ipc::IpcClient) {
             }
             Err(e) => app.set_status(e),
         }
+    }
+}
+
+/// Every address the account can answer an invitation as: its `email`,
+/// its `caldav.login` and every `senders` entry (display names stripped),
+/// lower-cased and de-duplicated. Matched against `ATTENDEE` lines by
+/// `CalApp::own_attendee`.
+fn own_identities(account: &config::JamailAccount) -> Vec<String> {
+    let mut raw: Vec<String> = vec![account.email.clone()];
+    if let Some(c) = &account.caldav {
+        raw.push(c.login.clone());
+    }
+    if let Some(senders) = &account.senders {
+        raw.extend(senders.iter().cloned());
+    }
+    let mut out: Vec<String> = Vec::new();
+    for entry in raw {
+        let addr = jamail::jadav::config::mailbox_address(&entry);
+        if addr.contains('@') && !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    out
+}
+
+/// Answer the invitation the RSVP prompt was opened for: rewrite our
+/// `ATTENDEE` line locally (no `SEQUENCE` bump) and queue the same
+/// `Update` mutation an edit uses; the CalDAV server turns the stored
+/// `PARTSTAT` change into the iTIP `REPLY` mail.
+fn handle_rsvp_key(app: &mut CalApp, db: &MailDb, ipc_client: &ipc::IpcClient, code: KeyCode) {
+    let (partstat, verb) = match code {
+        KeyCode::Char('a') | KeyCode::Enter => ("ACCEPTED", "Accepted"),
+        KeyCode::Char('t') => ("TENTATIVE", "Tentatively accepted"),
+        KeyCode::Char('d') => ("DECLINED", "Declined"),
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+            app.cancel_rsvp();
+            return;
+        }
+        _ => return,
+    };
+    let Some(target) = app.take_pending_rsvp() else {
+        return;
+    };
+    let account = app.current_account.clone();
+    let edits = EventEdits {
+        rsvp: Some(Rsvp {
+            attendee: target.attendee.clone(),
+            partstat: partstat.to_string(),
+        }),
+        ..Default::default()
+    };
+    match db.apply_local_calendar_edit(target.id, &edits) {
+        Ok(()) => {
+            ipc_client.send(ipc::Request::EnqueueCalendarMutation {
+                account,
+                mutation: CalMutation::Update {
+                    local_id: target.id,
+                    edits,
+                },
+            });
+            reload_events(app, db);
+            app.set_status(format!("{} \"{}\", syncing…", verb, target.summary));
+        }
+        Err(e) => app.set_status(format!("Could not respond: {}", e)),
     }
 }
 

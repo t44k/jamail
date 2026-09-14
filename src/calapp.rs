@@ -577,6 +577,8 @@ pub enum CalMode {
     Create,
     Edit,
     ConfirmDelete,
+    /// The accept/tentative/decline prompt — see [`PendingRsvp`].
+    Rsvp,
 }
 
 /// The event a [`CalMode::ConfirmDelete`] prompt is about, captured when
@@ -598,6 +600,19 @@ pub struct PendingDelete {
     /// module docs on why editing/deleting always acts on the master
     /// `VEVENT`), so the prompt has to say so before the user confirms.
     pub recurring: bool,
+}
+
+/// The invitation a [`CalMode::Rsvp`] prompt answers, captured when the
+/// prompt opens for the same reason [`PendingDelete`] is.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PendingRsvp {
+    pub id: i64,
+    pub summary: String,
+    /// Which of our identities is on the guest list (the `ATTENDEE`
+    /// line that gets rewritten).
+    pub attendee: String,
+    /// That line's `PARTSTAT` before answering, for the prompt text.
+    pub current: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -859,6 +874,7 @@ impl DraftEvent {
             dtstart: Some(dtstart),
             dtend: Some(dtend),
             rrule,
+            rsvp: None,
         })
     }
 
@@ -935,6 +951,13 @@ pub struct CalApp {
     /// The event the delete prompt is about while `mode` is
     /// [`CalMode::ConfirmDelete`] — see [`PendingDelete`].
     pub pending_delete: Option<PendingDelete>,
+    /// The invitation the RSVP prompt is about while `mode` is
+    /// [`CalMode::Rsvp`] — see [`PendingRsvp`].
+    pub pending_rsvp: Option<PendingRsvp>,
+    /// Our own addresses, lower-cased: the account's `email`, its
+    /// `caldav.login` and every `senders` entry. An event is answerable
+    /// when one of them is on its `ATTENDEE` list.
+    pub identities: Vec<String>,
     pub status: Option<String>,
     pub ipc_connected: bool,
 }
@@ -956,6 +979,8 @@ impl CalApp {
             mode: CalMode::Browse,
             draft: None,
             pending_delete: None,
+            pending_rsvp: None,
+            identities: Vec::new(),
             status: None,
             ipc_connected: false,
         }
@@ -1404,6 +1429,65 @@ impl CalApp {
         self.mode = CalMode::Browse;
     }
 
+    /// The `ATTENDEE` of `row` that is one of [`Self::identities`], if any.
+    pub fn own_attendee(&self, row: &CalendarEventRow) -> Option<crate::calendar::Attendee> {
+        let event = row.to_vevent().ok()?;
+        event.attendees.into_iter().find(|a| {
+            self.identities
+                .iter()
+                .any(|i| i.eq_ignore_ascii_case(&a.email))
+        })
+    }
+
+    /// Open the RSVP prompt for the selected event, capturing which
+    /// invitation and which of our addresses it is about (see
+    /// [`PendingRsvp`]). Explicit errors, not silent no-ops, when there is
+    /// nothing to answer: no selection, no identities configured, we are
+    /// not on the guest list, or we are the organizer.
+    pub fn begin_rsvp(&mut self) -> Result<(), String> {
+        let ev = self
+            .selected_event()
+            .ok_or_else(|| "no event selected".to_string())?;
+        if self.identities.is_empty() {
+            return Err(
+                "no identities known — set the account's email, caldav.login or senders"
+                    .to_string(),
+            );
+        }
+        let organizer = crate::calendar::cal_address_email(&ev.organizer);
+        if !organizer.is_empty()
+            && self
+                .identities
+                .iter()
+                .any(|i| i.eq_ignore_ascii_case(&organizer))
+        {
+            return Err("you organise this event — edit it instead of answering".to_string());
+        }
+        let attendee = self
+            .own_attendee(ev)
+            .ok_or_else(|| "none of your addresses is an attendee of this event".to_string())?;
+        self.pending_rsvp = Some(PendingRsvp {
+            id: ev.id,
+            summary: ev.summary.clone(),
+            attendee: attendee.email,
+            current: attendee.partstat,
+        });
+        self.mode = CalMode::Rsvp;
+        Ok(())
+    }
+
+    /// Close the RSVP prompt, handing back the invitation it was about.
+    pub fn take_pending_rsvp(&mut self) -> Option<PendingRsvp> {
+        self.mode = CalMode::Browse;
+        self.pending_rsvp.take()
+    }
+
+    /// Close the RSVP prompt without answering.
+    pub fn cancel_rsvp(&mut self) {
+        self.pending_rsvp = None;
+        self.mode = CalMode::Browse;
+    }
+
     pub fn cancel_form(&mut self) {
         self.draft = None;
         self.mode = CalMode::Browse;
@@ -1464,6 +1548,7 @@ impl CalApp {
                 }
             }
             CalMode::ConfirmDelete => self.render_delete_confirm(frame, area),
+            CalMode::Rsvp => self.render_rsvp_prompt(frame, area),
             CalMode::Browse => {}
         }
     }
@@ -2456,6 +2541,34 @@ impl CalApp {
         if !ev.organizer.is_empty() {
             lines.push(row("Organizer", ev.organizer.clone()));
         }
+        if let Ok(parsed) = ev.to_vevent()
+            && !parsed.attendees.is_empty()
+        {
+            const MAX_SHOWN: usize = 12;
+            for (i, a) in parsed.attendees.iter().enumerate() {
+                if i == MAX_SHOWN {
+                    lines.push(row(
+                        "",
+                        format!("… and {} more", parsed.attendees.len() - MAX_SHOWN),
+                    ));
+                    break;
+                }
+                let ours = self
+                    .identities
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case(&a.email));
+                let who = match &a.name {
+                    Some(n) if !n.is_empty() => format!("{} <{}>", n, a.email),
+                    _ => a.email.clone(),
+                };
+                let partstat = a.partstat.as_deref().unwrap_or("NEEDS-ACTION");
+                let mut line = format!("{}  {}", who, partstat.to_ascii_lowercase());
+                if ours {
+                    line.push_str("  (you — r to respond)");
+                }
+                lines.push(row(if i == 0 { "Attendees" } else { "" }, line));
+            }
+        }
         if let Some(rrule) = &ev.rrule {
             lines.push(row("Repeats", rrule.clone()));
         }
@@ -2492,7 +2605,7 @@ impl CalApp {
         let text = if let Some(status) = &self.status {
             status.clone()
         } else {
-            "hjkl move  [/] jump period  Tab/S-Tab narrow/widen  Enter zoom  Esc back  t today  n new  e edit  d del  1-9 cal  s sync  q quit"
+            "hjkl move  [/] jump period  Tab/S-Tab narrow/widen  Enter zoom  Esc back  t today  n new  e edit  d del  r rsvp  1-9 cal  s sync  q quit"
                 .to_string()
         };
         frame.render_widget(
@@ -2592,6 +2705,47 @@ impl CalApp {
             "y confirm   n/Esc cancel",
             Style::default().fg(theme::FG_DIM),
         )));
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_rsvp_prompt(&self, frame: &mut Frame, area: Rect) {
+        let target = self.pending_rsvp.as_ref();
+        let popup = centered_rect(60, 6, area);
+        frame.render_widget(Clear, popup);
+        let block = Block::default()
+            .title(" Respond to invitation ")
+            .borders(Borders::ALL)
+            .style(
+                Style::default()
+                    .bg(theme::HELP_BG)
+                    .fg(theme::THREAD_INDICATOR),
+            );
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let summary = target.map(|t| t.summary.as_str()).unwrap_or("this event");
+        let attendee = target.map(|t| t.attendee.as_str()).unwrap_or("you");
+        let current = target
+            .and_then(|t| t.current.clone())
+            .unwrap_or_else(|| "NEEDS-ACTION".to_string());
+        let lines = vec![
+            Line::from(Span::styled(
+                format!("\"{}\"", summary),
+                Style::default().fg(theme::FG_TEXT),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "as {} (currently {})",
+                    attendee,
+                    current.to_ascii_lowercase()
+                ),
+                Style::default().fg(theme::FG_DIM),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "a accept   t tentative   d decline   Esc cancel",
+                Style::default().fg(theme::FG_DIM),
+            )),
+        ];
         frame.render_widget(Paragraph::new(lines), inner);
     }
 }
@@ -3706,6 +3860,58 @@ mod tests {
         let mut app = test_app();
         assert!(app.begin_delete_confirm().is_err());
         assert_eq!(app.mode, CalMode::Browse);
+    }
+
+    fn invited_row(organizer: &str, our_partstat: &str) -> CalendarEventRow {
+        let start = Utc
+            .with_ymd_and_hms(2024, 1, 15, 12, 0, 0)
+            .unwrap()
+            .timestamp();
+        let mut row = make_row("inv", start, start + 3600, None, false);
+        row.organizer = organizer.to_string();
+        row.raw_ics = Some(format!(
+            "BEGIN:VEVENT\r\nUID:inv\r\nDTSTART:20240115T120000Z\r\nDTEND:20240115T130000Z\r\nSUMMARY:inv\r\nORGANIZER;CN=Boss:mailto:{organizer}\r\nATTENDEE;CN=Me;PARTSTAT={our_partstat};RSVP=TRUE:mailto:Me@Example.com\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:other@example.com\r\nEND:VEVENT\r\n"
+        ));
+        row
+    }
+
+    #[test]
+    fn begin_rsvp_captures_our_attendee_line_or_explains_why_not() {
+        let mut app = test_app();
+        assert!(app.begin_rsvp().is_err(), "nothing selected");
+
+        app.set_events(vec![invited_row("boss@example.com", "NEEDS-ACTION")]);
+        app.focused_date = local_date_of(app.events[0].dtstart_utc);
+        app.event_cursor = 0;
+        assert!(app.selected_event().is_some());
+        let err = app.begin_rsvp().unwrap_err();
+        assert!(err.contains("no identities"), "{err}");
+
+        app.identities = vec!["stranger@example.com".to_string()];
+        let err = app.begin_rsvp().unwrap_err();
+        assert!(err.contains("attendee"), "{err}");
+        assert_eq!(app.mode, CalMode::Browse);
+
+        app.identities = vec!["me@example.com".to_string()];
+        app.begin_rsvp().unwrap();
+        assert_eq!(app.mode, CalMode::Rsvp);
+        let pending = app.take_pending_rsvp().unwrap();
+        assert_eq!(pending.attendee, "Me@Example.com");
+        assert_eq!(pending.current.as_deref(), Some("NEEDS-ACTION"));
+        assert_eq!(pending.summary, "inv");
+        assert_eq!(app.mode, CalMode::Browse);
+        assert!(app.pending_rsvp.is_none());
+
+        // Organiser of our own event: no RSVP, edit instead.
+        app.set_events(vec![invited_row("me@example.com", "ACCEPTED")]);
+        let err = app.begin_rsvp().unwrap_err();
+        assert!(err.contains("organise"), "{err}");
+
+        app.set_events(vec![invited_row("boss@example.com", "ACCEPTED")]);
+        app.begin_rsvp().unwrap();
+        app.cancel_rsvp();
+        assert_eq!(app.mode, CalMode::Browse);
+        assert!(app.pending_rsvp.is_none());
     }
 
     #[test]

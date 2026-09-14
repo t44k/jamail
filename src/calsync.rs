@@ -61,6 +61,9 @@ use std::time::Duration;
 /// IPC protocol's `EnqueueCalendarMutation` request — hence the
 /// `Serialize`/`Deserialize` derives (same pattern as `sync::UploadKind`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+// `Update` carries the whole `EventEdits` (a handful of `Option<String>`s);
+// the queue holds a few of these at most, so the size skew is irrelevant.
+#[allow(clippy::large_enum_variant)]
 pub enum CalMutation {
     Create { local_id: i64 },
     Update { local_id: i64, edits: EventEdits },

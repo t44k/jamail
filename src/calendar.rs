@@ -256,10 +256,21 @@ impl VEvent {
     }
 }
 
+/// An answer to an invitation: the new `PARTSTAT` of one of *our*
+/// `ATTENDEE` lines (`ACCEPTED`, `TENTATIVE` or `DECLINED`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rsvp {
+    /// The attendee address being answered for (matched case-insensitively
+    /// against the `mailto:` value).
+    pub attendee: String,
+    pub partstat: String,
+}
+
 /// Fields a user is allowed to change through jacal's edit UI. `None`
-/// means "leave as-is". Anything not listed here (`ORGANIZER`, `ATTENDEE`,
-/// `VALARM`, `RRULE`, and any property this module doesn't model at all)
-/// is intentionally not editable and is always preserved verbatim.
+/// means "leave as-is". Anything not listed here (`ORGANIZER`, other
+/// attendees' lines, `VALARM`, `RRULE`, and any property this module
+/// doesn't model at all) is intentionally not editable and is always
+/// preserved verbatim.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EventEdits {
     pub summary: Option<String>,
@@ -274,6 +285,28 @@ pub struct EventEdits {
     /// `RRULE` property value (e.g. `"FREQ=WEEKLY;COUNT=5"`), verified
     /// only for gross well-formedness (see [`validate_rrule`]).
     pub rrule: Option<String>,
+    /// Answer an invitation. Applied after every other edit as a raw-line
+    /// rewrite of just our `ATTENDEE` line (dropping its `RSVP=` request
+    /// parameter); never bumps `SEQUENCE`, which belongs to the organizer
+    /// (RFC 5546 §2.1.4). The CalDAV server (jadav) turns the stored
+    /// `PARTSTAT` change into the iTIP `REPLY`.
+    #[serde(default)]
+    pub rsvp: Option<Rsvp>,
+}
+
+/// Apply an [`Rsvp`] to a whole document: rewrite our `ATTENDEE` line's
+/// `PARTSTAT` on the master component and nothing else. Errors when the
+/// address is not an attendee, so a stale identity list can never turn
+/// into a silent no-op that the UI reports as sent.
+pub fn apply_rsvp(ics: &str, rsvp: &Rsvp) -> Result<String, CalendarError> {
+    let mut doc = parse_document(ics)?;
+    if !doc.set_attendee_partstat(&rsvp.attendee, &rsvp.partstat, None)? {
+        return Err(CalendarError::Malformed(format!(
+            "{} is not an attendee of this event",
+            rsvp.attendee
+        )));
+    }
+    Ok(doc.to_ics())
 }
 
 // ---------------------------------------------------------------------
@@ -1858,7 +1891,13 @@ impl VEvent {
 
         match &self.raw {
             Some(raw) => patch_raw_vevent(raw, &updated, now),
-            None => Ok(updated.to_new_ics(now)),
+            None => {
+                let ics = updated.to_new_ics(now);
+                match &edits.rsvp {
+                    Some(r) => apply_rsvp(&ics, r),
+                    None => Ok(ics),
+                }
+            }
         }
     }
 }
@@ -2075,7 +2114,11 @@ pub fn patch_document(
         out = wrapped;
     }
     out.retain(|l| !l.is_empty());
-    Ok(out.join("\r\n") + "\r\n")
+    let ics = out.join("\r\n") + "\r\n";
+    match &edits.rsvp {
+        Some(r) => apply_rsvp(&ics, r),
+        None => Ok(ics),
+    }
 }
 
 /// Patch a raw `VEVENT` block: drop existing lines for any property in
@@ -3033,6 +3076,75 @@ END:VCALENDAR\r\n";
                 None
             ),
             "BEGIN:VEVENT\r\nEND:VEVENT"
+        );
+    }
+
+    #[test]
+    fn rsvp_edit_rewrites_only_our_attendee_line_and_keeps_sequence() {
+        let doc = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//g//EN\r\nBEGIN:VTIMEZONE\r\nTZID:Europe/Budapest\r\nBEGIN:STANDARD\r\nDTSTART:19701025T030000\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:rsvp-1\r\nDTSTART;TZID=Europe/Budapest:20240115T100000\r\nDTEND;TZID=Europe/Budapest:20240115T110000\r\nSUMMARY:Lunch\r\nSEQUENCE:3\r\nORGANIZER;CN=Boss:mailto:boss@example.com\r\nATTENDEE;CN=Me;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;X-APPLE-FOO=1:mailto:Me@Example.com\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:other@example.com\r\nX-CUSTOM:kept\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let event = parse_vevents(doc).unwrap().remove(0);
+        let edits = EventEdits {
+            rsvp: Some(Rsvp {
+                attendee: "me@example.com".to_string(),
+                partstat: "ACCEPTED".to_string(),
+            }),
+            ..Default::default()
+        };
+        let out = patch_document(doc, &event, &edits, utc(2024, 1, 10, 0, 0, 0)).unwrap();
+        let lines = unfold(&out);
+        // Our line keeps every foreign parameter and its exact address
+        // spelling; PARTSTAT is re-set (it lands last) and RSVP= is gone.
+        let ours = lines
+            .iter()
+            .find(|l| l.ends_with(":mailto:Me@Example.com"))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert_eq!(
+            ours,
+            "ATTENDEE;CN=Me;X-APPLE-FOO=1;PARTSTAT=ACCEPTED:mailto:Me@Example.com"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "ATTENDEE;PARTSTAT=ACCEPTED:mailto:other@example.com")
+        );
+        assert!(
+            lines.iter().any(|l| l == "SEQUENCE:3"),
+            "an RSVP is not the organizer's change"
+        );
+        assert!(lines.iter().any(|l| l == "X-CUSTOM:kept"));
+        assert!(lines.iter().any(|l| l == "TZID:Europe/Budapest"));
+        assert!(!out.contains("RSVP=TRUE"));
+
+        let bad = EventEdits {
+            rsvp: Some(Rsvp {
+                attendee: "nobody@example.com".to_string(),
+                partstat: "DECLINED".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert!(patch_document(doc, &event, &bad, utc(2024, 1, 10, 0, 0, 0)).is_err());
+    }
+
+    #[test]
+    fn rsvp_combined_with_a_real_edit_still_bumps_sequence_once() {
+        let doc = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:rsvp-2\r\nDTSTART:20240115T090000Z\r\nDTEND:20240115T100000Z\r\nSUMMARY:Old\r\nSEQUENCE:0\r\nORGANIZER:mailto:boss@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:me@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let event = parse_vevents(doc).unwrap().remove(0);
+        let edits = EventEdits {
+            summary: Some("New".to_string()),
+            rsvp: Some(Rsvp {
+                attendee: "me@example.com".to_string(),
+                partstat: "TENTATIVE".to_string(),
+            }),
+            ..Default::default()
+        };
+        let out = patch_document(doc, &event, &edits, utc(2024, 1, 10, 0, 0, 0)).unwrap();
+        let lines = unfold(&out);
+        assert!(lines.iter().any(|l| l == "SUMMARY:New"));
+        assert!(lines.iter().any(|l| l == "SEQUENCE:1"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "ATTENDEE;PARTSTAT=TENTATIVE:mailto:me@example.com")
         );
     }
 }
