@@ -894,6 +894,11 @@ impl Store {
                 all.iter()
                     .find(|c| c.identity == identity && c.provider == Provider::Native)
             })
+            // An identity whose only calendars are mirrors: invitations for
+            // it belong to the provider, and naming that calendar here is
+            // what lets the inbound path report `not_applied_mirrored`
+            // instead of pretending the identity has nowhere to go.
+            .or_else(|| all.iter().find(|c| c.identity == identity))
             .cloned())
     }
 
@@ -2780,6 +2785,29 @@ mod tests {
                 .is_none()
         );
         assert_eq!(s.find_object_by_uid("nothing").unwrap(), None);
+
+        // An identity whose only calendar is a mirror still resolves to it,
+        // so inbound mail for it is reported as left to the provider.
+        s.reconcile_calendars(&[CalendarSpec {
+            slug: "g-work".to_string(),
+            display_name: "Work".to_string(),
+            description: None,
+            color: None,
+            timezone: None,
+            identity: "work@example.com".to_string(),
+            provider: Provider::Google,
+            remote_account: Some("work".to_string()),
+            remote_calendar_id: Some("work@example.com".to_string()),
+            two_way: true,
+            send_via: SendVia::Smtp,
+            is_default_for_identity: false,
+        }])
+        .unwrap();
+        let d = s
+            .default_calendar_for_identity("Work@Example.com")
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.slug, "g-work");
     }
 
     #[test]

@@ -466,13 +466,13 @@ impl JadavConfig {
             }
         }
         for identity in &identities {
-            let has_native = self.calendars.iter().any(|c| {
-                c.provider == Provider::Native
-                    && self.calendar_identity(c).as_deref() == Some(identity.as_str())
-            });
-            if !has_native && !defaults_per_identity.contains_key(identity) {
+            let has_any = self
+                .calendars
+                .iter()
+                .any(|c| self.calendar_identity(c).as_deref() == Some(identity.as_str()));
+            if !has_any && !defaults_per_identity.contains_key(identity) {
                 warnings.push(format!(
-                    "identity {:?} has no native calendar; invitations addressed to it cannot be stored",
+                    "identity {:?} has no calendar; invitations addressed to it cannot be stored",
                     identity
                 ));
             }
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn full_config_parses_and_validates() {
         let cfg = parse(
-            "jadav:\n  listen: 127.0.0.1:5232\n  store: /var/lib/jadav/jadav.db\n  principal:\n    login: t@mas.gg\n    auth: {type: command, value: 'echo pw'}\n    identities: [t@mas.gg, tamas@example.com]\n  google_oauth: {client_id: cid, client_secret: {type: password, value: sec}}\n  remotes:\n    work: {kind: google, user: tamas@example.com}\n    cloud: {kind: caldav, url: https://caldav.example.com/, login: u, auth: {type: password, value: p}}\n  calendars:\n    - {slug: personal, name: Personal, provider: native, default_for_identity: true}\n    - {slug: g-work, name: Work, identity: tamas@example.com, provider: google, remote: work, remote_calendar: tamas@example.com, two_way: true}\n    - {slug: cloud-home, name: Home, provider: caldav, remote: cloud, remote_calendar: Home, two_way: false, color: '#ff0000'}\n  scheduling: {send_via: smtp, history_days: 30}\n  sync_log_retention_days: 30\n",
+            "jadav:\n  listen: 127.0.0.1:5232\n  store: /var/lib/jadav/jadav.db\n  principal:\n    login: t@mas.gg\n    auth: {type: command, value: 'echo pw'}\n    identities: [t@mas.gg, tamas@example.com, lonely@example.com]\n  google_oauth: {client_id: cid, client_secret: {type: password, value: sec}}\n  remotes:\n    work: {kind: google, user: tamas@example.com}\n    cloud: {kind: caldav, url: https://caldav.example.com/, login: u, auth: {type: password, value: p}}\n  calendars:\n    - {slug: personal, name: Personal, provider: native, default_for_identity: true}\n    - {slug: g-work, name: Work, identity: tamas@example.com, provider: google, remote: work, remote_calendar: tamas@example.com, two_way: true}\n    - {slug: cloud-home, name: Home, provider: caldav, remote: cloud, remote_calendar: Home, two_way: false, color: '#ff0000'}\n  scheduling: {send_via: smtp, history_days: 30}\n  sync_log_retention_days: 30\n",
         );
         assert_eq!(cfg.calendars.len(), 3);
         assert_eq!(cfg.calendars[1].provider, Provider::Google);
@@ -561,9 +561,17 @@ mod tests {
         assert_eq!(cfg.scheduling.history_days, 30);
         assert_eq!(cfg.scheduling.send_via, SendVia::Smtp);
         let warnings = cfg.validate().unwrap();
-        // tamas@example.com has only a mirrored calendar and no default.
+        // tamas@example.com has only a mirrored calendar: invitations for
+        // it are the provider's business, not a misconfiguration.
         assert!(
-            warnings.iter().any(|w| w.contains("tamas@example.com")),
+            !warnings.iter().any(|w| w.contains("tamas@example.com")),
+            "{warnings:?}"
+        );
+        // lonely@example.com has nowhere at all for an invitation to land.
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("lonely@example.com") && w.contains("no calendar")),
             "{warnings:?}"
         );
     }
