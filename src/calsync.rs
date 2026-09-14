@@ -262,6 +262,36 @@ fn run_one_cycle(
     let _ = db.prune_calendars_not_in(account_name, &kept_urls);
 }
 
+/// Which `sync-token` to send for this pass. A calendar whose cached rows
+/// still carry legacy unquoted ETags (see
+/// [`MailDb::calendar_has_unquoted_etags`]) deliberately forgets its
+/// token: an RFC 6578 *initial* sync makes the server re-list every
+/// member with `getetag` + `calendar-data`, which rewrites the stored
+/// ETags (and repairs event text that lost its `&`/`<`/`>`) in one pass,
+/// after which the condition is false and the normal delta path resumes.
+fn effective_prior_token(has_legacy_etags: bool, stored: Option<String>) -> Option<String> {
+    if has_legacy_etags { None } else { stored }
+}
+
+/// Drop every locally-cached, fully-synced row of `calendar_url` whose
+/// href the server did not list in a complete enumeration (an initial
+/// sync-collection pass or a `calendar-query` full listing). Rows with an
+/// outstanding local write are left alone for the write path to resolve.
+fn reconcile_missing(
+    account_name: &str,
+    calendar_url: &str,
+    db: &MailDb,
+    seen_hrefs: &HashSet<String>,
+) {
+    if let Ok(cached) = db.get_calendar_events_in_range(Some(account_name), i64::MIN, i64::MAX) {
+        for row in cached.iter().filter(|r| r.calendar_url == calendar_url) {
+            if !seen_hrefs.contains(&row.href) && row.local_status == db::CAL_STATUS_SYNCED {
+                let _ = db.delete_calendar_event_by_href(account_name, calendar_url, &row.href);
+            }
+        }
+    }
+}
+
 fn sync_one_calendar(
     account_name: &str,
     calendar_url: &str,
@@ -269,17 +299,42 @@ fn sync_one_calendar(
     db: &MailDb,
     tx: &Sender<CalSyncEvent>,
 ) {
-    let prior_token = db
+    let stored_token = db
         .get_calendar_sync_token(account_name, calendar_url)
         .ok()
         .flatten();
-    let outcome = match client.sync_calendar(calendar_url, prior_token.as_deref()) {
+    let has_legacy_etags = db
+        .calendar_has_unquoted_etags(account_name, calendar_url)
+        .unwrap_or(false);
+    let mut prior_token = effective_prior_token(has_legacy_etags, stored_token);
+    if has_legacy_etags {
+        eprintln!(
+            "jamaild: {} has ETags cached without quotes; running one full re-list to repair them",
+            calendar_url
+        );
+    }
+
+    let mut outcome = match client.sync_calendar(calendar_url, prior_token.as_deref()) {
         Ok(o) => o,
         Err(e) => {
             let _ = tx.send(CalSyncEvent::Error(format!("{}: {}", calendar_url, e)));
             return;
         }
     };
+    // A rejected/expired token does not mean the server lacks
+    // sync-collection: retry once as an initial sync so a fresh token is
+    // stored, and only fall back to `calendar-query` (which never yields a
+    // token, so it would repeat every cycle) when that fails too.
+    if matches!(outcome, SyncOutcome::FullResyncRequired) && prior_token.is_some() {
+        prior_token = None;
+        outcome = match client.sync_calendar(calendar_url, None) {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = tx.send(CalSyncEvent::Error(format!("{}: {}", calendar_url, e)));
+                return;
+            }
+        };
+    }
 
     let mut applied = 0usize;
     match outcome {
@@ -288,6 +343,7 @@ fn sync_one_calendar(
             changed,
             deleted,
         } => {
+            let seen_hrefs: HashSet<String> = changed.iter().map(|e| e.href.clone()).collect();
             for changed_event in changed {
                 if apply_changed_event(account_name, calendar_url, client, db, &changed_event) {
                     applied += 1;
@@ -296,6 +352,11 @@ fn sync_one_calendar(
             for href in deleted {
                 let _ = db.delete_calendar_event_by_href(account_name, calendar_url, &href);
                 applied += 1;
+            }
+            if prior_token.is_none() {
+                // An initial sync enumerates the whole collection, so
+                // anything it did not list is gone server-side.
+                reconcile_missing(account_name, calendar_url, db, &seen_hrefs);
             }
             let _ = db.set_calendar_sync_state(account_name, calendar_url, None, token.as_deref());
         }
@@ -307,23 +368,7 @@ fn sync_one_calendar(
                         applied += 1;
                     }
                 }
-                // Reconcile deletions: anything cached locally for this
-                // calendar that the server no longer listed.
-                if let Ok(cached) =
-                    db.get_calendar_events_in_range(Some(account_name), i64::MIN, i64::MAX)
-                {
-                    for row in cached.iter().filter(|r| r.calendar_url == calendar_url) {
-                        if !seen_hrefs.contains(&row.href)
-                            && row.local_status == db::CAL_STATUS_SYNCED
-                        {
-                            let _ = db.delete_calendar_event_by_href(
-                                account_name,
-                                calendar_url,
-                                &row.href,
-                            );
-                        }
-                    }
-                }
+                reconcile_missing(account_name, calendar_url, db, &seen_hrefs);
             }
             Err(e) => {
                 let _ = tx.send(CalSyncEvent::Error(format!(
@@ -746,5 +791,28 @@ mod tests {
         // Row must remain pending_create (not silently marked synced).
         let row = db.get_calendar_event_by_id(local_id).unwrap().unwrap();
         assert_eq!(row.local_status, db::CAL_STATUS_PENDING_CREATE);
+    }
+}
+
+#[cfg(test)]
+mod legacy_etag_repair_tests {
+    use super::effective_prior_token;
+
+    #[test]
+    fn legacy_unquoted_etags_force_an_initial_sync() {
+        assert_eq!(
+            effective_prior_token(true, Some("urn:token:42".to_string())),
+            None
+        );
+        assert_eq!(effective_prior_token(true, None), None);
+    }
+
+    #[test]
+    fn healthy_calendars_keep_their_stored_token() {
+        assert_eq!(
+            effective_prior_token(false, Some("urn:token:42".to_string())),
+            Some("urn:token:42".to_string())
+        );
+        assert_eq!(effective_prior_token(false, None), None);
     }
 }

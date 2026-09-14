@@ -111,6 +111,18 @@ fn local_date_of(ts_utc: i64) -> NaiveDate {
         .date_naive()
 }
 
+/// The calendar date an *all-day* instant stands for. All-day
+/// `DTSTART`/`DTEND` values are dates, not moments, and
+/// `calendar::EventTime::all_day` stores them as midnight **UTC** — so
+/// they must be read back as UTC dates. Routing them through the local
+/// zone (as timed events are) would shift a multi-day all-day event onto
+/// an extra day anywhere east of Greenwich.
+fn utc_date_of(ts_utc: i64) -> NaiveDate {
+    DateTime::<Utc>::from_timestamp(ts_utc, 0)
+        .unwrap_or_else(Utc::now)
+        .date_naive()
+}
+
 trait WeekStartExt {
     /// Days from this week-start convention's first day to `weekday`
     /// (0 for the start-of-week day itself, up to 6).
@@ -1308,8 +1320,8 @@ impl CalApp {
             .enumerate()
             .filter(|(_, e)| {
                 if e.all_day {
-                    let start_date = local_date_of(e.dtstart_utc);
-                    let end_date = local_date_of((e.dtend_utc - 1).max(e.dtstart_utc));
+                    let start_date = utc_date_of(e.dtstart_utc);
+                    let end_date = utc_date_of((e.dtend_utc - 1).max(e.dtstart_utc));
                     start_date <= day && day <= end_date
                 } else {
                     let d = local_date_of(e.dtstart_utc);

@@ -480,6 +480,23 @@ fn parse_http_status_line(text: &str) -> Option<u16> {
     text.split_whitespace().nth(1).and_then(|c| c.parse().ok())
 }
 
+/// Resolve one `XmlEvent::GeneralRef` (the text between `&` and `;`) to
+/// the characters it stands for: numeric character references
+/// (`&#38;`, `&#x26;`), then the five predefined XML entities
+/// (`amp`, `lt`, `gt`, `quot`, `apos`). Anything else (a document-defined
+/// entity we have no DTD for) is kept verbatim as `&name;` rather than
+/// dropped, so no bytes of the server's text ever vanish.
+pub(crate) fn general_ref_text(reference: &quick_xml::events::BytesRef<'_>) -> String {
+    if let Ok(Some(ch)) = reference.resolve_char_ref() {
+        return ch.to_string();
+    }
+    let name: &str = reference;
+    match quick_xml::escape::resolve_predefined_entity(name) {
+        Some(s) => s.to_string(),
+        None => format!("&{};", name),
+    }
+}
+
 fn parse_multistatus(xml: &str) -> Result<MultiStatusDoc> {
     let mut reader = Reader::from_str(xml);
     let mut doc = MultiStatusDoc::default();
@@ -524,6 +541,16 @@ fn parse_multistatus(xml: &str) -> Result<MultiStatusDoc> {
                     Ok(decoded) => text.push_str(&decoded),
                     Err(_) => text.push_str(raw),
                 }
+            }
+            // quick-xml (>= 0.38) reports entity and character references
+            // (`&quot;`, `&amp;`, `&#38;`, `&#x26;`, ...) as their own event
+            // rather than as part of the surrounding `Text`. Servers routinely
+            // escape the quotes around ETags and any `&`/`<`/`>` inside
+            // `calendar-data`, so dropping these silently would store
+            // unquoted ETags (breaking every `If-Match`) and corrupt event
+            // text.
+            XmlEvent::GeneralRef(e) => {
+                text.push_str(&general_ref_text(&e));
             }
             XmlEvent::CData(e) => {
                 let raw: &str = e.as_ref();
@@ -755,14 +782,14 @@ mod tests {
                 assert_eq!(token.as_deref(), Some("https://cal.example.com/sync/2"));
                 assert_eq!(changed.len(), 1);
                 assert_eq!(changed[0].href, "/cal/personal/event1.ics");
+                // The fixture escapes the ETag quotes and the `&`/`<`/`>` in
+                // the body the way real servers (sabre/dav, Google) do; the
+                // decoded values must come back byte-exact.
                 assert_eq!(changed[0].etag.as_deref(), Some("\"etag-1\""));
-                assert!(
-                    changed[0]
-                        .calendar_data
-                        .as_ref()
-                        .unwrap()
-                        .contains("UID:event1")
-                );
+                let data = changed[0].calendar_data.as_ref().unwrap();
+                assert!(data.contains("UID:event1"));
+                assert!(data.contains("SUMMARY:Product Q&A Drop-In"), "{data}");
+                assert!(data.contains("DESCRIPTION:a <b> & c & d"), "{data}");
                 assert_eq!(deleted, vec!["/cal/personal/event2.ics".to_string()]);
             }
             SyncOutcome::FullResyncRequired => panic!("expected Delta"),
@@ -894,8 +921,55 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].href, "/cal/personal/a.ics");
+        assert_eq!(events[0].etag.as_deref(), Some("\"a1\""));
         assert!(events[0].calendar_data.as_ref().unwrap().contains("UID:a"));
         assert_eq!(events[1].href, "/cal/personal/b.ics");
+        assert_eq!(events[1].etag.as_deref(), Some("\"b1\""));
+    }
+
+    #[test]
+    fn initial_sync_sends_an_empty_sync_token_element() {
+        // An RFC 6578 initial sync (no prior token) must send an empty
+        // `<D:sync-token/>`, which makes the server enumerate every member
+        // — the path `calsync` relies on to repair legacy caches.
+        let body = sync_collection_body(None);
+        assert!(body.contains("<D:sync-token></D:sync-token>"), "{body}");
+        let body2 = sync_collection_body(Some("urn:x:7"));
+        assert!(
+            body2.contains("<D:sync-token>urn:x:7</D:sync-token>"),
+            "{body2}"
+        );
+    }
+
+    #[test]
+    fn parse_multistatus_resolves_entity_and_character_references() {
+        // Entity references arrive as separate quick-xml events; every
+        // form must be decoded and accumulated in document order, and an
+        // entity we cannot resolve must be kept verbatim, never dropped.
+        let xml = r#"<?xml version="1.0"?>
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/cal/r&amp;d/</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+        <D:displayname>R&amp;D &lt;team&gt; &#39;quoted&#x27; &unknown;</D:displayname>
+        <D:getetag>&quot;e1&quot;</D:getetag>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+        let doc = parse_multistatus(xml).unwrap();
+        assert_eq!(doc.responses.len(), 1);
+        let r = &doc.responses[0];
+        assert_eq!(r.href.as_deref(), Some("/cal/r&d/"));
+        assert_eq!(
+            r.displayname.as_deref(),
+            Some("R&D <team> 'quoted' &unknown;")
+        );
+        assert_eq!(r.etag.as_deref(), Some("\"e1\""));
+        assert!(r.is_calendar_collection);
     }
 
     #[test]
@@ -963,8 +1037,8 @@ mod tests {
     <D:href>/cal/personal/event1.ics</D:href>
     <D:propstat>
       <D:prop>
-        <D:getetag>"etag-1"</D:getetag>
-        <C:calendar-data>BEGIN:VEVENT\r\nUID:event1\r\nEND:VEVENT\r\n</C:calendar-data>
+        <D:getetag>&quot;etag-1&quot;</D:getetag>
+        <C:calendar-data>BEGIN:VEVENT\r\nUID:event1\r\nSUMMARY:Product Q&amp;A Drop-In\r\nDESCRIPTION:a &lt;b&gt; &#38; c &#x26; d\r\nEND:VEVENT\r\n</C:calendar-data>
       </D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>
     </D:propstat>
@@ -982,7 +1056,7 @@ mod tests {
     <D:href>/cal/personal/a.ics</D:href>
     <D:propstat>
       <D:prop>
-        <D:getetag>"a1"</D:getetag>
+        <D:getetag>&quot;a1&quot;</D:getetag>
         <C:calendar-data>BEGIN:VEVENT\r\nUID:a\r\nEND:VEVENT\r\n</C:calendar-data>
       </D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>
@@ -992,7 +1066,7 @@ mod tests {
     <D:href>/cal/personal/b.ics</D:href>
     <D:propstat>
       <D:prop>
-        <D:getetag>"b1"</D:getetag>
+        <D:getetag>&quot;b1&quot;</D:getetag>
         <C:calendar-data>BEGIN:VEVENT\r\nUID:b\r\nEND:VEVENT\r\n</C:calendar-data>
       </D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>

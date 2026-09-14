@@ -989,6 +989,11 @@ fn expand_rrule_occurrences(
 // Serialization
 // ---------------------------------------------------------------------
 
+/// Properties `patch_raw_vevent` drops from the original block and
+/// re-emits from the model. `RRULE` is listed even though it is not
+/// editable after creation: `replacement_lines` always re-emits the
+/// model's `RRULE`, so without dropping the original the patched block
+/// would carry the rule twice.
 const PROPERTY_NAMES_TO_PATCH: &[&str] = &[
     "SUMMARY",
     "DESCRIPTION",
@@ -997,6 +1002,7 @@ const PROPERTY_NAMES_TO_PATCH: &[&str] = &[
     "DTSTART",
     "DTEND",
     "DURATION",
+    "RRULE",
     "SEQUENCE",
     "DTSTAMP",
     "LAST-MODIFIED",
@@ -1126,6 +1132,119 @@ fn render_trigger(t: &AlarmTrigger) -> String {
             format!("TRIGGER{}:{}", related_param, format_ical_duration(*offset))
         }
     }
+}
+
+/// Whether this `VEVENT` is a `RECURRENCE-ID` override of a recurring
+/// series rather than the series master. Decided from the raw block since
+/// `RECURRENCE-ID` is not otherwise modeled; an event without raw text is
+/// never an override (locally-created events are always masters).
+pub fn is_recurrence_override(event: &VEvent) -> bool {
+    event.raw.as_deref().is_some_and(|raw| {
+        unfold(raw)
+            .iter()
+            .any(|line| line.len() >= 13 && line[..13].eq_ignore_ascii_case("RECURRENCE-ID"))
+    })
+}
+
+/// Apply `edits` to `event` *inside its original document*: the patched
+/// `VEVENT` block replaces the matching component of `document` (the
+/// master with the same `UID`, i.e. the one without a `RECURRENCE-ID`,
+/// falling back to the first component with that `UID`) and everything
+/// else — the `VCALENDAR` wrapper, `PRODID`, `VTIMEZONE` blocks, override
+/// components, `X-` properties — is preserved byte-for-byte. A document
+/// without a `VCALENDAR` wrapper (rows written by older builds, or a
+/// server that returned a bare component) gets a minimal one, so the
+/// result is always a complete RFC 5545 object a strict server accepts.
+///
+/// [`VEvent::to_ics`] alone returns only the patched block when the event
+/// has raw text, which is why callers that store or upload the result
+/// must go through this function instead.
+pub fn patch_document(
+    document: &str,
+    event: &VEvent,
+    edits: &EventEdits,
+    now: DateTime<Utc>,
+) -> Result<String, CalendarError> {
+    let patched = event.to_ics(edits, now)?;
+    if event.raw.is_none() {
+        // `to_ics` built a fresh, complete document from the model.
+        return Ok(patched);
+    }
+    let patched_lines = unfold(&patched);
+    let doc_lines = unfold(document);
+
+    // Locate every top-level VEVENT block: (start, end_inclusive, uid,
+    // is_override).
+    let mut blocks: Vec<(usize, usize, Option<String>, bool)> = Vec::new();
+    let mut i = 0;
+    while i < doc_lines.len() {
+        if doc_lines[i].eq_ignore_ascii_case("BEGIN:VEVENT") {
+            let start = i;
+            let mut depth = 1;
+            let mut uid = None;
+            let mut is_override = false;
+            i += 1;
+            while i < doc_lines.len() && depth > 0 {
+                let line = &doc_lines[i];
+                if line.len() >= 6 && line[..6].eq_ignore_ascii_case("BEGIN:") {
+                    depth += 1;
+                } else if line.len() >= 4 && line[..4].eq_ignore_ascii_case("END:") {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                } else if depth == 1
+                    && let Some(cl) = parse_content_line(line)
+                {
+                    match cl.name.as_str() {
+                        "UID" => uid = Some(cl.value.trim().to_string()),
+                        "RECURRENCE-ID" => is_override = true,
+                        _ => {}
+                    }
+                }
+                i += 1;
+            }
+            let end = i.min(doc_lines.len().saturating_sub(1));
+            blocks.push((start, end, uid, is_override));
+        }
+        i += 1;
+    }
+
+    let target = blocks
+        .iter()
+        .find(|(_, _, uid, is_override)| uid.as_deref() == Some(event.uid.as_str()) && !is_override)
+        .or_else(|| {
+            blocks
+                .iter()
+                .find(|(_, _, uid, _)| uid.as_deref() == Some(event.uid.as_str()))
+        })
+        .or_else(|| blocks.first());
+
+    let mut out: Vec<String> = match target {
+        Some(&(start, end, _, _)) => {
+            let mut v = doc_lines[..start].to_vec();
+            v.extend(patched_lines.iter().cloned());
+            v.extend(doc_lines[end + 1..].iter().cloned());
+            v
+        }
+        None => patched_lines.clone(),
+    };
+
+    let has_wrapper = out
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case("BEGIN:VCALENDAR"));
+    if !has_wrapper {
+        let mut wrapped = vec![
+            "BEGIN:VCALENDAR".to_string(),
+            "VERSION:2.0".to_string(),
+            "PRODID:-//jamail//jacal//EN".to_string(),
+        ];
+        wrapped.extend(out.into_iter().filter(|l| !l.is_empty()));
+        wrapped.push("END:VCALENDAR".to_string());
+        out = wrapped;
+    }
+    out.retain(|l| !l.is_empty());
+    Ok(out.join("\r\n") + "\r\n")
 }
 
 /// Patch a raw `VEVENT` block: drop existing lines for any property in
@@ -1684,5 +1803,152 @@ END:VCALENDAR\r\n";
             occurrences,
             vec![(utc(2024, 1, 1, 9, 0, 0), utc(2024, 1, 1, 9, 15, 0))]
         );
+    }
+
+    const GOOGLE_STYLE_DOCUMENT: &str = "BEGIN:VCALENDAR\r\n\
+PRODID:-//Google Inc//Google Calendar 70.9054//EN\r\n\
+VERSION:2.0\r\n\
+CALSCALE:GREGORIAN\r\n\
+X-WR-CALNAME:tamas@example.com\r\n\
+BEGIN:VTIMEZONE\r\n\
+TZID:Europe/Budapest\r\n\
+BEGIN:DAYLIGHT\r\n\
+TZOFFSETFROM:+0100\r\n\
+TZOFFSETTO:+0200\r\n\
+TZNAME:CEST\r\n\
+DTSTART:19700329T020000\r\n\
+RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\n\
+END:DAYLIGHT\r\n\
+BEGIN:STANDARD\r\n\
+TZOFFSETFROM:+0200\r\n\
+TZOFFSETTO:+0100\r\n\
+TZNAME:CET\r\n\
+DTSTART:19701025T030000\r\n\
+RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\n\
+END:STANDARD\r\n\
+END:VTIMEZONE\r\n\
+BEGIN:VTIMEZONE\r\n\
+TZID:Europe/London\r\n\
+BEGIN:STANDARD\r\n\
+TZOFFSETFROM:+0000\r\n\
+TZOFFSETTO:+0000\r\n\
+TZNAME:GMT\r\n\
+DTSTART:19701025T020000\r\n\
+END:STANDARD\r\n\
+END:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\n\
+UID:series@google.com\r\n\
+DTSTART;TZID=Europe/Budapest:20240115T090000\r\n\
+DTEND;TZID=Europe/Budapest:20240115T100000\r\n\
+RRULE:FREQ=WEEKLY;BYDAY=MO\r\n\
+SUMMARY:Weekly\r\n\
+SEQUENCE:1\r\n\
+X-GOOGLE-CONFERENCE:https://meet.example.com/abc\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:series@google.com\r\n\
+RECURRENCE-ID;TZID=Europe/Budapest:20240122T090000\r\n\
+DTSTART;TZID=Europe/Budapest:20240122T100000\r\n\
+DTEND;TZID=Europe/Budapest:20240122T110000\r\n\
+SUMMARY:Weekly (moved)\r\n\
+SEQUENCE:2\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+    #[test]
+    fn patch_document_preserves_wrapper_vtimezones_and_overrides() {
+        let events = parse_vevents(GOOGLE_STYLE_DOCUMENT).unwrap();
+        assert_eq!(events.len(), 2);
+        let master = events
+            .iter()
+            .find(|e| !is_recurrence_override(e))
+            .expect("master");
+        assert!(is_recurrence_override(&events[1]));
+
+        let edits = EventEdits {
+            summary: Some("Weekly (renamed)".to_string()),
+            ..Default::default()
+        };
+        let patched = patch_document(
+            GOOGLE_STYLE_DOCUMENT,
+            master,
+            &edits,
+            utc(2024, 2, 1, 0, 0, 0),
+        )
+        .unwrap();
+
+        assert!(patched.starts_with("BEGIN:VCALENDAR\r\n"), "{patched}");
+        assert!(patched.trim_end().ends_with("END:VCALENDAR"), "{patched}");
+        assert!(patched.contains("PRODID:-//Google Inc//Google Calendar 70.9054//EN"));
+        assert!(patched.contains("X-WR-CALNAME:tamas@example.com"));
+        assert_eq!(patched.matches("BEGIN:VTIMEZONE").count(), 2);
+        assert!(patched.contains("TZID:Europe/Budapest"));
+        assert!(patched.contains("TZID:Europe/London"));
+        // Exactly two VEVENTs: the patched master and the untouched override.
+        assert_eq!(patched.matches("BEGIN:VEVENT").count(), 2);
+        assert!(patched.contains("SUMMARY:Weekly (renamed)"));
+        assert!(patched.contains("SUMMARY:Weekly (moved)"));
+        assert!(patched.contains("RECURRENCE-ID;TZID=Europe/Budapest:20240122T090000"));
+        assert!(patched.contains("X-GOOGLE-CONFERENCE:https://meet.example.com/abc"));
+        // The master's RRULE is emitted exactly once (the override has none).
+        assert_eq!(patched.matches("RRULE:FREQ=WEEKLY;BYDAY=MO").count(), 1);
+        // The master's SEQUENCE was bumped, the override's was not.
+        assert!(patched.contains("SEQUENCE:2\r\n"));
+        assert!(!patched.contains("SEQUENCE:1\r\n"));
+
+        // Still parses, and the override survived byte-for-byte.
+        let reparsed = parse_vevents(&patched).unwrap();
+        assert_eq!(reparsed.len(), 2);
+        assert_eq!(reparsed[0].summary, "Weekly (renamed)");
+        assert_eq!(reparsed[1].raw, events[1].raw);
+    }
+
+    #[test]
+    fn patch_document_wraps_a_bare_vevent() {
+        let bare = "BEGIN:VEVENT\r\nUID:bare\r\nDTSTART:20240115T090000Z\r\nDTEND:20240115T100000Z\r\nSUMMARY:Old\r\nEND:VEVENT\r\n";
+        let event = &parse_vevents(bare).unwrap()[0];
+        let edits = EventEdits {
+            summary: Some("New".to_string()),
+            ..Default::default()
+        };
+        let patched = patch_document(bare, event, &edits, utc(2024, 2, 1, 0, 0, 0)).unwrap();
+        assert!(patched.starts_with("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:"));
+        assert!(patched.trim_end().ends_with("END:VCALENDAR"));
+        assert_eq!(patched.matches("BEGIN:VEVENT").count(), 1);
+        assert!(patched.contains("SUMMARY:New"));
+        assert!(!patched.contains("SUMMARY:Old"));
+    }
+
+    #[test]
+    fn editing_a_recurring_event_emits_a_single_rrule() {
+        let ics = "BEGIN:VEVENT\r\nUID:r\r\nDTSTART:20240101T090000Z\r\nDTEND:20240101T093000Z\r\nRRULE:FREQ=DAILY;COUNT=3\r\nSUMMARY:Daily\r\nEND:VEVENT\r\n";
+        let event = &parse_vevents(ics).unwrap()[0];
+        let edits = EventEdits {
+            location: Some("Room 1".to_string()),
+            ..Default::default()
+        };
+        let patched = event.to_ics(&edits, utc(2024, 1, 2, 0, 0, 0)).unwrap();
+        assert_eq!(patched.matches("RRULE:").count(), 1, "{patched}");
+        assert!(patched.contains("RRULE:FREQ=DAILY;COUNT=3"));
+        let reparsed = &parse_vevents(&patched).unwrap()[0];
+        assert_eq!(reparsed.rrule.as_deref(), Some("FREQ=DAILY;COUNT=3"));
+        assert_eq!(reparsed.location, "Room 1");
+    }
+
+    #[test]
+    fn patch_document_for_a_never_uploaded_event_builds_a_full_document() {
+        // No raw text: `to_ics` builds from the model, and the result must
+        // already be a complete document (nothing to splice into).
+        let mut event = parse_vevents(
+            "BEGIN:VEVENT\r\nUID:fresh\r\nDTSTART:20240115T090000Z\r\nDTEND:20240115T100000Z\r\nSUMMARY:Fresh\r\nEND:VEVENT\r\n",
+        )
+        .unwrap()
+        .remove(0);
+        event.raw = None;
+        let patched =
+            patch_document("", &event, &EventEdits::default(), utc(2024, 2, 1, 0, 0, 0)).unwrap();
+        assert!(patched.starts_with("BEGIN:VCALENDAR"));
+        assert_eq!(patched.matches("BEGIN:VEVENT").count(), 1);
+        assert!(patched.contains("UID:fresh"));
     }
 }

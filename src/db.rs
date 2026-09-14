@@ -1299,6 +1299,33 @@ impl MailDb {
             .flatten())
     }
 
+    /// Whether any synced event in this calendar still carries an ETag
+    /// stored without its surrounding quotes. Builds before the CalDAV
+    /// client learned to decode XML entity references stored
+    /// `&quot;abc&quot;` as `abc`, which every `If-Match` then failed
+    /// against. A `true` here tells `calsync` to run one initial
+    /// (token-less) sync so the server re-lists every member and the
+    /// stored ETags (and any `&`/`<`/`>`-stripped text) are rewritten;
+    /// the condition clears itself on that pass. Never-uploaded rows
+    /// (`local:` hrefs) and weak ETags (`W/"..."`) are not legacy.
+    pub fn calendar_has_unquoted_etags(&self, account: &str, url: &str) -> Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM calendar_events
+                 WHERE account = ?1 AND calendar_url = ?2
+                   AND etag IS NOT NULL
+                   AND etag NOT LIKE '\"%'
+                   AND etag NOT LIKE 'W/\"%'
+                   AND href NOT LIKE ?3
+                 LIMIT 1",
+                params![account, url, format!("{}%", LOCAL_HREF_PREFIX)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     pub fn set_calendar_sync_state(
         &self,
         account: &str,
@@ -1471,7 +1498,9 @@ impl MailDb {
     /// and mark it `pending_update` (unless it's still `pending_create`,
     /// in which case it stays `pending_create` — there's nothing to
     /// "update" server-side yet). Rebuilds the stored raw ICS via
-    /// [`VEvent::to_ics`] so unmodeled properties survive the edit.
+    /// [`crate::calendar::patch_document`] so the `VCALENDAR` wrapper,
+    /// `VTIMEZONE` blocks and every unmodeled property survive the edit
+    /// and the result is a complete document a strict server accepts.
     pub fn apply_local_calendar_edit(
         &self,
         id: i64,
@@ -1481,13 +1510,23 @@ impl MailDb {
             .get_calendar_event_by_id(id)?
             .context("calendar event not found")?;
         let event = row.to_vevent()?;
-        let new_ics = event
-            .to_ics(edits, Utc::now())
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        let updated = crate::calendar::parse_vevents(&new_ics)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?
-            .into_iter()
-            .next()
+        let now = Utc::now();
+        let new_ics = match &row.raw_ics {
+            Some(document) => crate::calendar::patch_document(document, &event, edits, now),
+            None => event.to_ics(edits, now),
+        }
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // Re-derive the indexed columns from the series master (the
+        // component with this UID and no RECURRENCE-ID), not from
+        // whichever component happens to come first in the document.
+        let reparsed =
+            crate::calendar::parse_vevents(&new_ics).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let updated = reparsed
+            .iter()
+            .find(|e| e.uid == row.uid && !crate::calendar::is_recurrence_override(e))
+            .or_else(|| reparsed.iter().find(|e| e.uid == row.uid))
+            .or_else(|| reparsed.first())
+            .cloned()
             .context("re-parsing edited event produced no VEVENT")?;
         let next_status = if row.local_status == CAL_STATUS_PENDING_CREATE {
             CAL_STATUS_PENDING_CREATE
@@ -2720,6 +2759,87 @@ mod calendar_event_tests {
         .unwrap();
         let row = db.get_calendar_event_by_id(id).unwrap().unwrap();
         assert_eq!(row.local_status, CAL_STATUS_PENDING_CREATE);
+    }
+
+    #[test]
+    fn apply_local_edit_keeps_the_full_vcalendar_document() {
+        let db = MailDb::open_in_memory().unwrap();
+        let document = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//EN\r\n\
+BEGIN:VTIMEZONE\r\nTZID:Europe/Budapest\r\nBEGIN:STANDARD\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nDTSTART:19701025T030000\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\nUID:doc-1\r\nDTSTART;TZID=Europe/Budapest:20240115T090000\r\nDTEND;TZID=Europe/Budapest:20240115T100000\r\nSUMMARY:Old\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:doc-1\r\nRECURRENCE-ID;TZID=Europe/Budapest:20240122T090000\r\nDTSTART;TZID=Europe/Budapest:20240122T110000\r\nDTEND;TZID=Europe/Budapest:20240122T120000\r\nSUMMARY:Old (moved)\r\nEND:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let master = parse_vevents(document).unwrap().remove(0);
+        let id = db
+            .upsert_calendar_event(
+                ACCOUNT,
+                CAL_URL,
+                "/dav/personal/doc-1.ics",
+                Some("\"v1\""),
+                &master,
+                document,
+            )
+            .unwrap();
+
+        db.apply_local_calendar_edit(
+            id,
+            &EventEdits {
+                summary: Some("New".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let row = db.get_calendar_event_by_id(id).unwrap().unwrap();
+        let raw = row.raw_ics.as_deref().unwrap();
+        assert!(raw.starts_with("BEGIN:VCALENDAR"), "{raw}");
+        assert!(raw.contains("BEGIN:VTIMEZONE"));
+        assert!(raw.contains("PRODID:-//Example//EN"));
+        assert_eq!(raw.matches("BEGIN:VEVENT").count(), 2);
+        assert!(raw.contains("SUMMARY:New"));
+        assert!(raw.contains("SUMMARY:Old (moved)"));
+        // Indexed columns come from the master, not the override.
+        assert_eq!(row.summary, "New");
+        assert_eq!(row.local_status, CAL_STATUS_PENDING_UPDATE);
+    }
+
+    #[test]
+    fn calendar_has_unquoted_etags_detects_only_legacy_synced_rows() {
+        let db = MailDb::open_in_memory().unwrap();
+        let put = |uid: &str, href: &str, etag: Option<&str>| {
+            let event = sample_event(uid);
+            db.upsert_calendar_event(
+                ACCOUNT,
+                CAL_URL,
+                href,
+                etag,
+                &event,
+                event.raw.as_ref().unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(!db.calendar_has_unquoted_etags(ACCOUNT, CAL_URL).unwrap());
+
+        put("q", "/dav/personal/q.ics", Some("\"quoted\""));
+        put("w", "/dav/personal/w.ics", Some("W/\"weak\""));
+        put("n", "/dav/personal/n.ics", None);
+        assert!(!db.calendar_has_unquoted_etags(ACCOUNT, CAL_URL).unwrap());
+
+        // A never-uploaded local row with a bare etag is not "legacy".
+        put("l", &format!("{}l", LOCAL_HREF_PREFIX), Some("bare"));
+        assert!(!db.calendar_has_unquoted_etags(ACCOUNT, CAL_URL).unwrap());
+
+        put(
+            "u",
+            "/dav/personal/u.ics",
+            Some("0eb3f81ec60ce0758d8d394aab3f1f03"),
+        );
+        assert!(db.calendar_has_unquoted_etags(ACCOUNT, CAL_URL).unwrap());
+        // Other calendars are unaffected.
+        assert!(
+            !db.calendar_has_unquoted_etags(ACCOUNT, "https://cal.example.com/dav/other/")
+                .unwrap()
+        );
     }
 
     #[test]
