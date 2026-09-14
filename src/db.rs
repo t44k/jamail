@@ -1259,10 +1259,23 @@ impl MailDb {
     /// those, so a rediscovery pass (which only learns the display name
     /// again) can't accidentally reset sync progress.
     pub fn upsert_calendar(&self, account: &str, url: &str, display_name: &str) -> Result<()> {
+        self.upsert_calendar_with_color(account, url, display_name, None)
+    }
+
+    /// [`Self::upsert_calendar`] that also records the server's
+    /// `calendar-color`; `None` leaves a previously stored colour alone.
+    pub fn upsert_calendar_with_color(
+        &self,
+        account: &str,
+        url: &str,
+        display_name: &str,
+        color: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO calendars (account, url, display_name) VALUES (?1, ?2, ?3)
-             ON CONFLICT(account, url) DO UPDATE SET display_name = excluded.display_name",
-            params![account, url, display_name],
+            "INSERT INTO calendars (account, url, display_name, color) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account, url) DO UPDATE SET display_name = excluded.display_name,
+                 color = COALESCE(excluded.color, calendars.color)",
+            params![account, url, display_name, color],
         )?;
         Ok(())
     }

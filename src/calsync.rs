@@ -259,7 +259,12 @@ fn run_one_cycle(
             continue;
         }
         kept_urls.push(cal.url.clone());
-        let _ = db.upsert_calendar(account_name, &cal.url, &cal.display_name);
+        let _ = db.upsert_calendar_with_color(
+            account_name,
+            &cal.url,
+            &cal.display_name,
+            cal.color.as_deref(),
+        );
         sync_one_calendar(account_name, &cal.url, client, db, tx);
     }
     let _ = db.prune_calendars_not_in(account_name, &kept_urls);

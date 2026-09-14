@@ -99,6 +99,9 @@ pub struct DiscoveredCalendar {
     pub url: String,
     pub display_name: String,
     pub ctag: Option<String>,
+    /// Apple's `calendar-color` (`#rrggbb` or `#rrggbbaa`), the colour the
+    /// server (or the user, on the phone) gave the calendar.
+    pub color: Option<String>,
 }
 
 pub struct ChangedEvent {
@@ -267,6 +270,7 @@ impl CalDavClient {
                     url: resolved.to_absolute_string(),
                     display_name: r.displayname.unwrap_or_else(|| href.clone()),
                     ctag: r.ctag,
+                    color: r.color,
                 });
             }
         }
@@ -630,6 +634,7 @@ struct ResponseAccum {
     etag: Option<String>,
     calendar_data: Option<String>,
     displayname: Option<String>,
+    color: Option<String>,
     ctag: Option<String>,
     is_calendar_collection: bool,
     current_user_principal: Option<String>,
@@ -647,6 +652,7 @@ struct PropStatBuf {
     etag: Option<String>,
     calendar_data: Option<String>,
     displayname: Option<String>,
+    color: Option<String>,
     ctag: Option<String>,
     is_calendar: bool,
     current_user_principal: Option<String>,
@@ -770,6 +776,12 @@ fn parse_multistatus(xml: &str) -> Result<MultiStatusDoc> {
                     "getetag" => buf.etag = Some(text.trim().to_string()),
                     "calendar-data" => buf.calendar_data = Some(text.clone()),
                     "displayname" => buf.displayname = Some(text.trim().to_string()),
+                    "calendar-color" => {
+                        let c = text.trim();
+                        if !c.is_empty() {
+                            buf.color = Some(c.to_string());
+                        }
+                    }
                     "getctag" => buf.ctag = Some(text.trim().to_string()),
                     "sync-token" => doc.sync_token = Some(text.trim().to_string()),
                     "status" => {
@@ -793,6 +805,9 @@ fn parse_multistatus(xml: &str) -> Result<MultiStatusDoc> {
                             }
                             if buf.displayname.is_some() {
                                 c.displayname = buf.displayname.take();
+                            }
+                            if buf.color.is_some() {
+                                c.color = buf.color.take();
                             }
                             if buf.ctag.is_some() {
                                 c.ctag = buf.ctag.take();
@@ -838,11 +853,12 @@ const HOMESET_PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
 </D:propfind>"#;
 
 const CALENDAR_LIST_PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
-<D:propfind xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/">
+<D:propfind xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/" xmlns:A="http://apple.com/ns/ical/">
   <D:prop>
     <D:resourcetype/>
     <D:displayname/>
     <CS:getctag/>
+    <A:calendar-color/>
   </D:prop>
 </D:propfind>"#;
 
@@ -945,6 +961,7 @@ mod tests {
         let calendars = client.discover_calendars().unwrap();
         assert_eq!(calendars.len(), 1);
         assert_eq!(calendars[0].display_name, "Personal");
+        assert_eq!(calendars[0].color.as_deref(), Some("#3366FFFF"));
         assert!(calendars[0].url.ends_with("/cal/personal/"));
         let requests = handle.join().unwrap();
         assert!(requests[0].starts_with("PROPFIND / HTTP/1.1"));
@@ -1217,6 +1234,7 @@ mod tests {
       <D:prop>
         <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
         <D:displayname>Personal</D:displayname>
+        <A:calendar-color xmlns:A="http://apple.com/ns/ical/">#3366FFFF</A:calendar-color>
         <CS:getctag>"ctag-1"</CS:getctag>
       </D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>
