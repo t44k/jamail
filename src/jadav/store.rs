@@ -266,6 +266,56 @@ pub struct OauthTokenRow {
     pub needs_reauth: bool,
 }
 
+/// A queued outbound iMIP message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboundJob {
+    pub calendar_slug: String,
+    pub href_name: String,
+    pub ical_uid: String,
+    pub recurrence_id: Option<String>,
+    pub method: String,
+    pub sender: String,
+    pub recipient: String,
+    pub message_id: String,
+    /// The complete RFC 5322 message bytes.
+    pub raw_message: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedOutbound {
+    pub id: i64,
+    pub created_at: i64,
+    pub job: OutboundJob,
+    pub attempts: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImipProcessed {
+    pub message_id: String,
+    pub folder: Option<String>,
+    pub uid: Option<u32>,
+    pub method: Option<String>,
+    pub ical_uid: Option<String>,
+    pub recurrence_id: Option<String>,
+    pub sequence: Option<i64>,
+    pub dtstamp: Option<String>,
+    pub identity: Option<String>,
+    pub calendar_slug: Option<String>,
+    pub outcome: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InboxItem {
+    pub id: i64,
+    pub href_name: String,
+    pub identity: String,
+    pub ical_uid: String,
+    pub method: String,
+    pub etag: String,
+    pub ics: String,
+    pub received_at: i64,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CompactionReport {
     pub deleted_rows: usize,
@@ -1211,6 +1261,22 @@ impl Store {
         pre: Precondition<'_>,
         origin: Origin,
     ) -> Result<Result<WriteOutcome, PutError>> {
+        self.put_object_with(slug, href_name, ics, pre, origin, |_| Ok(()))
+    }
+
+    /// [`Self::put_object`] plus `extra`, run inside the same transaction
+    /// once the object write succeeded (the scheduling engine queues its
+    /// outbound mail here so a crash can never store the event without the
+    /// invitations, or vice versa).
+    pub fn put_object_with(
+        &self,
+        slug: &str,
+        href_name: &str,
+        ics: &str,
+        pre: Precondition<'_>,
+        origin: Origin,
+        extra: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<Result<WriteOutcome, PutError>> {
         let tx = self.conn.unchecked_transaction()?;
         let calendar = self
             .get_calendar(slug)?
@@ -1324,6 +1390,7 @@ impl Store {
             params![slug, href_name, validated.uid, origin.as_str(), rev, now],
         )?;
         let log_id = tx.last_insert_rowid();
+        extra(&tx)?;
         tx.commit()?;
         let new = self.get_object(slug, href_name)?;
         Ok(Ok(WriteOutcome {
@@ -1347,6 +1414,18 @@ impl Store {
         href_name: &str,
         pre: Precondition<'_>,
         origin: Origin,
+    ) -> Result<Result<WriteOutcome, DeleteError>> {
+        self.delete_object_with(slug, href_name, pre, origin, |_| Ok(()))
+    }
+
+    /// [`Self::delete_object`] plus `extra` in the same transaction.
+    pub fn delete_object_with(
+        &self,
+        slug: &str,
+        href_name: &str,
+        pre: Precondition<'_>,
+        origin: Origin,
+        extra: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<Result<WriteOutcome, DeleteError>> {
         let tx = self.conn.unchecked_transaction()?;
         let calendar = self
@@ -1391,6 +1470,7 @@ impl Store {
             ],
         )?;
         let log_id = tx.last_insert_rowid();
+        extra(&tx)?;
         tx.commit()?;
         Ok(Ok(WriteOutcome {
             calendar,
@@ -1746,7 +1826,198 @@ impl Store {
     }
 
     // ------------------------------------------------------------------
-    // Schedule inbox (served empty until the scheduling milestone)
+    // Outbound iMIP queue
+    // ------------------------------------------------------------------
+
+    /// Insert a queued message using an arbitrary connection (so it can
+    /// ride along inside [`Self::put_object_with`]'s transaction).
+    pub fn enqueue_outbound_on(conn: &Connection, job: &OutboundJob) -> Result<()> {
+        conn.execute(
+            "INSERT INTO outbound_queue (created_at, calendar_slug, href_name, ical_uid, recurrence_id,
+                 method, sender, recipient, message_id, raw_message, attempts, next_attempt_at, last_error, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?1, NULL, 'pending')",
+            params![
+                now_ts(),
+                job.calendar_slug,
+                job.href_name,
+                job.ical_uid,
+                job.recurrence_id,
+                job.method,
+                job.sender,
+                job.recipient,
+                job.message_id,
+                compress(&job.raw_message),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn enqueue_outbound(&self, job: &OutboundJob) -> Result<()> {
+        Self::enqueue_outbound_on(&self.conn, job)
+    }
+
+    /// Pending messages whose retry time has come, oldest first.
+    pub fn due_outbound(&self, now: i64, limit: usize) -> Result<Vec<QueuedOutbound>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at, calendar_slug, href_name, ical_uid, recurrence_id, method, sender,
+                    recipient, message_id, raw_message, attempts
+             FROM outbound_queue WHERE state = 'pending' AND next_attempt_at <= ?1
+             ORDER BY id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![now, limit as i64], |r| {
+            let blob: Vec<u8> = r.get(10)?;
+            Ok(QueuedOutbound {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
+                job: OutboundJob {
+                    calendar_slug: r.get(2)?,
+                    href_name: r.get(3)?,
+                    ical_uid: r.get(4)?,
+                    recurrence_id: r.get(5)?,
+                    method: r.get(6)?,
+                    sender: r.get(7)?,
+                    recipient: r.get(8)?,
+                    message_id: r.get(9)?,
+                    raw_message: decompress(&blob),
+                },
+                attempts: r.get(11)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn mark_outbound_sent(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE outbound_queue SET state = 'sent', last_error = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_outbound_failed(&self, id: i64, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE outbound_queue SET state = 'failed', last_error = ?2 WHERE id = ?1",
+            params![id, error],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_outbound_retry(&self, id: i64, next_attempt_at: i64, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE outbound_queue SET attempts = attempts + 1, next_attempt_at = ?2, last_error = ?3 WHERE id = ?1",
+            params![id, next_attempt_at, error],
+        )?;
+        Ok(())
+    }
+
+    /// The earliest pending retry time, for the worker's sleep.
+    pub fn next_outbound_due(&self) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT MIN(next_attempt_at) FROM outbound_queue WHERE state = 'pending'",
+                [],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// `(pending, sent, failed)` counts.
+    pub fn outbound_counts(&self) -> Result<(i64, i64, i64)> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(state = 'pending'), 0), COALESCE(SUM(state = 'sent'), 0), COALESCE(SUM(state = 'failed'), 0) FROM outbound_queue",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?)
+    }
+
+    // ------------------------------------------------------------------
+    // Inbound mail bookkeeping
+    // ------------------------------------------------------------------
+
+    pub fn imap_cursor(&self, folder: &str) -> Result<Option<(u32, u32)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT uidvalidity, last_uid FROM imap_cursor WHERE folder = ?1",
+                params![folder],
+                |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32)),
+            )
+            .optional()?)
+    }
+
+    pub fn set_imap_cursor(&self, folder: &str, uidvalidity: u32, last_uid: u32) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO imap_cursor (folder, uidvalidity, last_uid) VALUES (?1, ?2, ?3)
+             ON CONFLICT(folder) DO UPDATE SET uidvalidity = excluded.uidvalidity, last_uid = excluded.last_uid",
+            params![folder, i64::from(uidvalidity), i64::from(last_uid)],
+        )?;
+        Ok(())
+    }
+
+    /// Record a message as seen; `false` if it already was.
+    pub fn imap_seen_insert(&self, folder: &str, uidvalidity: u32, uid: u32) -> Result<bool> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO imap_seen (folder, uidvalidity, uid, seen_at) VALUES (?1, ?2, ?3, ?4)",
+            params![folder, i64::from(uidvalidity), i64::from(uid), now_ts()],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn imip_processed_find(&self, message_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT outcome FROM imip_processed WHERE message_id = ?1",
+                params![message_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn imip_processed_insert(&self, rec: &ImipProcessed) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO imip_processed (message_id, folder, uid, method, ical_uid, recurrence_id,
+                 sequence, dtstamp, identity, calendar_slug, outcome, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                rec.message_id,
+                rec.folder,
+                rec.uid.map(i64::from),
+                rec.method,
+                rec.ical_uid,
+                rec.recurrence_id,
+                rec.sequence,
+                rec.dtstamp,
+                rec.identity,
+                rec.calendar_slug,
+                rec.outcome,
+                now_ts(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The Message-ID of the invitation we received for `uid`, if any
+    /// (for `In-Reply-To` on our REPLY).
+    pub fn invitation_message_id(&self, ical_uid: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT message_id FROM imip_processed WHERE ical_uid = ?1 AND method = 'REQUEST' ORDER BY id DESC LIMIT 1",
+                params![ical_uid],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    // ------------------------------------------------------------------
+    // Schedule inbox
     // ------------------------------------------------------------------
 
     pub fn inbox_ctag(&self) -> Result<i64> {
@@ -1755,6 +2026,85 @@ impl Store {
             .query_row("SELECT COALESCE(MAX(id), 0) FROM schedule_inbox", [], |r| {
                 r.get(0)
             })?)
+    }
+
+    pub fn inbox_insert(
+        &self,
+        identity: &str,
+        ical_uid: &str,
+        method: &str,
+        itip_ics: &str,
+    ) -> Result<InboxItem> {
+        let etag = compute_etag(itip_ics);
+        let now = now_ts();
+        let href_name = format!("{}-{}.ics", now, &etag.trim_matches('"')[..12]);
+        self.conn.execute(
+            "INSERT INTO schedule_inbox (href_name, identity, ical_uid, method, etag, raw_itip_zstd, received_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                href_name,
+                identity,
+                ical_uid,
+                method,
+                etag,
+                compress(itip_ics.as_bytes()),
+                now
+            ],
+        )?;
+        Ok(InboxItem {
+            id: self.conn.last_insert_rowid(),
+            href_name,
+            identity: identity.to_string(),
+            ical_uid: ical_uid.to_string(),
+            method: method.to_string(),
+            etag,
+            ics: itip_ics.to_string(),
+            received_at: now,
+        })
+    }
+
+    fn inbox_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
+        let blob: Vec<u8> = r.get(6)?;
+        Ok(InboxItem {
+            id: r.get(0)?,
+            href_name: r.get(1)?,
+            identity: r.get(2)?,
+            ical_uid: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            method: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            etag: r.get(5)?,
+            ics: String::from_utf8_lossy(&decompress(&blob)).into_owned(),
+            received_at: r.get(7)?,
+        })
+    }
+
+    pub fn inbox_list(&self) -> Result<Vec<InboxItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, href_name, identity, ical_uid, method, etag, raw_itip_zstd, received_at FROM schedule_inbox ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], Self::inbox_from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn inbox_get(&self, href_name: &str) -> Result<Option<InboxItem>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, href_name, identity, ical_uid, method, etag, raw_itip_zstd, received_at FROM schedule_inbox WHERE href_name = ?1",
+                params![href_name],
+                Self::inbox_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn inbox_delete(&self, href_name: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM schedule_inbox WHERE href_name = ?1",
+            params![href_name],
+        )? > 0)
     }
 }
 

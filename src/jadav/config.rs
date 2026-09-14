@@ -46,6 +46,10 @@ pub struct JadavConfig {
     pub remotes: IndexMap<String, RemoteConfig>,
     #[serde(default)]
     pub calendars: Vec<CalendarConfig>,
+    /// Our own mail server: read invitations/replies (IMAP) and send iTIP
+    /// messages (SMTP). Unset: no iMIP at all — writes still update the
+    /// store, nothing is emailed or imported.
+    pub mail: Option<MailConfig>,
     #[serde(default)]
     pub scheduling: SchedulingConfig,
     /// How long `change_log` rows are kept before compaction, which
@@ -190,13 +194,80 @@ impl SendVia {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct MailConfig {
+    pub imap: crate::config::ImapConfig,
+    pub smtp: crate::config::SmtpConfig,
+    /// Folders watched for iTIP mail; the first is the one IDLE'd on.
+    #[serde(default = "default_mail_folders")]
+    pub folders: Vec<String>,
+    /// On first run (or a `UIDVALIDITY` change) look this many days back.
+    #[serde(default = "default_since_days")]
+    pub since_days: u32,
+    #[serde(default = "default_mail_poll_secs")]
+    pub poll_interval_secs: u64,
+    /// IMAP keyword → identity hints (e.g. `acct-scraperapi:
+    /// tamas@scraperapi.com`), used only when the ICS names several of our
+    /// identities.
+    #[serde(default)]
+    pub keyword_identities: IndexMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct SchedulingConfig {
     #[serde(default)]
     pub send_via: SendVia,
     /// Default mirror window in days when a remote does not set its own.
     #[serde(default = "default_history_days")]
     pub history_days: u32,
+    /// Property changes that re-invite existing attendees.
+    #[serde(default = "default_significant_properties")]
+    pub significant_properties: Vec<String>,
+    /// Also file inbound `REQUEST`/`CANCEL` copies in the schedule inbox for
+    /// mirrored calendars (off: iOS may then re-file the event elsewhere).
+    #[serde(default)]
+    pub inbox_for_mirrored: bool,
+    /// Give up on an outbound message after this long.
+    #[serde(default = "default_retry_max_age_hours")]
+    pub retry_max_age_hours: u32,
+    /// Zone used to render `{when}` in mail subjects for UTC/floating events.
+    #[serde(default = "default_timezone")]
+    pub default_timezone: String,
+}
+
+impl Default for SchedulingConfig {
+    fn default() -> Self {
+        Self {
+            send_via: SendVia::default(),
+            history_days: default_history_days(),
+            significant_properties: default_significant_properties(),
+            inbox_for_mirrored: false,
+            retry_max_age_hours: default_retry_max_age_hours(),
+            default_timezone: default_timezone(),
+        }
+    }
+}
+
+fn default_mail_folders() -> Vec<String> {
+    vec!["INBOX".to_string()]
+}
+fn default_since_days() -> u32 {
+    14
+}
+fn default_mail_poll_secs() -> u64 {
+    60
+}
+fn default_significant_properties() -> Vec<String> {
+    crate::jadav::itip::DEFAULT_SIGNIFICANT_PROPERTIES
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+fn default_retry_max_age_hours() -> u32 {
+    24
+}
+fn default_timezone() -> String {
+    "UTC".to_string()
 }
 
 fn default_listen() -> String {

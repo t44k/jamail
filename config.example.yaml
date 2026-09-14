@@ -211,9 +211,52 @@ jadav:
       remote_calendar: alice@corp.com
       two_way: true          # false = read-only mirror (clients get 403 on writes)
       send_via: smtp         # who emails invitations/RSVPs: smtp (jadav) | provider
+  # Our own mail server, used for iMIP (RFC 6047) in both directions: the
+  # inbound watcher reads invitations/replies/cancellations addressed to
+  # any identity from these IMAP folders and applies them to the matching
+  # calendar; the outbound worker sends our invitations and RSVPs through
+  # this SMTP server From: the calendar's identity. Without this block
+  # jadav still serves CalDAV and mirrors, but never sends or reads mail.
+  mail:
+    imap:
+      host: mail.example.com
+      port: 993
+      login: alice@example.com
+      auth:
+        type: command
+        value: pass show jadav/mail
+    smtp:
+      host: mail.example.com
+      port: 587
+      login: alice@example.com
+      auth:
+        type: command
+        value: pass show jadav/mail
+      starttls: true
+    # Folders watched for calendar mail; the first one is IDLE'd on, the
+    # rest are re-checked on every wake-up (a filter may move mail between
+    # them; every message is applied once, by Message-ID). Mail is never
+    # flagged, moved or deleted.
+    folders: [INBOX]
+    since_days: 14            # how far back the first pass looks
+    poll_interval_secs: 60
+    # IMAP keywords a mail fetcher stamps on messages it pulled from another
+    # mailbox, mapped to the identity that mailbox belongs to. Only used to
+    # break a tie when several identities appear on the same invitation.
+    keyword_identities:
+      acct-corp: alice@corp.com
   scheduling:
     send_via: smtp
     history_days: 90         # how far back a mirror's first fill reaches (0 = all)
+    # Properties whose change on an organised event re-sends the invitation
+    # (an attendee edit that touches none of these is silent).
+    significant_properties: [DTSTART, DTEND, DURATION, RRULE, RDATE, EXDATE, STATUS, SUMMARY, LOCATION]
+    # Also drop a copy of invitations for mirrored (Google/CalDAV) calendars
+    # into the schedule-inbox that iOS-style clients read. Off: those
+    # calendars already receive the invitation through the mirror.
+    inbox_for_mirrored: false
+    retry_max_age_hours: 24  # give up on an undeliverable iMIP message after this long
+    default_timezone: Europe/Budapest   # for subjects of events given in UTC/floating time
   # How long the RFC 6578 change log is kept; older client sync-tokens get a
   # full resync instead of a delta.
   sync_log_retention_days: 90

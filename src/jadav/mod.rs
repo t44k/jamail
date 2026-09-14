@@ -26,6 +26,7 @@
 pub mod caldav_remote;
 pub mod config;
 pub mod google;
+pub mod imip;
 pub mod itip;
 pub mod mirror;
 pub mod server;
@@ -313,6 +314,14 @@ fn status(config_path: &Path) -> Result<()> {
     for l in lines {
         println!("{}", l);
     }
+    let (pending, sent, failed) = store.outbound_counts()?;
+    println!(
+        "outbound mail: {} pending, {} sent, {} failed; inbox items: {}",
+        pending,
+        sent,
+        failed,
+        store.inbox_list()?.len()
+    );
     for cal in store.list_calendars()? {
         if cal.provider != Provider::Native {
             let st = store.calendar_mirror_state(&cal.slug)?;
@@ -590,9 +599,46 @@ fn serve(config_path: &std::path::Path) -> Result<()> {
             hub.wake_for_calendar(&outcome.calendar.slug);
         }));
     }
+    let scheduling = Arc::new(scheduling_runtime(&cfg));
+    state.scheduling = Some(Arc::clone(&scheduling));
     let state = Arc::new(state);
     install_signal_handlers();
     let (handle, addr) = server::spawn(&cfg.listen, Arc::clone(&state))?;
+
+    // iMIP: the outbound SMTP worker and the inbound IMAP watcher, both
+    // only when our own mail server is configured.
+    let mut mail_threads = Vec::new();
+    if let Some(mail) = &cfg.mail {
+        let sender: Box<dyn imip::MailSender> = Box::new(imip::SmtpSender::new(mail.smtp.clone()));
+        let store_path = cfg.store.clone();
+        let wake = Arc::clone(&scheduling.outbound_wake);
+        let max_age = scheduling.retry_max_age_secs;
+        let shutdown = Arc::clone(&state.shutdown);
+        mail_threads.push(
+            std::thread::Builder::new()
+                .name("jadav-imip-out".into())
+                .spawn(move || {
+                    imip::run_outbound_worker(store_path, sender, wake, max_age, shutdown)
+                })?,
+        );
+        let inbound = imip::InboundConfig::from_mail_config(mail);
+        eprintln!(
+            "jadav: watching {} on {} for iTIP mail; sending via {}",
+            inbound.folders.join(", "),
+            mail.imap.host,
+            mail.smtp.host
+        );
+        let store_path = cfg.store.clone();
+        let runtime = Arc::clone(&scheduling);
+        let shutdown = Arc::clone(&state.shutdown);
+        mail_threads.push(
+            std::thread::Builder::new()
+                .name("jadav-imip-in".into())
+                .spawn(move || imip::run_inbound_watcher(inbound, store_path, runtime, shutdown))?,
+        );
+    } else {
+        eprintln!("jadav: no mail: section — scheduling stores documents as received, no iMIP");
+    }
     for (remote_name, cals, control, interval) in mirror_plan {
         let factory = provider_factory(&cfg, &remote_name)?;
         eprintln!(
@@ -624,6 +670,7 @@ fn serve(config_path: &std::path::Path) -> Result<()> {
             eprintln!("jadav: shutting down");
             state.shutdown.store(true, Ordering::Relaxed);
             hub.shutdown_all();
+            scheduling.wake_outbound();
             break;
         }
         if HUP_RECEIVED.swap(false, Ordering::SeqCst) {
@@ -656,7 +703,39 @@ fn serve(config_path: &std::path::Path) -> Result<()> {
     for t in mirror_threads {
         let _ = t.join();
     }
+    for t in mail_threads {
+        let _ = t.join();
+    }
     Ok(())
+}
+
+/// Resolve everything the scheduling paths need from config, once.
+fn scheduling_runtime(cfg: &JadavConfig) -> imip::SchedulingRuntime {
+    let identities = cfg.identities();
+    let identity_names = identities
+        .iter()
+        .filter_map(|id| cfg.identity_display_name(id).map(|n| (id.clone(), n)))
+        .collect();
+    let message_id_domain = cfg
+        .principal
+        .login
+        .rsplit_once('@')
+        .map(|(_, d)| d.to_string())
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "jadav.invalid".to_string());
+    imip::SchedulingRuntime {
+        identities,
+        identity_names,
+        significant_properties: cfg.scheduling.significant_properties.clone(),
+        prodid: itip::DEFAULT_PRODID.to_string(),
+        templates: imip::SubjectTemplates::default(),
+        default_timezone: cfg.scheduling.default_timezone.clone(),
+        message_id_domain,
+        inbox_for_mirrored: cfg.scheduling.inbox_for_mirrored,
+        retry_max_age_secs: i64::from(cfg.scheduling.retry_max_age_hours) * 3600,
+        mail_enabled: cfg.mail.is_some(),
+        outbound_wake: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+    }
 }
 
 fn check_config(config_path: &std::path::Path) -> Result<()> {
@@ -705,6 +784,38 @@ fn check_config(config_path: &std::path::Path) -> Result<()> {
             remote.poll_interval_secs
         );
     }
+    match &cfg.mail {
+        Some(mail) => {
+            let inbound = imip::InboundConfig::from_mail_config(mail);
+            println!(
+                "mail:      imap {}:{} as {} folders=[{}] since={}d poll={}s",
+                mail.imap.host,
+                mail.imap.port,
+                mail.imap.login,
+                inbound.folders.join(", "),
+                inbound.since_days,
+                inbound.poll_interval.as_secs()
+            );
+            println!(
+                "mail:      smtp {}:{} as {}",
+                mail.smtp.host, mail.smtp.port, mail.smtp.login
+            );
+            let mut keys: Vec<(&String, &String)> = inbound.keyword_identities.iter().collect();
+            keys.sort();
+            for (keyword, identity) in keys {
+                println!("keyword:   {} -> {}", keyword, identity);
+            }
+        }
+        None => println!("mail:      (none) — no iMIP; client writes are stored as received"),
+    }
+    println!(
+        "scheduling: send_via={:?} significant=[{}] inbox_for_mirrored={} retry_max_age={}h tz={}",
+        cfg.scheduling.send_via,
+        cfg.scheduling.significant_properties.join(" "),
+        cfg.scheduling.inbox_for_mirrored,
+        cfg.scheduling.retry_max_age_hours,
+        cfg.scheduling.default_timezone
+    );
     println!("ok");
     Ok(())
 }

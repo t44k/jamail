@@ -56,9 +56,11 @@
 use crate::calendar;
 use crate::httpc;
 use crate::jadav::config::RESERVED_SLUGS;
+use crate::jadav::imip::{self, SchedulingRuntime};
+use crate::jadav::itip;
 use crate::jadav::store::{
-    CalendarRow, DeleteError, ObjectRow, Origin, Precondition, PropPatch, Provider, PutError,
-    Store, WriteOutcome, parse_sync_token,
+    CalendarRow, DeleteError, InboxItem, ObjectRow, Origin, Precondition, PropPatch, Provider,
+    PutError, Store, WriteOutcome, parse_sync_token,
 };
 use crate::jadav::xml::{
     self, MultiStatus, NS_APPLE, NS_CALDAV, NS_CS, NS_DAV, PropOp, PropfindRequest, QName,
@@ -125,6 +127,9 @@ pub struct ServerState {
     pub identities: Vec<String>,
     pub shutdown: Arc<AtomicBool>,
     pub on_client_write: Option<ClientWriteHook>,
+    /// The iTIP/iMIP broker. `None` (tests, `mail:` absent and no
+    /// scheduling wanted) stores client documents exactly as received.
+    pub scheduling: Option<Arc<SchedulingRuntime>>,
 }
 
 impl ServerState {
@@ -136,6 +141,7 @@ impl ServerState {
             identities,
             shutdown: Arc::new(AtomicBool::new(false)),
             on_client_write: None,
+            scheduling: None,
         }
     }
 }
@@ -586,6 +592,7 @@ enum Res<'a> {
     Inbox,
     Outbox,
     Object(&'a CalendarRow, &'a ObjectRow),
+    InboxItem(&'a InboxItem),
 }
 
 impl Ctx<'_> {
@@ -626,13 +633,32 @@ impl Ctx<'_> {
                 }
                 _ => Resp::method_not_allowed("OPTIONS, PROPFIND, REPORT"),
             },
-            ["dav", "calendars", l, "inbox", _] if *l == login => Resp::not_found(),
+            ["dav", "calendars", l, "inbox", name] if *l == login => match m {
+                "PROPFIND" => match self.store.inbox_get(name)? {
+                    Some(item) => self.propfind(req, Res::InboxItem(&item))?,
+                    None => Resp::not_found(),
+                },
+                "GET" => self.get_inbox_item(req, name, false)?,
+                "HEAD" => self.get_inbox_item(req, name, true)?,
+                "DELETE" => {
+                    if self.store.inbox_delete(name)? {
+                        Resp::empty(204)
+                    } else {
+                        Resp::not_found()
+                    }
+                }
+                "PUT" | "PROPPATCH" | "MKCALENDAR" | "MKCOL" => {
+                    Resp::dav_error(403, "<D:need-privileges/>")
+                }
+                _ => Resp::method_not_allowed("OPTIONS, PROPFIND, GET, HEAD, DELETE"),
+            },
             ["dav", "calendars", l, "outbox"] if *l == login => match m {
                 "PROPFIND" => self.propfind(req, Res::Outbox)?,
-                "POST" => Resp::xml(
-                    200,
-                    "<?xml version=\"1.0\" encoding=\"utf-8\"?><C:schedule-response xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"/>".to_string(),
-                ),
+                "POST" => {
+                    let (status, body) =
+                        itip::handle_outbox_post(&String::from_utf8_lossy(&req.body));
+                    Resp::xml(status, body)
+                }
                 _ => Resp::method_not_allowed("OPTIONS, PROPFIND, POST"),
             },
             ["dav", "calendars", l, slug] if *l == login => match m {
@@ -688,6 +714,7 @@ impl Ctx<'_> {
             Res::Inbox => self.paths.inbox(),
             Res::Outbox => self.paths.outbox(),
             Res::Object(c, o) => self.paths.object(&c.slug, &o.meta.href_name),
+            Res::InboxItem(i) => format!("{}{}", self.paths.inbox(), i.href_name),
         }
     }
 
@@ -728,7 +755,7 @@ impl Ctx<'_> {
                 QName::caldav("supported-calendar-component-set"),
                 QName::caldav("schedule-default-calendar-URL"),
             ]),
-            Res::Object(_, _) => v.extend([
+            Res::Object(_, _) | Res::InboxItem(_) => v.extend([
                 QName::dav("getetag"),
                 QName::dav("getcontenttype"),
                 QName::dav("getcontentlength"),
@@ -749,7 +776,7 @@ impl Ctx<'_> {
                 Res::Calendar(_) => "<D:collection/><C:calendar/>".to_string(),
                 Res::Inbox => "<D:collection/><C:schedule-inbox/>".to_string(),
                 Res::Outbox => "<D:collection/><C:schedule-outbox/>".to_string(),
-                Res::Object(_, _) => String::new(),
+                Res::Object(_, _) | Res::InboxItem(_) => String::new(),
                 _ => "<D:collection/>".to_string(),
             }),
             (NS_DAV, "displayname") => match res {
@@ -880,22 +907,27 @@ impl Ctx<'_> {
             },
             (NS_DAV, "getetag") => match res {
                 Res::Object(_, o) => Some(xml::escape_text(&o.meta.etag)),
+                Res::InboxItem(i) => Some(xml::escape_text(&i.etag)),
                 _ => None,
             },
             (NS_DAV, "getcontenttype") => match res {
                 Res::Object(_, _) => Some("text/calendar; charset=utf-8; component=VEVENT".to_string()),
+                Res::InboxItem(_) => Some("text/calendar; charset=utf-8".to_string()),
                 _ => None,
             },
             (NS_DAV, "getcontentlength") => match res {
                 Res::Object(_, o) => Some(o.ics.len().to_string()),
+                Res::InboxItem(i) => Some(i.ics.len().to_string()),
                 _ => None,
             },
             (NS_DAV, "getlastmodified") => match res {
                 Res::Object(_, o) => Some(http_date(o.meta.updated_at)),
+                Res::InboxItem(i) => Some(http_date(i.received_at)),
                 _ => None,
             },
             (NS_CALDAV, "calendar-data") => match res {
                 Res::Object(_, o) => Some(xml::escape_text(&o.ics)),
+                Res::InboxItem(i) => Some(xml::escape_text(&i.ics)),
                 _ => None,
             },
             _ => None,
@@ -965,6 +997,11 @@ impl Ctx<'_> {
                 Res::Calendar(cal) => {
                     for obj in self.store.list_objects(&cal.slug)? {
                         self.render_props(&mut ms, &Res::Object(cal, &obj), &request)?;
+                    }
+                }
+                Res::Inbox => {
+                    for item in self.store.inbox_list()? {
+                        self.render_props(&mut ms, &Res::InboxItem(&item), &request)?;
                     }
                 }
                 _ => {}
@@ -1173,7 +1210,12 @@ impl Ctx<'_> {
         obj: &ObjectRow,
         props: &[QName],
     ) -> Result<()> {
-        let res = Res::Object(cal, obj);
+        self.res_block(ms, &Res::Object(cal, obj), props)
+    }
+
+    /// One `<D:response>` for a resource in a REPORT: the requested
+    /// properties (default `getetag` + `calendar-data`) split 200/404.
+    fn res_block(&self, ms: &mut MultiStatus, res: &Res<'_>, props: &[QName]) -> Result<()> {
         let names: Vec<QName> = if props.is_empty() {
             vec![QName::dav("getetag"), QName::caldav("calendar-data")]
         } else {
@@ -1182,12 +1224,12 @@ impl Ctx<'_> {
         let mut found = String::new();
         let mut missing = String::new();
         for name in &names {
-            match self.prop(&res, name)? {
+            match self.prop(res, name)? {
                 Some(inner) => found.push_str(&prop_element(name, &inner)),
                 None => missing.push_str(&prop_element(name, "")),
             }
         }
-        ms.response(&encode_href(&self.res_href(&res)))
+        ms.response(&encode_href(&self.res_href(res)))
             .propstat(200, &found)
             .propstat(404, &missing)
             .end();
@@ -1290,20 +1332,56 @@ impl Ctx<'_> {
         };
         let mut ms = MultiStatus::new();
         match request {
-            ReportRequest::Multiget { hrefs, .. } => {
+            ReportRequest::Multiget { props, hrefs } => {
+                let prefix = self.paths.inbox();
                 for href in hrefs {
-                    ms.status_only(&href, 404);
+                    let path = request_path_of(&href);
+                    match path
+                        .strip_prefix(prefix.as_str())
+                        .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+                        .map(|name| self.store.inbox_get(name))
+                        .transpose()?
+                        .flatten()
+                    {
+                        Some(item) => self.res_block(&mut ms, &Res::InboxItem(&item), &props)?,
+                        None => ms.status_only(&href, 404),
+                    }
                 }
             }
             ReportRequest::SyncCollection { .. } => {
                 ms.sync_token(&format!("urn:jadav:inbox:{}", self.store.inbox_ctag()?));
             }
-            ReportRequest::Query { .. } => {}
+            ReportRequest::Query { props, .. } => {
+                // Inbox items carry no time-range worth filtering on; the
+                // whole inbox is small and the client deletes what it read.
+                for item in self.store.inbox_list()? {
+                    self.res_block(&mut ms, &Res::InboxItem(&item), &props)?;
+                }
+            }
             ReportRequest::Unsupported(_) => {
                 return Ok(Resp::dav_error(403, "<D:supported-report/>"));
             }
         }
         Ok(Resp::xml(207, ms.finish()))
+    }
+
+    fn get_inbox_item(&self, req: &HttpRequest, name: &str, head_only: bool) -> Result<Resp> {
+        let Some(item) = self.store.inbox_get(name)? else {
+            return Ok(Resp::not_found());
+        };
+        if let Some(inm) = req.header("if-none-match")
+            && etag_list(inm).iter().any(|t| t == "*" || t == &item.etag)
+        {
+            return Ok(Resp::empty(304).header("ETag", &item.etag));
+        }
+        let resp = Resp::empty(200)
+            .header("Content-Type", "text/calendar; charset=utf-8")
+            .header("ETag", &item.etag)
+            .header("Last-Modified", &http_date(item.received_at));
+        if head_only {
+            return Ok(resp.header("Content-Length", &item.ics.len().to_string()));
+        }
+        Ok(resp.with_body(item.ics.into_bytes()))
     }
 
     // ------------------------------------------------------------------
@@ -1358,19 +1436,44 @@ impl Ctx<'_> {
             (None, Some(list)) => Precondition::IfNoneMatch(list),
             (None, None) => Precondition::None,
         };
+        let existing = self.store.get_object(&cal.slug, name)?;
         if let Some(tag) = req.header("if-schedule-tag-match")
-            && let Some(existing) = self.store.get_object(&cal.slug, name)?
+            && let Some(existing) = &existing
             && tag.trim() != format!("\"{}\"", existing.meta.schedule_tag)
         {
             return Ok(Resp::empty(412));
         }
-        // Scheduling broker hook lands in the scheduling milestone; until
-        // then the stored document is exactly what the client sent.
-        let rewritten = false;
-        let outcome = match self
-            .store
-            .put_object(&cal.slug, name, &ics, pre, Origin::Client)?
-        {
+        // The iTIP broker runs before the transaction: it may rewrite the
+        // document (SEQUENCE bump, SCHEDULE-STATUS stamps) and produces the
+        // iMIP messages that are queued inside the very same transaction.
+        let plan = match &self.state.scheduling {
+            Some(rt) => imip::plan_client_write(
+                self.store,
+                rt,
+                cal,
+                name,
+                existing.as_ref().map(|o| o.ics.as_str()),
+                Some(&ics),
+                Utc::now(),
+            ),
+            None => imip::PlannedWrite::default(),
+        };
+        let rewritten = plan.rewritten();
+        let store_ics = plan.store_ics.as_deref().unwrap_or(&ics);
+        let jobs = plan.jobs;
+        let outcome = match self.store.put_object_with(
+            &cal.slug,
+            name,
+            store_ics,
+            pre,
+            Origin::Client,
+            |conn| {
+                for job in &jobs {
+                    Store::enqueue_outbound_on(conn, job)?;
+                }
+                Ok(())
+            },
+        )? {
             Ok(o) => o,
             Err(PutError::PreconditionFailed { .. }) => return Ok(Resp::empty(412)),
             Err(PutError::UidConflict { other_href_name }) => {
@@ -1408,9 +1511,7 @@ impl Ctx<'_> {
                 resp = resp.header("Schedule-Tag", &format!("\"{}\"", new.meta.schedule_tag));
             }
         }
-        if let Some(hook) = &self.state.on_client_write {
-            hook(&outcome);
-        }
+        self.after_client_write(&outcome, !jobs.is_empty());
         Ok(resp)
     }
 
@@ -1421,20 +1522,64 @@ impl Ctx<'_> {
             Some(list) => Precondition::IfMatch(list),
             None => Precondition::None,
         };
+        let existing = self.store.get_object(&cal.slug, name)?;
+        if let Some(tag) = req.header("if-schedule-tag-match")
+            && let Some(existing) = &existing
+            && tag.trim() != format!("\"{}\"", existing.meta.schedule_tag)
+        {
+            return Ok(Resp::empty(412));
+        }
+        // Deleting an attended object is a DECLINE, deleting an organised
+        // one a CANCEL: the broker decides, the queue rows ride along.
+        let jobs = match (&self.state.scheduling, &existing) {
+            (Some(rt), Some(old)) => {
+                imip::plan_client_write(self.store, rt, cal, name, Some(&old.ics), None, Utc::now())
+                    .jobs
+            }
+            _ => Vec::new(),
+        };
         match self
             .store
-            .delete_object(&cal.slug, name, pre, Origin::Client)?
-        {
-            Ok(outcome) => {
-                if let Some(hook) = &self.state.on_client_write {
-                    hook(&outcome);
+            .delete_object_with(&cal.slug, name, pre, Origin::Client, |conn| {
+                for job in &jobs {
+                    Store::enqueue_outbound_on(conn, job)?;
                 }
+                Ok(())
+            })? {
+            Ok(outcome) => {
+                self.after_client_write(&outcome, !jobs.is_empty());
                 Ok(Resp::empty(204))
             }
             Err(DeleteError::NotFound) => Ok(Resp::not_found()),
             Err(DeleteError::PreconditionFailed { .. }) => Ok(Resp::empty(412)),
             Err(DeleteError::ReadOnly) => Ok(Resp::dav_error(403, "<D:need-privileges/>")),
         }
+    }
+
+    /// Post-commit fan-out for a client write: wake the mirror for the
+    /// calendar and, when messages were queued, the outbound mail worker.
+    fn after_client_write(&self, outcome: &WriteOutcome, queued_mail: bool) {
+        if let Some(hook) = &self.state.on_client_write {
+            hook(outcome);
+        }
+        if queued_mail && let Some(rt) = &self.state.scheduling {
+            rt.wake_outbound();
+        }
+    }
+}
+
+/// The percent-decoded path of an href that may be absolute
+/// (`https://host/dav/...`) or already a path.
+fn request_path_of(href: &str) -> String {
+    let decoded = percent_decode_str(href.split('?').next().unwrap_or(""))
+        .decode_utf8_lossy()
+        .into_owned();
+    match decoded.find("://") {
+        Some(i) => decoded[i + 3..]
+            .find('/')
+            .map(|j| decoded[i + 3 + j..].to_string())
+            .unwrap_or_default(),
+        None => decoded,
     }
 }
 
@@ -1525,6 +1670,10 @@ mod tests {
     }
 
     fn start(label: &str) -> TestServer {
+        start_with(label, None)
+    }
+
+    fn start_with(label: &str, scheduling: Option<imip::SchedulingRuntime>) -> TestServer {
         let store_path = std::env::temp_dir().join(format!(
             "jadav-server-test-{}-{}-{}.db",
             label,
@@ -1550,12 +1699,14 @@ mod tests {
                 ])
                 .unwrap();
         }
-        let state = Arc::new(ServerState::new(
+        let mut state = ServerState::new(
             store_path.clone(),
             LOGIN,
             PASSWORD,
             vec![LOGIN.to_string(), "alice@other.example".to_string()],
-        ));
+        );
+        state.scheduling = scheduling.map(Arc::new);
+        let state = Arc::new(state);
         let (_handle, addr) = spawn("127.0.0.1:0", Arc::clone(&state)).unwrap();
         TestServer {
             base: format!("http://{}", addr),
@@ -2298,5 +2449,285 @@ mod tests {
         let (_, segs, slash) = split_target("/dav/calendars/a/p/e%20v.ics");
         assert_eq!(segs.last().unwrap(), "e v.ics");
         assert!(!slash);
+    }
+
+    // ------------------------------------------------------------------
+    // Scheduling surfaces (RFC 6638) with the iTIP broker enabled
+    // ------------------------------------------------------------------
+
+    fn start_scheduling(label: &str) -> TestServer {
+        start_with(
+            label,
+            Some(imip::SchedulingRuntime {
+                identities: vec![LOGIN.to_string(), "alice@other.example".to_string()],
+                identity_names: HashMap::from([(LOGIN.to_string(), "Alice".to_string())]),
+                significant_properties: itip::DEFAULT_SIGNIFICANT_PROPERTIES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                prodid: itip::DEFAULT_PRODID.to_string(),
+                templates: imip::SubjectTemplates::default(),
+                default_timezone: "UTC".to_string(),
+                message_id_domain: "example.com".to_string(),
+                inbox_for_mirrored: false,
+                retry_max_age_secs: 3600,
+                mail_enabled: true,
+                outbound_wake: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+            }),
+        )
+    }
+
+    fn organised_ics(uid: &str, summary: &str, attendees: &[&str]) -> String {
+        let mut s = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20240115T090000Z\r\nDTEND:20240115T100000Z\r\nSUMMARY:{summary}\r\nSEQUENCE:0\r\nORGANIZER;CN=Alice:mailto:{LOGIN}\r\n"
+        );
+        for a in attendees {
+            s.push_str(&format!(
+                "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{a}\r\n"
+            ));
+        }
+        s.push_str("END:VEVENT\r\nEND:VCALENDAR\r\n");
+        s
+    }
+
+    #[test]
+    fn organiser_put_queues_invitations_stamps_status_and_omits_etag() {
+        let ts = start_scheduling("sched-put");
+        let base = format!("/dav/calendars/{LOGIN}/personal");
+        let ct = ("Content-Type", "text/calendar; charset=utf-8");
+        let put = raw(
+            &ts,
+            "PUT",
+            &format!("{base}/org.ics"),
+            &[ct],
+            Some(&organised_ics(
+                "org-1",
+                "Kickoff",
+                &["bob@example.com", "carol@example.com"],
+            )),
+        );
+        assert_eq!(put.status, 201);
+        assert!(
+            put.header("etag").is_none(),
+            "rewritten document must not echo an ETag"
+        );
+        assert!(put.header("schedule-tag").is_some());
+
+        let store = Store::open(&ts.store_path).unwrap();
+        let obj = store.get_object("personal", "org.ics").unwrap().unwrap();
+        assert_eq!(obj.ics.matches("SCHEDULE-STATUS=1.0").count(), 2);
+        assert_eq!(store.outbound_counts().unwrap(), (2, 0, 0));
+        let queued = store.due_outbound(i64::MAX, 10).unwrap();
+        let mut recipients: Vec<&str> = queued.iter().map(|q| q.job.recipient.as_str()).collect();
+        recipients.sort();
+        assert_eq!(recipients, vec!["bob@example.com", "carol@example.com"]);
+        assert!(
+            queued
+                .iter()
+                .all(|q| q.job.method == "REQUEST" && q.job.sender == LOGIN)
+        );
+
+        // A pure re-PUT of what the server stored changes nothing and
+        // queues nothing more.
+        let again = raw(
+            &ts,
+            "PUT",
+            &format!("{base}/org.ics"),
+            &[ct],
+            Some(&obj.ics),
+        );
+        assert_eq!(again.status, 204);
+        assert_eq!(store.outbound_counts().unwrap().0, 2);
+
+        // Deleting the organised event cancels it for everybody.
+        let del = raw(&ts, "DELETE", &format!("{base}/org.ics"), &[], None);
+        assert_eq!(del.status, 204);
+        assert_eq!(store.outbound_counts().unwrap().0, 4);
+        let cancels = store
+            .due_outbound(i64::MAX, 10)
+            .unwrap()
+            .into_iter()
+            .filter(|q| q.job.method == "CANCEL")
+            .count();
+        assert_eq!(cancels, 2);
+    }
+
+    #[test]
+    fn attendee_rsvp_queues_one_reply_and_import_queues_nothing() {
+        let ts = start_scheduling("sched-rsvp");
+        let base = format!("/dav/calendars/{LOGIN}/personal");
+        let ct = ("Content-Type", "text/calendar; charset=utf-8");
+        let invite = |partstat: &str| {
+            format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//g//EN\r\nBEGIN:VEVENT\r\nUID:inv-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20240115T090000Z\r\nDTEND:20240115T100000Z\r\nSUMMARY:Lunch\r\nSEQUENCE:0\r\nORGANIZER;CN=Boss:mailto:boss@example.com\r\nATTENDEE;PARTSTAT={partstat};RSVP=TRUE:mailto:{LOGIN}\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:dave@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            )
+        };
+        let first = raw(
+            &ts,
+            "PUT",
+            &format!("{base}/inv.ics"),
+            &[ct],
+            Some(&invite("NEEDS-ACTION")),
+        );
+        assert_eq!(first.status, 201);
+        assert!(
+            first.header("etag").is_some(),
+            "an import is stored as received"
+        );
+        let store = Store::open(&ts.store_path).unwrap();
+        assert_eq!(store.outbound_counts().unwrap(), (0, 0, 0));
+
+        let rsvp = raw(
+            &ts,
+            "PUT",
+            &format!("{base}/inv.ics"),
+            &[ct],
+            Some(&invite("ACCEPTED")),
+        );
+        assert_eq!(rsvp.status, 204);
+        assert_eq!(store.outbound_counts().unwrap(), (1, 0, 0));
+        let q = store.due_outbound(i64::MAX, 10).unwrap();
+        assert_eq!(q[0].job.method, "REPLY");
+        assert_eq!(q[0].job.recipient, "boss@example.com");
+        assert_eq!(q[0].job.sender, LOGIN);
+        let obj = store.get_object("personal", "inv.ics").unwrap().unwrap();
+        assert!(
+            obj.ics
+                .contains("ORGANIZER;CN=Boss;SCHEDULE-STATUS=1.0:mailto:boss@example.com")
+        );
+    }
+
+    #[test]
+    fn schedule_tag_mismatch_is_412_before_the_broker_runs() {
+        let ts = start_scheduling("sched-tag");
+        let base = format!("/dav/calendars/{LOGIN}/personal");
+        let ct = ("Content-Type", "text/calendar; charset=utf-8");
+        let put = raw(
+            &ts,
+            "PUT",
+            &format!("{base}/t.ics"),
+            &[ct],
+            Some(&organised_ics("tag-1", "Tagged", &["bob@example.com"])),
+        );
+        let tag = put.header("schedule-tag").unwrap().to_string();
+        let store = Store::open(&ts.store_path).unwrap();
+        let stored = store.get_object("personal", "t.ics").unwrap().unwrap();
+        let stale = raw(
+            &ts,
+            "PUT",
+            &format!("{base}/t.ics"),
+            &[ct, ("If-Schedule-Tag-Match", "\"999\"")],
+            Some(&stored.ics),
+        );
+        assert_eq!(stale.status, 412);
+        let del_stale = raw(
+            &ts,
+            "DELETE",
+            &format!("{base}/t.ics"),
+            &[("If-Schedule-Tag-Match", "\"999\"")],
+            None,
+        );
+        assert_eq!(del_stale.status, 412);
+        assert_eq!(
+            store.outbound_counts().unwrap().0,
+            1,
+            "nothing queued by rejected writes"
+        );
+        let fresh = raw(
+            &ts,
+            "PUT",
+            &format!("{base}/t.ics"),
+            &[ct, ("If-Schedule-Tag-Match", &tag)],
+            Some(&stored.ics),
+        );
+        assert_eq!(fresh.status, 204);
+    }
+
+    #[test]
+    fn inbox_lists_gets_multigets_and_deletes_items() {
+        let ts = start("inbox");
+        let store = Store::open(&ts.store_path).unwrap();
+        let itip = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//g//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:in-1\r\nDTSTART:20240115T090000Z\r\nDTEND:20240115T100000Z\r\nSUMMARY:Inbound\r\nORGANIZER:mailto:boss@example.com\r\nATTENDEE:mailto:alice@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let item = store.inbox_insert(LOGIN, "in-1", "REQUEST", itip).unwrap();
+        let inbox = format!("/dav/calendars/{LOGIN}/inbox/");
+
+        let list = raw(&ts, "PROPFIND", &inbox, &[("Depth", "1")], None);
+        assert_eq!(list.status, 207);
+        let text = String::from_utf8_lossy(&list.body).into_owned();
+        assert!(
+            text.contains(&format!("{inbox}{}", item.href_name)),
+            "{text}"
+        );
+        assert!(text.contains(&xml::escape_text(&item.etag)));
+        assert!(text.contains("schedule-inbox"));
+
+        let get = raw(&ts, "GET", &format!("{inbox}{}", item.href_name), &[], None);
+        assert_eq!(get.status, 200);
+        assert_eq!(get.header("etag"), Some(item.etag.as_str()));
+        assert_eq!(String::from_utf8_lossy(&get.body), itip);
+        let head = raw(
+            &ts,
+            "HEAD",
+            &format!("{inbox}{}", item.href_name),
+            &[],
+            None,
+        );
+        assert_eq!(head.status, 200);
+        assert!(head.body.is_empty());
+
+        let multiget = format!(
+            r#"<C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><D:getetag/><C:calendar-data/></D:prop><D:href>{inbox}{}</D:href><D:href>{inbox}missing.ics</D:href></C:calendar-multiget>"#,
+            item.href_name
+        );
+        let rep = raw(
+            &ts,
+            "REPORT",
+            &inbox,
+            &[("Content-Type", "application/xml"), ("Depth", "1")],
+            Some(&multiget),
+        );
+        assert_eq!(rep.status, 207);
+        let text = String::from_utf8_lossy(&rep.body).into_owned();
+        assert!(text.contains("METHOD:REQUEST"), "{text}");
+        assert!(text.contains("HTTP/1.1 404"), "{text}");
+
+        let put = raw(
+            &ts,
+            "PUT",
+            &format!("{inbox}{}", item.href_name),
+            &[("Content-Type", "text/calendar")],
+            Some(itip),
+        );
+        assert_eq!(put.status, 403);
+        let del = raw(
+            &ts,
+            "DELETE",
+            &format!("{inbox}{}", item.href_name),
+            &[],
+            None,
+        );
+        assert_eq!(del.status, 204);
+        let gone = raw(&ts, "GET", &format!("{inbox}{}", item.href_name), &[], None);
+        assert_eq!(gone.status, 404);
+        assert!(store.inbox_list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn outbox_post_answers_free_busy_with_no_scheduling_support() {
+        let ts = start("outbox");
+        let outbox = format!("/dav/calendars/{LOGIN}/outbox/");
+        let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//ios//EN\r\nMETHOD:REQUEST\r\nBEGIN:VFREEBUSY\r\nUID:fb-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20240115T000000Z\r\nDTEND:20240116T000000Z\r\nORGANIZER:mailto:alice@example.com\r\nATTENDEE:mailto:bob@example.com\r\nEND:VFREEBUSY\r\nEND:VCALENDAR\r\n";
+        let resp = raw(
+            &ts,
+            "POST",
+            &outbox,
+            &[("Content-Type", "text/calendar; charset=utf-8")],
+            Some(body),
+        );
+        assert_eq!(resp.status, 200);
+        let text = String::from_utf8_lossy(&resp.body).into_owned();
+        assert!(text.contains("schedule-response"), "{text}");
+        assert!(text.contains("mailto:bob@example.com"), "{text}");
+        assert!(text.contains("3.7"), "{text}");
     }
 }
