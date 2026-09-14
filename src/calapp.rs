@@ -3029,7 +3029,7 @@ impl CalApp {
         let text = if let Some(status) = &self.status {
             status.clone()
         } else {
-            "hjkl move  [/] jump period  Tab/S-Tab narrow/widen  Enter zoom  Esc back  t today  n new  e edit  d del  r rsvp  C cals  1-9 cal  s sync  q quit"
+            "hjkl move  [/] jump period  Tab/S-Tab narrow/widen  Enter zoom  Esc back  t today  n new  e edit  d del  r rsvp  v/C cals  1-9 cal  s sync  q quit"
                 .to_string()
         };
         frame.render_widget(

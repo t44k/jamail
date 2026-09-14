@@ -424,6 +424,11 @@ fn handle_browse_key(
             app.goto_today();
             reload_events(app, db);
         }
+        // The calendar panel: `C`, or `v` for terminals whose keyboard
+        // protocol reports Shift+c as a lowercase `c` with the SHIFT
+        // modifier rather than as `C`.
+        KeyCode::Char('C') | KeyCode::Char('v') => app.begin_calendar_panel(),
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::SHIFT) => app.begin_calendar_panel(),
         KeyCode::Char('n') | KeyCode::Char('c') => {
             if app.calendars.is_empty() {
                 app.set_status("No calendars discovered yet — try 's' to sync.");
@@ -446,7 +451,6 @@ fn handle_browse_key(
                 app.set_status(e);
             }
         }
-        KeyCode::Char('C') => app.begin_calendar_panel(),
         KeyCode::Char(digit @ '1'..='9') => {
             let idx = digit as usize - '1' as usize;
             if let Some(cal) = app.calendars.get(idx).cloned() {
@@ -597,7 +601,9 @@ fn handle_calendar_panel_key(app: &mut CalApp, code: KeyCode) {
                 app.toggle_calendar_visible(&cal.url);
             }
         }
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('C') => app.close_calendar_panel(),
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('C') | KeyCode::Char('v') => {
+            app.close_calendar_panel()
+        }
         _ => {}
     }
 }
