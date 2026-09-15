@@ -465,6 +465,13 @@ impl MailClient {
 
     /// Fetch server flags for all known UIDs in a folder and reconcile with DB.
     /// Returns true if any flags changed.
+    /// Bring the cached copies of `folder` in line with the server for
+    /// everything `sync_folder` does not cover: the `\\Seen` flag of every
+    /// known message, and messages that are **gone** from the folder — a
+    /// `UID FETCH … FLAGS` answers only for UIDs that still exist there, so
+    /// any known UID the server stays silent about was moved or expunged by
+    /// another client and its cached copy is removed (with FTS row and
+    /// attachments). Returns whether anything changed, so the UI reloads.
     pub fn sync_flags(&mut self, db: &MailDb, account: &str, folder: &str) -> Result<bool> {
         let known_uids = db.get_all_uids(account, folder)?;
         if known_uids.is_empty() {
@@ -474,7 +481,16 @@ impl MailClient {
             .select(folder)
             .with_context(|| format!("Failed to select folder for flag sync: {}", folder))?;
         let server_flags = self.fetch_flags(&known_uids)?;
-        db.update_flags(account, folder, &server_flags)
+        let present: std::collections::HashSet<u32> =
+            server_flags.iter().map(|(uid, _)| *uid).collect();
+        let vanished: Vec<u32> = known_uids
+            .iter()
+            .copied()
+            .filter(|uid| !present.contains(uid))
+            .collect();
+        let removed = db.delete_emails_by_uid(account, folder, &vanished)?;
+        let flags_changed = db.update_flags(account, folder, &server_flags)?;
+        Ok(flags_changed || removed > 0)
     }
 
     #[allow(dead_code)]

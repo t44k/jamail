@@ -1051,6 +1051,35 @@ impl MailDb {
         Ok(result)
     }
 
+    /// Remove the cached copies of `uids` in `(account, folder)` — messages
+    /// the server no longer has there (moved or expunged by another
+    /// client) — with their FTS rows and attachments. Returns how many
+    /// rows went.
+    pub fn delete_emails_by_uid(&self, account: &str, folder: &str, uids: &[u32]) -> Result<usize> {
+        if uids.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut removed = 0usize;
+        for &uid in uids {
+            let id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM emails WHERE account = ?1 AND folder = ?2 AND uid = ?3",
+                    params![account, folder, uid],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(id) = id else {
+                continue;
+            };
+            tx.execute("DELETE FROM emails_fts WHERE rowid = ?1", params![id])?;
+            tx.execute("DELETE FROM attachments WHERE email_id = ?1", params![id])?;
+            removed += tx.execute("DELETE FROM emails WHERE id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
     pub fn get_all_uids(&self, account: &str, folder: &str) -> Result<Vec<u32>> {
         let mut stmt = self
             .conn
@@ -3319,5 +3348,69 @@ mod caldav_server_db_tests {
         let a_again = compute_etag(&ics("x", "A"));
         assert_ne!(a, b);
         assert_eq!(a, a_again);
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    fn seed(db: &MailDb, folder: &str, uid: u32, subject: &str) -> i64 {
+        db.store_email(
+            "personal",
+            folder,
+            uid,
+            "alice@example.com",
+            "bob@example.com",
+            subject,
+            &Local::now(),
+            true,
+            "preview",
+            &format!("body of {subject}"),
+            None,
+            "",
+            &format!("msg-{uid}"),
+            "",
+            "",
+            false,
+            &[],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn deleting_vanished_uids_removes_rows_fts_and_nothing_else() {
+        let db = MailDb::open_in_memory().unwrap();
+        let kept = seed(&db, "FRESHBOX", 1, "stays");
+        let moved = seed(&db, "FRESHBOX", 2, "moved elsewhere");
+        let other_folder = seed(&db, "INBOX", 2, "same uid, other folder");
+        let removed = db
+            .delete_emails_by_uid("personal", "FRESHBOX", &[2, 99])
+            .unwrap();
+        assert_eq!(removed, 1, "unknown uids are ignored");
+        let mut uids = db.get_all_uids("personal", "FRESHBOX").unwrap();
+        uids.sort();
+        assert_eq!(uids, vec![1]);
+        assert!(
+            db.has_email("personal", "INBOX", 2),
+            "other folders untouched"
+        );
+        let fts_rows = |id: i64| -> i64 {
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM emails_fts WHERE rowid = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(fts_rows(moved), 0);
+        assert_eq!(fts_rows(kept), 1);
+        assert_eq!(fts_rows(other_folder), 1);
+        assert_eq!(
+            db.delete_emails_by_uid("personal", "FRESHBOX", &[])
+                .unwrap(),
+            0
+        );
     }
 }
