@@ -447,6 +447,38 @@ pub struct GReminders {
     pub overrides: Option<Vec<GReminderOverride>>,
 }
 
+/// Give an event that relies on the calendar's default reminders
+/// (`reminders.useDefault`, Google's normal case) those reminders as
+/// explicit overrides, so the mirrored `VEVENT` carries the `VALARM`s the
+/// Google UI shows. An event with its own overrides is left alone.
+pub fn materialize_default_reminders(g: &mut GEvent, defaults: &[GReminderOverride]) {
+    let uses_default = g
+        .reminders
+        .as_ref()
+        .and_then(|r| r.use_default)
+        .unwrap_or(true);
+    if uses_default {
+        g.reminders = Some(GReminders {
+            use_default: Some(true),
+            overrides: Some(defaults.to_vec()),
+        });
+    }
+}
+
+/// Whether two reminder lists mean the same thing (order-insensitive).
+fn same_reminders(a: &[GReminderOverride], b: &[GReminderOverride]) -> bool {
+    let key = |list: &[GReminderOverride]| {
+        let mut v: Vec<(String, i64)> = list
+            .iter()
+            .map(|r| (r.method.to_ascii_lowercase(), r.minutes))
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    key(a) == key(b)
+}
+
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GEvent {
@@ -522,6 +554,9 @@ pub struct GCalendarListEntry {
     pub time_zone: Option<String>,
     pub deleted: Option<bool>,
     pub hidden: Option<bool>,
+    /// The calendar-wide reminders every event with
+    /// `reminders.useDefault` gets — Google never puts them on the event.
+    pub default_reminders: Vec<GReminderOverride>,
 }
 
 impl GCalendarListEntry {
@@ -890,7 +925,11 @@ pub enum BodyMode {
     RsvpOnly,
 }
 
-fn vevent_to_gevent(ev: &VEvent, include_recurrence: bool) -> GEvent {
+fn vevent_to_gevent(
+    ev: &VEvent,
+    include_recurrence: bool,
+    defaults: &[GReminderOverride],
+) -> GEvent {
     let raw = ev.raw.as_deref().unwrap_or("");
     let value_of = |name: &str| -> Option<String> {
         calendar::raw_property_lines(raw, &[name])
@@ -980,26 +1019,35 @@ fn vevent_to_gevent(ev: &VEvent, include_recurrence: bool) -> GEvent {
         })
         .take(5)
         .collect();
-    g.reminders = Some(if overrides.is_empty() {
-        GReminders {
-            use_default: Some(true),
-            overrides: None,
-        }
-    } else {
-        GReminders {
-            use_default: Some(false),
-            overrides: Some(overrides),
-        }
-    });
+    // Alarms that are exactly the calendar's defaults go back as
+    // `useDefault` — they came from there when the event was mirrored —
+    // so a round trip never turns Google's defaults into per-event copies.
+    g.reminders = Some(
+        if overrides.is_empty() || same_reminders(&overrides, defaults) {
+            GReminders {
+                use_default: Some(true),
+                overrides: None,
+            }
+        } else {
+            GReminders {
+                use_default: Some(false),
+                overrides: Some(overrides),
+            }
+        },
+    );
     g
 }
 
 /// The JSON body for an insert/patch of the master event.
-pub fn doc_to_gevent_body(doc: &VCalendarDoc, mode: BodyMode) -> serde_json::Value {
+pub fn doc_to_gevent_body(
+    doc: &VCalendarDoc,
+    mode: BodyMode,
+    defaults: &[GReminderOverride],
+) -> serde_json::Value {
     match mode {
         BodyMode::RsvpOnly => serde_json::json!({}),
         BodyMode::Full => {
-            let mut g = vevent_to_gevent(&doc.master, true);
+            let mut g = vevent_to_gevent(&doc.master, true, defaults);
             g.ical_uid = Some(doc.uid.clone());
             serde_json::to_value(g).unwrap_or_else(|_| serde_json::json!({}))
         }
@@ -1016,6 +1064,9 @@ pub struct GoogleRest {
     identity: String,
     send_updates: &'static str,
     skip_event_types: Vec<String>,
+    /// The calendar's default reminders, fetched once per process on
+    /// first use (`None` until then, or after a failed lookup).
+    default_reminders: Option<Vec<GReminderOverride>>,
 }
 
 impl GoogleRest {
@@ -1031,6 +1082,36 @@ impl GoogleRest {
             identity: identity.to_ascii_lowercase(),
             send_updates: send_updates_for(send_via),
             skip_event_types: default_skip_event_types(calendar_id),
+            default_reminders: None,
+        }
+    }
+
+    /// Use these as the calendar's default reminders instead of asking
+    /// Google (tests, or a caller that already has the calendar list).
+    pub fn with_default_reminders(mut self, defaults: Vec<GReminderOverride>) -> Self {
+        self.default_reminders = Some(defaults);
+        self
+    }
+
+    /// The calendar's default reminders, from `calendarList` on first use.
+    /// A failed lookup yields none for this cycle and is retried next time.
+    fn default_reminders(&mut self) -> Vec<GReminderOverride> {
+        if let Some(d) = &self.default_reminders {
+            return d.clone();
+        }
+        let path = format!(
+            "/users/me/calendarList/{}",
+            httpc::percent_encode_component(&self.calendar_id)
+        );
+        match self
+            .client
+            .call_json::<GCalendarListEntry>("GET", &path, None)
+        {
+            Ok(entry) => {
+                self.default_reminders = Some(entry.default_reminders.clone());
+                entry.default_reminders
+            }
+            Err(_) => Vec::new(),
         }
     }
 
@@ -1093,7 +1174,14 @@ impl GoogleRest {
         } else {
             Vec::new()
         };
-        gevent_group_to_object(master, &exceptions).map_err(RemoteError::Other)
+        let defaults = self.default_reminders();
+        let mut master = master.clone();
+        materialize_default_reminders(&mut master, &defaults);
+        let mut exceptions = exceptions;
+        for ex in &mut exceptions {
+            materialize_default_reminders(ex, &defaults);
+        }
+        gevent_group_to_object(&master, &exceptions).map_err(RemoteError::Other)
     }
 
     fn fetch_event(&mut self, id: &str) -> Result<Option<GEvent>, RemoteError> {
@@ -1135,11 +1223,12 @@ impl GoogleRest {
     }
 
     fn patch_overrides(&mut self, master_id: &str, doc: &VCalendarDoc) -> Result<(), RemoteError> {
+        let defaults = self.default_reminders();
         for (rid, ev) in &doc.overrides {
             let Some(instance_id) = self.instance_id_for(master_id, rid)? else {
                 continue;
             };
-            let mut body = vevent_to_gevent(ev, false);
+            let mut body = vevent_to_gevent(ev, false, &defaults);
             body.recurrence = None;
             let value = serde_json::to_value(body).unwrap_or_default();
             let path = format!(
@@ -1260,7 +1349,8 @@ impl RemoteCalendar for GoogleRest {
     }
 
     fn create(&mut self, doc: &VCalendarDoc) -> Result<RemoteObject, RemoteError> {
-        let body = doc_to_gevent_body(doc, BodyMode::Full);
+        let defaults = self.default_reminders();
+        let body = doc_to_gevent_body(doc, BodyMode::Full, &defaults);
         let path = format!(
             "{}?{}",
             self.events_path(),
@@ -1284,7 +1374,8 @@ impl RemoteCalendar for GoogleRest {
         doc: &VCalendarDoc,
         pre: Precondition,
     ) -> Result<RemoteObject, RemoteError> {
-        let body = doc_to_gevent_body(doc, BodyMode::Full);
+        let defaults = self.default_reminders();
+        let body = doc_to_gevent_body(doc, BodyMode::Full, &defaults);
         let path = format!(
             "{}?{}",
             self.event_path(&id.0),
@@ -1716,7 +1807,7 @@ mod tests {
         let master = g(MASTER);
         let obj = gevent_group_to_object(&master, &[]).unwrap();
         let doc = VCalendarDoc::parse(&obj.ics).unwrap();
-        let body = doc_to_gevent_body(&doc, BodyMode::Full);
+        let body = doc_to_gevent_body(&doc, BodyMode::Full, &[]);
         assert_eq!(body["summary"], "Weekly sync");
         assert_eq!(body["description"], "Agenda & notes");
         assert_eq!(body["start"]["dateTime"], "2024-01-15T09:00:00+01:00");
@@ -1745,7 +1836,7 @@ mod tests {
         let reparsed = Semantic::from_ics(&doc.ics).unwrap().fingerprint();
         assert_eq!(rendered, reparsed);
         assert_eq!(
-            doc_to_gevent_body(&doc, BodyMode::RsvpOnly),
+            doc_to_gevent_body(&doc, BodyMode::RsvpOnly, &[]),
             serde_json::json!({})
         );
     }
@@ -1818,5 +1909,69 @@ mod tests {
         };
         assert_eq!(e.name(), "My name");
         assert!(e.writable());
+    }
+
+    #[test]
+    fn default_reminders_become_alarms_on_pull_and_use_default_again_on_push() {
+        let defaults = vec![GReminderOverride {
+            method: "popup".to_string(),
+            minutes: 10,
+        }];
+        // An event on the calendar's defaults gets them as explicit alarms.
+        let mut on_defaults = g(
+            r#"{"id": "d1", "iCalUID": "d1@google.com", "summary": "Standup",
+            "start": {"dateTime": "2026-09-15T09:30:00+02:00", "timeZone": "Europe/Budapest"},
+            "end": {"dateTime": "2026-09-15T09:45:00+02:00", "timeZone": "Europe/Budapest"},
+            "reminders": {"useDefault": true}}"#,
+        );
+        materialize_default_reminders(&mut on_defaults, &defaults);
+        let obj = gevent_group_to_object(&on_defaults, &[]).unwrap();
+        assert!(obj.ics.contains("BEGIN:VALARM"), "{}", obj.ics);
+        assert!(obj.ics.contains("TRIGGER:-PT10M"));
+        // Its own overrides win over the defaults.
+        let mut own = g(
+            r#"{"id": "d2", "iCalUID": "d2@google.com", "summary": "Own",
+            "start": {"dateTime": "2026-09-15T09:30:00+02:00"}, "end": {"dateTime": "2026-09-15T09:45:00+02:00"},
+            "reminders": {"useDefault": false, "overrides": [{"method": "email", "minutes": 60}]}}"#,
+        );
+        materialize_default_reminders(&mut own, &defaults);
+        assert_eq!(own.reminders.unwrap().overrides.unwrap()[0].minutes, 60);
+        // No reminders object at all counts as "use the defaults".
+        let mut bare = g(r#"{"id": "d3", "summary": "Bare",
+            "start": {"dateTime": "2026-09-15T09:30:00+02:00"}, "end": {"dateTime": "2026-09-15T09:45:00+02:00"}}"#);
+        materialize_default_reminders(&mut bare, &defaults);
+        assert_eq!(bare.reminders.unwrap().overrides.unwrap().len(), 1);
+
+        // Pushing the mirrored copy back says "use defaults", not a copy
+        // of them; a different alarm set goes as overrides.
+        let doc = VCalendarDoc::parse(&obj.ics).unwrap();
+        let body = doc_to_gevent_body(&doc, BodyMode::Full, &defaults);
+        assert_eq!(body["reminders"]["useDefault"], true);
+        assert!(body["reminders"].get("overrides").is_none());
+        let body = doc_to_gevent_body(&doc, BodyMode::Full, &[]);
+        assert_eq!(body["reminders"]["useDefault"], false);
+        assert_eq!(body["reminders"]["overrides"][0]["minutes"], 10);
+        assert!(same_reminders(
+            &[
+                GReminderOverride {
+                    method: "popup".into(),
+                    minutes: 10
+                },
+                GReminderOverride {
+                    method: "email".into(),
+                    minutes: 60
+                }
+            ],
+            &[
+                GReminderOverride {
+                    method: "EMAIL".into(),
+                    minutes: 60
+                },
+                GReminderOverride {
+                    method: "popup".into(),
+                    minutes: 10
+                }
+            ]
+        ));
     }
 }

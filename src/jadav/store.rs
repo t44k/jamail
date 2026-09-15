@@ -892,6 +892,24 @@ impl Store {
         Ok(created)
     }
 
+    /// Make the next mirror pass of `slug` re-list and re-compare every
+    /// remote object: forget the incremental sync token and the recorded
+    /// remote versions, so objects whose *mapping* changed (a new mirror
+    /// build rendering something it did not before) are re-applied while
+    /// unchanged ones are recognised by fingerprint and left alone.
+    /// Returns the number of mirror-map rows reset.
+    pub fn force_mirror_refresh(&self, slug: &str) -> Result<usize> {
+        self.conn.execute(
+            "UPDATE calendars SET remote_sync_token = NULL WHERE slug = ?1",
+            params![slug],
+        )?;
+        let n = self.conn.execute(
+            "UPDATE mirror_map SET remote_version = NULL WHERE calendar_slug = ?1",
+            params![slug],
+        )?;
+        Ok(n)
+    }
+
     /// The calendars `mirror_all` created for one remote.
     pub fn list_discovered_calendars(&self, remote: &str) -> Result<Vec<CalendarRow>> {
         let mut stmt = self.conn.prepare(

@@ -96,6 +96,11 @@ pub enum Command {
     MirrorRunOnce {
         remote: String,
     },
+    /// Re-list and re-compare every object of a remote's calendars (after
+    /// a mirror-mapping change) — see `Store::force_mirror_refresh`.
+    MirrorRefresh {
+        remote: String,
+    },
 }
 
 pub fn parse_cli(args: &[String]) -> Result<Cli> {
@@ -129,7 +134,13 @@ pub fn parse_cli(args: &[String]) -> Result<Cli> {
                     .cloned()
                     .context("mirror run-once needs a <remote>")?,
             },
-            _ => bail!("usage: jadav mirror run-once <remote>"),
+            Some("refresh") => Command::MirrorRefresh {
+                remote: rest
+                    .get(2)
+                    .cloned()
+                    .context("mirror refresh needs a <remote>")?,
+            },
+            _ => bail!("usage: jadav mirror run-once|refresh <remote>"),
         },
         Some("import-caldav") => {
             let mut base_url = None;
@@ -227,6 +238,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         Command::Google(args) => google_command(&config_path, &args),
         Command::Status => status(&config_path),
         Command::MirrorRunOnce { remote } => mirror_run_once(&config_path, &remote),
+        Command::MirrorRefresh { remote } => mirror_refresh(&config_path, &remote),
     }
 }
 
@@ -747,6 +759,31 @@ fn mirror_run_once(config_path: &Path, remote_name: &str) -> Result<()> {
         }
     }
     store.set_remote_status(remote_name, false, None)?;
+    Ok(())
+}
+
+/// `jadav mirror refresh <remote>`: forget sync tokens and recorded remote
+/// versions for every calendar of the remote so the running daemon's next
+/// pass (within its poll interval) re-applies whatever the mirror now
+/// renders differently, e.g. after a mapping fix.
+fn mirror_refresh(config_path: &Path, remote_name: &str) -> Result<()> {
+    let cfg = load(config_path)?;
+    let store = open_store(&cfg)?;
+    let cals = all_mirror_cfgs(&cfg, &store, remote_name)?;
+    if cals.is_empty() {
+        bail!("no calendars are mirrored from remote {:?}", remote_name);
+    }
+    for cal in &cals {
+        let n = store.force_mirror_refresh(&cal.slug)?;
+        println!(
+            "{}: {} objects will be re-compared on the next pass",
+            cal.slug, n
+        );
+    }
+    println!(
+        "the running jadav picks this up within its poll interval; `jadav mirror run-once {}` does it now",
+        remote_name
+    );
     Ok(())
 }
 
