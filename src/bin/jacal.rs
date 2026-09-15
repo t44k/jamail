@@ -12,24 +12,19 @@
 //! binary exits immediately with a clear message rather than opening an
 //! empty calendar UI.
 //!
-//! Calendar alarm notifications are delivered by *this* process while
-//! it's running (see `jamail::calnotify` module docs for why that's a
-//! different ownership model than `jamail::notify`'s daemon-owned mail
-//! notifications, and what that implies: no `jacal` running means no
-//! alarm popups, the same way no terminal-based calendar client's alarms
-//! fire while it's closed unless a separate always-on piece exists for
-//! that, which this task's scope didn't include).
+//! Calendar alarm notifications are *not* this process's job: `jamaild`
+//! runs the alarm clock for every caldav-configured account (see
+//! `jamail::calnotify`), so reminders fire whether or not `jacal` is open.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration as ChronoDuration, Local, TimeZone, Utc};
+use chrono::{Local, TimeZone, Utc};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use jamail::calapp::{CalApp, CalField, CalMode};
-use jamail::calendar::{EventEdits, EventTime, Rsvp, VEvent, expand_occurrences};
-use jamail::calnotify::{AlarmScheduler, DesktopAlarmSink};
+use jamail::calendar::{EventEdits, Rsvp};
 use jamail::calsync::CalMutation;
 use jamail::db::MailDb;
 use jamail::{config, daemon, ipc};
@@ -42,14 +37,6 @@ use std::time::{Duration, Instant};
 /// `jamaild` updated the cache between polls, or `jacal` started before
 /// any sync completed).
 const CALENDAR_RELOAD_INTERVAL: Duration = Duration::from_secs(20);
-/// How often to re-check for due alarms. Alarms only need roughly
-/// minute-level precision (see `calnotify::DEFAULT_GRACE`), so this can be
-/// coarser than the calendar reload interval.
-const ALARM_CHECK_INTERVAL: Duration = Duration::from_secs(20);
-/// How far ahead (and slightly behind, to catch an alarm whose trigger
-/// just passed) to load events for alarm scheduling — independent of
-/// whatever date range is currently displayed.
-const ALARM_LOOKAHEAD: ChronoDuration = ChronoDuration::hours(48);
 
 fn main() -> Result<()> {
     if !io::stdout().is_terminal() {
@@ -86,12 +73,6 @@ fn main() -> Result<()> {
         );
     }
     let current_account = caldav_accounts[0].0.clone();
-    let default_lead_minutes: Vec<i64> = caldav_accounts[0]
-        .1
-        .caldav
-        .as_ref()
-        .and_then(|c| c.default_alarm_minutes_before.clone())
-        .unwrap_or_default();
 
     let db = MailDb::open().context("Failed to open mail database")?;
 
@@ -117,18 +98,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut scheduler = AlarmScheduler::new();
-    let alarm_sink = DesktopAlarmSink;
-
-    let result = run_app(
-        &mut terminal,
-        &mut app,
-        &db,
-        &ipc_client,
-        &mut scheduler,
-        &alarm_sink,
-        &default_lead_minutes,
-    );
+    let result = run_app(&mut terminal, &mut app, &db, &ipc_client);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -176,54 +146,13 @@ fn reload_events(app: &mut CalApp, db: &MailDb) {
     }
 }
 
-/// Load events across a wide window (independent of whatever range is
-/// currently displayed) for alarm scheduling, reconstructing full
-/// `VEvent`s (with `VALARM`s) from each row's stored raw ICS and expanding
-/// recurring events to every occurrence within the window, each with its
-/// `dtstart`/`dtend` shifted to that occurrence's own instants (so a
-/// relative `VALARM`, or the default-lead-minutes fallback, fires once per
-/// occurrence rather than only ever for the series' master).
-fn load_events_for_alarms(db: &MailDb, account: &str) -> Vec<VEvent> {
-    let now = Utc::now();
-    let start_ts = (now - ChronoDuration::hours(1)).timestamp();
-    let end_ts = (now + ALARM_LOOKAHEAD).timestamp();
-    let rows = db
-        .get_calendar_events_in_range(Some(account), start_ts, end_ts)
-        .unwrap_or_default();
-    let (Some(window_start), Some(window_end)) = (
-        DateTime::<Utc>::from_timestamp(start_ts, 0),
-        DateTime::<Utc>::from_timestamp(end_ts, 0),
-    ) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for row in &rows {
-        let Ok(vevent) = row.to_vevent() else {
-            continue;
-        };
-        for (occ_start, occ_end) in expand_occurrences(&vevent, window_start, window_end) {
-            let mut occurrence = vevent.clone();
-            occurrence.dtstart = EventTime::utc(occ_start);
-            occurrence.dtend = EventTime::utc(occ_end);
-            out.push(occurrence);
-        }
-    }
-    out
-}
-
-#[allow(clippy::too_many_arguments)]
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut CalApp,
     db: &MailDb,
     ipc_client: &ipc::IpcClient,
-    scheduler: &mut AlarmScheduler,
-    alarm_sink: &DesktopAlarmSink,
-    default_lead_minutes: &[i64],
 ) -> Result<()> {
     let mut last_calendar_reload = Instant::now();
-    let mut last_alarm_check = Instant::now() - ALARM_CHECK_INTERVAL; // check once immediately
-    let mut alarm_events = load_events_for_alarms(db, &app.current_account);
 
     loop {
         terminal.draw(|frame| app.render(frame))?;
@@ -262,21 +191,6 @@ fn run_app(
             reload_calendars(app, db);
             reload_events(app, db);
             last_calendar_reload = Instant::now();
-        }
-
-        if last_alarm_check.elapsed() >= ALARM_CHECK_INTERVAL {
-            alarm_events = load_events_for_alarms(db, &app.current_account);
-            last_alarm_check = Instant::now();
-        }
-        let fired = scheduler.tick(&alarm_events, default_lead_minutes, Utc::now(), alarm_sink);
-        for (fire, outcome) in fired {
-            match outcome {
-                Ok(()) => {}
-                Err(e) => app.set_status(format!(
-                    "Alarm for \"{}\" failed to deliver: {}",
-                    fire.summary, e
-                )),
-            }
         }
 
         if !event::poll(Duration::from_millis(200))? {

@@ -42,6 +42,7 @@
 //! account switches already abandoned sync threads the same way).
 
 use crate::caldav_server;
+use crate::calnotify;
 use crate::calsync::{self, CalSyncControl, CalSyncEvent};
 use crate::config::{JamailAccount, JamailConfig};
 use crate::db;
@@ -497,6 +498,39 @@ pub fn run_with_notifier(notifier: Notifier) -> Result<()> {
         .and_then(|d| d.caldav_server_listen.clone());
     let accounts: Vec<(String, JamailAccount)> = config.accounts.into_iter().collect();
     let daemon = Daemon::start(&accounts, notifier);
+
+    // Calendar alarms are this daemon's job, like mail notifications: one
+    // clock thread over every caldav-configured account's cached events,
+    // so a reminder fires whether or not `jacal` is open. Failures are
+    // logged, never swallowed (see `calnotify`'s module docs).
+    let alarm_accounts: Vec<calnotify::AlarmAccount> = accounts
+        .iter()
+        .filter_map(|(name, account)| {
+            account.caldav.as_ref().map(|c| calnotify::AlarmAccount {
+                name: name.clone(),
+                default_lead_minutes: c.default_alarm_minutes_before.clone().unwrap_or_default(),
+            })
+        })
+        .collect();
+    if !alarm_accounts.is_empty() {
+        match db::db_path() {
+            Ok(db_path) => {
+                let daemon = Arc::clone(&daemon);
+                let count = alarm_accounts.len();
+                thread::spawn(move || {
+                    calnotify::run_alarm_loop(
+                        &alarm_accounts,
+                        &db_path,
+                        &calnotify::DesktopAlarmSink,
+                        &|| SIGNAL_RECEIVED.load(Ordering::SeqCst) || daemon.shutdown_requested(),
+                        &|msg| eprintln!("jamaild: {}", msg),
+                    );
+                });
+                eprintln!("jamaild: calendar alarms armed for {} account(s)", count);
+            }
+            Err(e) => eprintln!("jamaild: calendar alarms disabled: {}", e),
+        }
+    }
 
     // Optional, opt-in: an inbound CalDAV HTTP server exposing every
     // caldav-configured account's local calendar cache. Unset (the

@@ -12,16 +12,11 @@
 //! Calendar alarms are different in two ways this module's design follows
 //! directly:
 //!
-//! 1. **Delivery lives in `jacal`, not `jamaild`.** `jamaild` syncs
-//!    calendar data into the shared cache, but nothing in this codebase
-//!    keeps `jacal` itself running unattended (unlike `jamaild`, there is
-//!    no `contrib/systemd` unit for it) — so unlike mail, a calendar alarm
-//!    only fires while `jacal` happens to be open. This is a real,
-//!    explicitly documented limitation, not an oversight: making calendar
-//!    alarms as reliable as mail notifications would mean either teaching
-//!    `jamaild` to own a scheduling clock for every account's events (a
-//!    much bigger change than this task's scope) or shipping a second
-//!    always-on daemon. Neither was justified for a first cut.
+//! 1. **Delivery lives in `jamaild`**, like mail notifications: the daemon
+//!    runs [`run_alarm_loop`] on its own thread from startup, for every
+//!    account with `caldav` configured, so an alarm fires whether or not
+//!    `jacal` is open. `jacal` does not fire alarms at all (it used to,
+//!    which meant no popup unless it happened to be running).
 //! 2. **Failures are surfaced, not swallowed.** [`AlarmSink::deliver`]
 //!    returns `Result<(), String>`, and [`AlarmScheduler::tick`] returns
 //!    every delivery attempt's outcome rather than discarding it — `jacal`
@@ -49,9 +44,11 @@
 //! notification for a meeting that already started an hour ago on
 //! restart).
 
-use crate::calendar::{EventStatus, VEvent};
+use crate::calendar::{EventStatus, EventTime, VEvent, expand_occurrences};
+use crate::db::MailDb;
 use chrono::{DateTime, Duration, Local, Utc};
 use std::collections::HashSet;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// A single alarm that should fire, resolved to a concrete instant.
@@ -185,10 +182,113 @@ pub fn due_now(all: &[AlarmFire], now: DateTime<Utc>, grace: Duration) -> Vec<&A
 /// treated as missed, not fired late.
 pub const DEFAULT_GRACE: Duration = Duration::minutes(2);
 
+/// How often the daemon re-reads the coming events and checks for due
+/// alarms. Alarms only need roughly minute-level precision (see
+/// [`DEFAULT_GRACE`]).
+pub const ALARM_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+/// How far ahead events are loaded for alarm scheduling.
+pub const ALARM_LOOKAHEAD: Duration = Duration::hours(48);
+/// How far back, so an alarm whose trigger just passed is still seen.
+pub const ALARM_LOOKBACK: Duration = Duration::hours(1);
+
+/// Load `account`'s events around `now` for alarm scheduling,
+/// reconstructing full [`VEvent`]s (with `VALARM`s) from each row's stored
+/// raw ICS and expanding recurring events to every occurrence in the
+/// window, each with its `dtstart`/`dtend` shifted to that occurrence's own
+/// instants (so a relative `VALARM`, or the default-lead-minutes fallback,
+/// fires once per occurrence rather than only ever for the series' master).
+pub fn events_for_alarm_window(db: &MailDb, account: &str, now: DateTime<Utc>) -> Vec<VEvent> {
+    let window_start = now - ALARM_LOOKBACK;
+    let window_end = now + ALARM_LOOKAHEAD;
+    let rows = db
+        .get_calendar_events_in_range(
+            Some(account),
+            window_start.timestamp(),
+            window_end.timestamp(),
+        )
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for row in &rows {
+        let Ok(vevent) = row.to_vevent() else {
+            continue;
+        };
+        for (occ_start, occ_end) in expand_occurrences(&vevent, window_start, window_end) {
+            let mut occurrence = vevent.clone();
+            occurrence.dtstart = EventTime::utc(occ_start);
+            occurrence.dtend = EventTime::utc(occ_end);
+            out.push(occurrence);
+        }
+    }
+    out
+}
+
+/// One account the daemon's alarm loop watches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlarmAccount {
+    pub name: String,
+    /// `caldav.default_alarm_minutes_before`: lead times for events that
+    /// carry no `VALARM` of their own.
+    pub default_lead_minutes: Vec<i64>,
+}
+
+/// `jamaild`'s alarm clock. Every [`ALARM_CHECK_INTERVAL`] it re-reads the
+/// coming events of each account from the cache at `db_path` and delivers
+/// every newly due alarm through `sink`; each delivery's outcome goes to
+/// `report` (failures included — see the module docs). Returns once `stop`
+/// says so, checked between passes and while waiting.
+pub fn run_alarm_loop(
+    accounts: &[AlarmAccount],
+    db_path: &Path,
+    sink: &dyn AlarmSink,
+    stop: &dyn Fn() -> bool,
+    report: &dyn Fn(&str),
+) {
+    let mut scheduler = AlarmScheduler::new();
+    loop {
+        if stop() {
+            return;
+        }
+        match MailDb::open_at(db_path) {
+            Ok(db) => {
+                let now = Utc::now();
+                for account in accounts {
+                    let events = events_for_alarm_window(&db, &account.name, now);
+                    for (fire, outcome) in
+                        scheduler.tick(&events, &account.default_lead_minutes, now, sink)
+                    {
+                        match outcome {
+                            Ok(()) => report(&format!(
+                                "alarm delivered for {:?} ({})",
+                                fire.summary, account.name
+                            )),
+                            Err(e) => report(&format!(
+                                "alarm for {:?} ({}) failed to deliver: {}",
+                                fire.summary, account.name, e
+                            )),
+                        }
+                    }
+                }
+            }
+            Err(e) => report(&format!(
+                "alarm check skipped, cannot open the cache: {}",
+                e
+            )),
+        }
+        let mut waited = std::time::Duration::ZERO;
+        while waited < ALARM_CHECK_INTERVAL {
+            if stop() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            waited += std::time::Duration::from_millis(200);
+        }
+    }
+}
+
 /// Stateful wrapper around [`compute_alarms`]/[`due_now`] that tracks which
 /// `(uid, fire_at)` pairs have already been delivered this session, so a
 /// repeated call with the same events doesn't re-notify. Session-local
-/// only — state resets on `jacal` restart (see module docs).
+/// only — state resets when `jamaild` restarts (see module docs).
 pub struct AlarmScheduler {
     fired: HashSet<(String, i64)>,
     grace: Duration,
@@ -246,6 +346,7 @@ impl Default for AlarmScheduler {
 mod tests {
     use super::*;
     use crate::calendar::parse_vevents;
+    use chrono::TimeZone;
 
     fn event_with_valarm(uid: &str, minutes_before: i64) -> VEvent {
         parse_vevents(&format!(
@@ -459,5 +560,31 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn alarm_window_expands_recurring_rows_into_occurrences_with_their_alarms() {
+        let db = MailDb::open_in_memory().unwrap();
+        db.upsert_calendar("acct", "https://cal/x/", "X").unwrap();
+        let raw = "BEGIN:VEVENT\r\nUID:daily\r\nDTSTART:20240115T090000Z\r\nDTEND:20240115T091500Z\r\nSUMMARY:Standup\r\nRRULE:FREQ=DAILY\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT10M\r\nDESCRIPTION:Reminder\r\nEND:VALARM\r\nEND:VEVENT\r\n";
+        let event = parse_vevents(raw).unwrap().remove(0);
+        db.upsert_calendar_event("acct", "https://cal/x/", "/daily.ics", None, &event, raw)
+            .unwrap();
+        let now = chrono::Utc.with_ymd_and_hms(2024, 1, 20, 8, 0, 0).unwrap();
+        let events = events_for_alarm_window(&db, "acct", now);
+        // 09:00 on the 20th and 21st fall inside [now-1h, now+48h).
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.iter().all(|e| e.alarms.len() == 1));
+        assert_eq!(
+            events[0].dtstart.utc,
+            chrono::Utc.with_ymd_and_hms(2024, 1, 20, 9, 0, 0).unwrap()
+        );
+        assert!(events_for_alarm_window(&db, "other", now).is_empty());
+        let fires = compute_alarms(&events, &[]);
+        assert_eq!(fires.len(), 2);
+        assert_eq!(
+            fires[0].fire_at,
+            chrono::Utc.with_ymd_and_hms(2024, 1, 20, 8, 50, 0).unwrap()
+        );
     }
 }

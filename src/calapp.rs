@@ -99,6 +99,18 @@ impl CalView {
 
 /// True for Saturday/Sunday, regardless of [`WeekStart`] — which day a
 /// week visually starts on doesn't change which days are "the weekend".
+/// Split the days of a column view into single columns and the days that
+/// share the last column: in Week view Saturday and Sunday are stacked
+/// there, in their chronological order within the displayed week; other
+/// views (and a Week view with fewer than seven days) keep one column per
+/// day. Pure, unit-tested.
+pub fn week_columns(days: &[NaiveDate], stack_weekend: bool) -> (Vec<NaiveDate>, Vec<NaiveDate>) {
+    if !stack_weekend || days.len() != 7 {
+        return (days.to_vec(), Vec::new());
+    }
+    days.iter().copied().partition(|d| !is_weekend(*d))
+}
+
 fn is_weekend(d: NaiveDate) -> bool {
     matches!(d.weekday(), Weekday::Sat | Weekday::Sun)
 }
@@ -1550,7 +1562,14 @@ impl CalApp {
     pub fn zoom_in(&mut self) {
         let target = match self.view {
             CalView::Year => Some(CalView::Month),
-            CalView::Month | CalView::Week | CalView::ThreeDay => Some(CalView::Day),
+            CalView::Month => Some(CalView::Day),
+            // Enter on an event in a column view opens that event; with
+            // nothing selected it narrows to the day as before.
+            CalView::Week | CalView::ThreeDay => Some(if self.selected_event().is_some() {
+                CalView::Event
+            } else {
+                CalView::Day
+            }),
             CalView::Day => Some(CalView::Event),
             CalView::Event => None,
         };
@@ -2988,99 +3007,150 @@ impl CalApp {
         }
     }
 
-    /// Render Day/3-Day/Week: one bordered column per entry in `days`,
-    /// each with a weekday/date header (distinctly colored for weekends,
-    /// today, and the keyboard-focused day).
+    /// Render Day/3-Day/Week: one bordered column per day, each with a
+    /// weekday/date header (distinctly colored for weekends, today, and
+    /// the keyboard-focused day). In Week view Saturday and Sunday share
+    /// the last column, stacked (see [`week_columns`]).
     ///
-    /// Given the room for it, each column's body is a time grid on one
-    /// shared [`TimeAxis`] (see [`Self::grid_column_lines`]) so events sit
-    /// at their real position in the day and line up across days. When the
-    /// terminal is too short or the columns too narrow for that, it falls
-    /// back to the plain stacked list.
+    /// Given the room for it, each column's body is a time grid on a
+    /// [`TimeAxis`] shared by the columns of equal height (see
+    /// [`Self::grid_column_lines`]) so events sit at their real position in
+    /// the day and line up across days; the half-height weekend columns
+    /// plan their own axis. When the terminal is too short or the columns
+    /// too narrow for that, a column falls back to the plain stacked list.
     fn render_columns(&self, frame: &mut Frame, area: Rect, days: &[NaiveDate]) {
-        let n = days.len().max(1) as u32;
-        let constraints: Vec<Constraint> = (0..n).map(|_| Constraint::Ratio(1, n)).collect();
+        let (single, stacked) = week_columns(days, self.view == CalView::Week);
+        let n = single.len() + usize::from(!stacked.is_empty());
+        let constraints: Vec<Constraint> = (0..n)
+            .map(|_| Constraint::Ratio(1, n.max(1) as u32))
+            .collect();
         let columns = Layout::horizontal(constraints).split(area);
         let today = Local::now().date_naive();
 
-        // One axis for every column, decided from the narrowest/shortest
-        // inner rect so no column has to render something that doesn't fit.
-        let inner_height = area.height.saturating_sub(2) as usize;
-        let inner_width = columns
+        let placed: Vec<(Rect, NaiveDate)> = single
             .iter()
-            .map(|c| c.width.saturating_sub(2))
+            .zip(columns.iter())
+            .map(|(d, r)| (*r, *d))
+            .collect();
+        let (axis, all_day_rows) = self.plan_group_axis(&placed);
+        for (rect, day) in &placed {
+            self.render_day_column(frame, *rect, *day, axis.as_ref(), all_day_rows, today);
+        }
+        if !stacked.is_empty() {
+            let last = columns[n - 1];
+            let parts = Layout::vertical(
+                (0..stacked.len())
+                    .map(|_| Constraint::Ratio(1, stacked.len() as u32))
+                    .collect::<Vec<_>>(),
+            )
+            .split(last);
+            let placed: Vec<(Rect, NaiveDate)> = stacked
+                .iter()
+                .zip(parts.iter())
+                .map(|(d, r)| (*r, *d))
+                .collect();
+            let (axis, all_day_rows) = self.plan_group_axis(&placed);
+            for (rect, day) in &placed {
+                self.render_day_column(frame, *rect, *day, axis.as_ref(), all_day_rows, today);
+            }
+        }
+    }
+
+    /// One time axis for a group of columns, decided from the
+    /// narrowest/shortest inner rect so no column has to render something
+    /// that doesn't fit, plus the all-day banner rows the group reserves.
+    fn plan_group_axis(&self, placed: &[(Rect, NaiveDate)]) -> (Option<TimeAxis>, usize) {
+        let days: Vec<NaiveDate> = placed.iter().map(|(_, d)| *d).collect();
+        let inner_height = placed
+            .iter()
+            .map(|(r, _)| r.height.saturating_sub(2) as usize)
             .min()
             .unwrap_or(0);
-        let all_day_rows = self.all_day_rows_for(days);
+        let inner_width = placed
+            .iter()
+            .map(|(r, _)| r.width.saturating_sub(2))
+            .min()
+            .unwrap_or(0);
+        let all_day_rows = self.all_day_rows_for(&days);
         let axis = if inner_width >= MIN_GRID_COL_WIDTH {
             plan_time_axis(
                 inner_height.saturating_sub(all_day_rows),
-                &self.timed_spans_for(days),
+                &self.timed_spans_for(&days),
             )
         } else {
             None
         };
+        (axis, all_day_rows)
+    }
 
-        for (col, &day) in columns.iter().zip(days.iter()) {
-            let is_today = day == today;
-            let is_focused = day == self.focused_date;
-            let weekend = is_weekend(day);
+    /// One day's bordered column: header, then the time grid on `axis`
+    /// (position-critical: one line per slot, never wrapped, or the columns
+    /// stop lining up) or the stacked list when there is no axis.
+    fn render_day_column(
+        &self,
+        frame: &mut Frame,
+        rect: Rect,
+        day: NaiveDate,
+        axis: Option<&TimeAxis>,
+        all_day_rows: usize,
+        today: NaiveDate,
+    ) {
+        let is_today = day == today;
+        let is_focused = day == self.focused_date;
+        let weekend = is_weekend(day);
 
-            let title_style = if is_today {
-                Style::default()
-                    .fg(theme::UNREAD_MARKER)
-                    .add_modifier(Modifier::BOLD)
-            } else if weekend {
-                Style::default().fg(WEEKEND_FG).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(theme::THREAD_INDICATOR)
-                    .add_modifier(Modifier::BOLD)
-            };
-            let title = if is_today {
-                format!(" {} (today) ", day.format("%a %-d %b"))
-            } else {
-                format!(" {} ", day.format("%a %-d %b"))
-            };
-            let border_style = if is_focused {
-                Style::default().fg(theme::HELP_BORDER)
-            } else {
-                Style::default().fg(theme::THREAD_BRANCH)
-            };
-            let cell_bg = if weekend { WEEKEND_BG } else { theme::BG };
-            let block = Block::bordered()
-                .title(Span::styled(title, title_style))
-                .border_style(border_style)
-                .style(Style::default().bg(cell_bg));
-            let inner = block.inner(*col);
-            frame.render_widget(block, *col);
+        let title_style = if is_today {
+            Style::default()
+                .fg(theme::UNREAD_MARKER)
+                .add_modifier(Modifier::BOLD)
+        } else if weekend {
+            Style::default().fg(WEEKEND_FG).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme::THREAD_INDICATOR)
+                .add_modifier(Modifier::BOLD)
+        };
+        let title = if is_today {
+            format!(" {} (today) ", day.format("%a %-d %b"))
+        } else {
+            format!(" {} ", day.format("%a %-d %b"))
+        };
+        let border_style = if is_focused {
+            Style::default().fg(theme::HELP_BORDER)
+        } else {
+            Style::default().fg(theme::THREAD_BRANCH)
+        };
+        let cell_bg = if weekend { WEEKEND_BG } else { theme::BG };
+        let block = Block::bordered()
+            .title(Span::styled(title, title_style))
+            .border_style(border_style)
+            .style(Style::default().bg(cell_bg));
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
 
-            // Grid rows are position-critical: one line per slot, never
-            // wrapped, or the columns stop lining up with each other.
-            if let Some(axis) = &axis {
-                let (lines, sel) =
-                    self.grid_column_lines(day, axis, all_day_rows, inner.width, cell_bg);
-                frame.render_widget(
-                    Paragraph::new(lines).style(Style::default().bg(cell_bg)),
-                    inner,
-                );
-                if is_focused && let Some(row) = sel {
-                    Self::mark_selected_row(frame, *col, inner.y + row as u16);
-                }
-                continue;
-            }
-            let indices = self.event_indices_for(day);
+        if let Some(axis) = axis {
             let (lines, sel) =
-                self.cell_event_lines(day, &indices, inner.height as usize, false, inner.width);
+                self.grid_column_lines(day, axis, all_day_rows, inner.width, cell_bg);
             frame.render_widget(
-                Paragraph::new(lines)
-                    .wrap(Wrap { trim: false })
-                    .style(Style::default().bg(cell_bg)),
+                Paragraph::new(lines).style(Style::default().bg(cell_bg)),
                 inner,
             );
             if is_focused && let Some(row) = sel {
-                Self::mark_selected_row(frame, *col, inner.y + row as u16);
+                Self::mark_selected_row(frame, rect, inner.y + row as u16);
             }
+            return;
+        }
+        let indices = self.event_indices_for(day);
+        let (lines, sel) =
+            self.cell_event_lines(day, &indices, inner.height as usize, false, inner.width);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .style(Style::default().bg(cell_bg)),
+            inner,
+        );
+        if is_focused && let Some(row) = sel {
+            Self::mark_selected_row(frame, rect, inner.y + row as u16);
         }
     }
 
@@ -5390,5 +5460,54 @@ mod tests {
         assert!(app.take_prefs_dirty());
         app.toggle_show_declined();
         assert_eq!(app.events.len(), 2);
+    }
+
+    #[test]
+    fn enter_in_week_view_opens_the_selected_event_or_narrows_to_the_day() {
+        let mut app = test_app();
+        app.view = CalView::Week;
+        app.focused_date = date(2024, 1, 15);
+        app.zoom_in();
+        assert_eq!(app.view, CalView::Day, "nothing selected: narrow as before");
+        assert!(app.go_back());
+        assert_eq!(app.view, CalView::Week);
+
+        let start = Utc
+            .with_ymd_and_hms(2024, 1, 15, 12, 0, 0)
+            .unwrap()
+            .timestamp();
+        let mut second = make_row("b", start + 3600, start + 7200, None, false);
+        second.id = 2;
+        app.set_events(vec![
+            make_row("a", start, start + 3600, None, false),
+            second,
+        ]);
+        app.focused_date = local_date_of(start);
+        app.event_cursor = 1;
+        app.zoom_in();
+        assert_eq!(app.view, CalView::Event);
+        assert_eq!(app.event_cursor, 1, "the event under the cursor opens");
+        assert_eq!(app.selected_event().unwrap().id, 2);
+        assert!(app.go_back());
+        assert_eq!(app.view, CalView::Week);
+        assert_eq!(app.event_cursor, 1);
+    }
+
+    #[test]
+    fn week_columns_stack_the_weekend_in_chronological_order() {
+        let monday = date(2024, 1, 15);
+        let week: Vec<NaiveDate> = (0..7).map(|i| monday + Duration::days(i)).collect();
+        let (single, stacked) = week_columns(&week, true);
+        assert_eq!(single.len(), 5);
+        assert_eq!(single[0], monday);
+        assert_eq!(stacked, vec![date(2024, 1, 20), date(2024, 1, 21)]);
+        let sunday = date(2024, 1, 14);
+        let week: Vec<NaiveDate> = (0..7).map(|i| sunday + Duration::days(i)).collect();
+        let (single, stacked) = week_columns(&week, true);
+        assert_eq!(single[0], date(2024, 1, 15));
+        assert_eq!(stacked, vec![sunday, date(2024, 1, 20)]);
+        assert_eq!(week_columns(&week, false), (week.clone(), Vec::new()));
+        let three: Vec<NaiveDate> = week[4..7].to_vec();
+        assert_eq!(week_columns(&three, true), (three.clone(), Vec::new()));
     }
 }
