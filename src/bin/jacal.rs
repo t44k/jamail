@@ -68,6 +68,11 @@ fn main() -> Result<()> {
         .as_ref()
         .map(|j| j.calendars.clone())
         .unwrap_or_default();
+    let show_declined = config
+        .jacal
+        .as_ref()
+        .map(|j| j.show_declined)
+        .unwrap_or(true);
     let accounts: Vec<(String, config::JamailAccount)> = config.accounts.into_iter().collect();
 
     let caldav_accounts: Vec<&(String, config::JamailAccount)> = accounts
@@ -92,6 +97,7 @@ fn main() -> Result<()> {
 
     let mut app = CalApp::new(current_account.clone(), week_start);
     app.identities = own_identities(&caldav_accounts[0].1);
+    app.show_declined = show_declined;
     app.set_calendar_prefs(jacal_prefs);
     reload_calendars(&mut app, &db);
     reload_events(&mut app, &db);
@@ -297,6 +303,9 @@ fn run_app(
                     handle_rsvp_key(app, db, ipc_client, key.code);
                 }
                 CalMode::Calendars => handle_calendar_panel_key(app, key.code),
+                CalMode::Attendees => {
+                    handle_attendee_editor_key(app, db, ipc_client, key.code, key.modifiers);
+                }
             }
             persist_calendar_prefs(app);
         }
@@ -451,6 +460,11 @@ fn handle_browse_key(
                 app.set_status(e);
             }
         }
+        KeyCode::Char('a') => {
+            if let Err(e) = app.begin_attendees_for_selected() {
+                app.set_status(e);
+            }
+        }
         KeyCode::Char(digit @ '1'..='9') => {
             let idx = digit as usize - '1' as usize;
             if let Some(cal) = app.calendars.get(idx).cloned() {
@@ -500,6 +514,35 @@ fn handle_form_key(
             if let Some(draft) = app.draft.as_mut() {
                 draft.prev_field();
             }
+        }
+        // The calendar field picks where a new event lives; the organizer
+        // identity follows the calendar.
+        KeyCode::Left | KeyCode::Right
+            if app
+                .draft
+                .as_ref()
+                .is_some_and(|d| d.field == CalField::Calendar) =>
+        {
+            let step = if code == KeyCode::Right { 1 } else { -1 };
+            let calendars = app.calendars.clone();
+            if let Some(draft) = app.draft.as_mut() {
+                draft.cycle_calendar(&calendars, step);
+            }
+            let organizer = app
+                .draft
+                .as_ref()
+                .and_then(|d| app.calendar_identity(&d.calendar_url));
+            if let Some(draft) = app.draft.as_mut() {
+                draft.organizer = organizer;
+            }
+        }
+        KeyCode::Enter
+            if app
+                .draft
+                .as_ref()
+                .is_some_and(|d| d.field == CalField::Attendees) =>
+        {
+            app.begin_attendees_for_draft();
         }
         KeyCode::Char(' ')
             if app
@@ -595,6 +638,7 @@ fn handle_calendar_panel_key(app: &mut CalApp, code: KeyCode) {
                 app.clear_calendar_color(&url);
             }
         }
+        KeyCode::Char('D') => app.toggle_show_declined(),
         KeyCode::Char(digit @ '1'..='9') => {
             let idx = digit as usize - '1' as usize;
             if let Some(cal) = app.calendars.get(idx).cloned() {
@@ -615,10 +659,62 @@ fn persist_calendar_prefs(app: &mut CalApp) {
     if !app.take_prefs_dirty() {
         return;
     }
-    let result = config::config_path()
-        .and_then(|path| config::save_jacal_calendar_prefs(&path, &app.calendar_prefs));
+    let result = config::config_path().and_then(|path| {
+        config::save_jacal_settings(&path, &app.calendar_prefs, app.show_declined)
+    });
     if let Err(e) = result {
         app.set_status(format!("Could not save calendar settings: {:#}", e));
+    }
+}
+
+/// Keys in the participants modal: type an address and Enter to add it,
+/// Up/Down to pick a guest, Delete (or Ctrl+D) to remove, Esc to finish —
+/// which saves the new guest list when the modal was opened on an
+/// existing event and something changed.
+fn handle_attendee_editor_key(
+    app: &mut CalApp,
+    db: &MailDb,
+    ipc_client: &ipc::IpcClient,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) {
+    match code {
+        KeyCode::Esc => {
+            if let Some(commit) = app.finish_attendee_editor() {
+                let account = app.current_account.clone();
+                match db.apply_local_calendar_edit(commit.id, &commit.edits) {
+                    Ok(()) => {
+                        ipc_client.send(ipc::Request::EnqueueCalendarMutation {
+                            account,
+                            mutation: CalMutation::Update {
+                                local_id: commit.id,
+                                edits: commit.edits,
+                            },
+                        });
+                        reload_events(app, db);
+                        app.set_status(format!(
+                            "Guest list of \"{}\" saved, syncing…",
+                            commit.summary
+                        ));
+                    }
+                    Err(e) => app.set_status(format!("Could not save guests: {}", e)),
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if let Err(e) = app.attendee_editor_add() {
+                app.set_status(e);
+            }
+        }
+        KeyCode::Up => app.attendee_editor_move(-1),
+        KeyCode::Down => app.attendee_editor_move(1),
+        KeyCode::Delete => app.attendee_editor_remove(),
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.attendee_editor_remove()
+        }
+        KeyCode::Backspace => app.attendee_editor_backspace(),
+        KeyCode::Char(c) => app.attendee_editor_input(c),
+        _ => {}
     }
 }
 

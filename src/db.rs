@@ -7,7 +7,7 @@ use crate::calendar::{EventStatus, EventTime, VEvent};
 use crate::mail::{AttachmentData, Email, EmailContent, FolderInfo};
 use chrono::{DateTime, Local, TimeZone, Utc};
 
-const CURRENT_SCHEMA_VERSION: i32 = 6;
+const CURRENT_SCHEMA_VERSION: i32 = 7;
 
 pub struct AttachmentMeta {
     pub id: i64,
@@ -24,6 +24,9 @@ pub struct CalendarRow {
     pub ctag: Option<String>,
     pub sync_token: Option<String>,
     pub color: Option<String>,
+    /// The address the server attached to this calendar (jadav's
+    /// `owner-identity`), if it told us.
+    pub identity: Option<String>,
 }
 
 /// A row from the `calendar_events` table. `raw_ics` is the decompressed
@@ -186,7 +189,7 @@ const MAIL_SCHEMA_SQL: &str = "DROP TABLE IF EXISTS emails_fts;
          DROP TABLE IF EXISTS schema_version;
 
          CREATE TABLE schema_version (version INTEGER NOT NULL);
-         INSERT INTO schema_version VALUES (6);
+         INSERT INTO schema_version VALUES (7);
 
          CREATE TABLE folders (
              account   TEXT NOT NULL,
@@ -277,6 +280,7 @@ const CALENDAR_SCHEMA_SQL: &str = "
              ctag         TEXT,
              sync_token   TEXT,
              color        TEXT,
+             identity     TEXT,
              PRIMARY KEY (account, url)
          );
 
@@ -339,6 +343,24 @@ fn migrate_v5_to_v6_add_sync_log(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v6 -> v7: `calendars.identity`, the address the CalDAV server says a
+/// calendar belongs to (jadav's `owner-identity`), which `jacal` uses as
+/// the `ORGANIZER` of events created there. Additive, like v5 and v6.
+fn migrate_v6_to_v7_add_calendar_identity(conn: &Connection) -> Result<()> {
+    // The shared calendar DDL already carries the column on a database
+    // created (or brought to v5) by this build; only add it when missing.
+    let has_identity = conn
+        .prepare("PRAGMA table_info(calendars)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == "identity");
+    if !has_identity {
+        conn.execute("ALTER TABLE calendars ADD COLUMN identity TEXT", [])?;
+    }
+    conn.execute("UPDATE schema_version SET version = 7", [])?;
+    Ok(())
+}
+
 /// Status values for `calendar_events.local_status`: `SYNCED` reflects the
 /// last-known server state exactly; the `PENDING_*` values are a local
 /// write queued for the daemon's calendar sync thread to apply (mirroring
@@ -394,6 +416,10 @@ fn upgrade_schema(conn: &Connection) -> Result<()> {
     if version == 5 {
         migrate_v5_to_v6_add_sync_log(conn)?;
         version = 6;
+    }
+    if version == 6 {
+        migrate_v6_to_v7_add_calendar_identity(conn)?;
+        version = 7;
     }
     debug_assert_eq!(
         version, CURRENT_SCHEMA_VERSION,
@@ -464,7 +490,7 @@ impl MailDb {
     #[cfg(test)]
     pub(crate) fn open_in_memory_legacy_v4() -> Result<Self> {
         let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
-        let sql = MAIL_SCHEMA_SQL.replacen("VALUES (6)", "VALUES (4)", 1);
+        let sql = MAIL_SCHEMA_SQL.replacen("VALUES (7)", "VALUES (4)", 1);
         conn.execute_batch(&sql)?;
         Ok(Self { conn })
     }
@@ -477,7 +503,7 @@ impl MailDb {
     pub(crate) fn open_in_memory_legacy_v5() -> Result<Self> {
         let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
         let sql = format!("{}\n{}", MAIL_SCHEMA_SQL, CALENDAR_SCHEMA_SQL).replacen(
-            "VALUES (6)",
+            "VALUES (7)",
             "VALUES (5)",
             1,
         );
@@ -1259,30 +1285,34 @@ impl MailDb {
     /// those, so a rediscovery pass (which only learns the display name
     /// again) can't accidentally reset sync progress.
     pub fn upsert_calendar(&self, account: &str, url: &str, display_name: &str) -> Result<()> {
-        self.upsert_calendar_with_color(account, url, display_name, None)
+        self.upsert_calendar_with_color(account, url, display_name, None, None)
     }
 
     /// [`Self::upsert_calendar`] that also records the server's
-    /// `calendar-color`; `None` leaves a previously stored colour alone.
+    /// `calendar-color` and owner identity; a `None` leaves a previously
+    /// stored value alone.
     pub fn upsert_calendar_with_color(
         &self,
         account: &str,
         url: &str,
         display_name: &str,
         color: Option<&str>,
+        identity: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO calendars (account, url, display_name, color) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO calendars (account, url, display_name, color, identity)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(account, url) DO UPDATE SET display_name = excluded.display_name,
-                 color = COALESCE(excluded.color, calendars.color)",
-            params![account, url, display_name, color],
+                 color = COALESCE(excluded.color, calendars.color),
+                 identity = COALESCE(excluded.identity, calendars.identity)",
+            params![account, url, display_name, color, identity],
         )?;
         Ok(())
     }
 
     pub fn get_calendars(&self, account: &str) -> Result<Vec<CalendarRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT url, display_name, ctag, sync_token, color FROM calendars
+            "SELECT url, display_name, ctag, sync_token, color, identity FROM calendars
              WHERE account = ?1 ORDER BY display_name",
         )?;
         let rows = stmt.query_map(params![account], |row| {
@@ -1292,6 +1322,7 @@ impl MailDb {
                 ctag: row.get(2)?,
                 sync_token: row.get(3)?,
                 color: row.get(4)?,
+                identity: row.get(5)?,
             })
         })?;
         let mut out = Vec::new();
@@ -2341,7 +2372,7 @@ mod calendar_migration_tests {
 
         db.upgrade_for_test().unwrap();
 
-        assert_eq!(db.schema_version_for_test(), 6);
+        assert_eq!(db.schema_version_for_test(), CURRENT_SCHEMA_VERSION);
 
         // Existing mail survived the upgrade untouched.
         let emails = db.get_email_list("personal", "INBOX").unwrap();
@@ -2371,15 +2402,15 @@ mod calendar_migration_tests {
         // Idempotency matters: jamaild and jamail both call MailDb::open()
         // independently and could race on first-run upgrade.
         db.upgrade_for_test().unwrap();
-        assert_eq!(db.schema_version_for_test(), 6);
+        assert_eq!(db.schema_version_for_test(), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
     fn a_fresh_database_is_unaffected_by_upgrade() {
         let db = MailDb::open_in_memory().unwrap();
-        assert_eq!(db.schema_version_for_test(), 6);
+        assert_eq!(db.schema_version_for_test(), CURRENT_SCHEMA_VERSION);
         db.upgrade_for_test().unwrap();
-        assert_eq!(db.schema_version_for_test(), 6);
+        assert_eq!(db.schema_version_for_test(), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -2411,7 +2442,7 @@ mod calendar_migration_tests {
             .unwrap();
 
         db.upgrade_for_test().unwrap();
-        assert_eq!(db.schema_version_for_test(), 6);
+        assert_eq!(db.schema_version_for_test(), CURRENT_SCHEMA_VERSION);
 
         // Existing calendar data survived the upgrade untouched.
         let calendars = db.get_calendars("personal").unwrap();

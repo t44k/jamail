@@ -18,18 +18,33 @@ pub struct JamailConfig {
     pub jadav: Option<crate::jadav::config::JadavConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct JacalConfig {
     /// Which day a week starts on in `jacal`'s week/month/year grids.
     /// Unset (default): Monday.
     #[serde(default)]
     pub week_start: WeekStart,
     /// Per-calendar display settings, keyed by calendar URL. `jacal`
-    /// writes this list back itself (see [`save_jacal_calendar_prefs`])
+    /// writes this list back itself (see [`save_jacal_settings`])
     /// whenever a calendar is hidden/shown or given a colour; a calendar
     /// without an entry is shown with its server or palette colour.
     #[serde(default)]
     pub calendars: Vec<JacalCalendarPref>,
+    /// Whether events we declined are shown (default) or hidden. Toggled
+    /// with `D` in `jacal`'s calendar panel and written back like
+    /// `calendars`.
+    #[serde(default = "default_true")]
+    pub show_declined: bool,
+}
+
+impl Default for JacalConfig {
+    fn default() -> Self {
+        Self {
+            week_start: WeekStart::default(),
+            calendars: Vec::new(),
+            show_declined: true,
+        }
+    }
 }
 
 /// One calendar's display settings in `jacal.calendars`.
@@ -76,74 +91,111 @@ fn render_jacal_calendars(prefs: &[JacalCalendarPref], indent: usize) -> Vec<Str
     out
 }
 
-/// Return `text` (a whole `config.yaml`) with its `jacal.calendars` list
-/// replaced by `prefs` and **nothing else changed**: comments, ordering,
-/// quoting and every other key are kept byte for byte. A missing
-/// `calendars:` key is added at the end of the `jacal:` block; a missing
-/// `jacal:` block is appended to the file. Pure, so it is unit-tested on
-/// literal documents; [`save_jacal_calendar_prefs`] does the I/O.
-pub fn splice_jacal_calendars(text: &str, prefs: &[JacalCalendarPref]) -> String {
-    let had_trailing_newline = text.is_empty() || text.ends_with('\n');
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    let is_top_level_key = |l: &str| !l.is_empty() && !l.starts_with(' ') && !l.starts_with('\t');
-    let jacal_idx = lines.iter().position(|l| {
+fn is_top_level_key(l: &str) -> bool {
+    !l.is_empty() && !l.starts_with(' ') && !l.starts_with('\t')
+}
+
+/// `(jacal line index, end of block, child indent)` of the `jacal:` block
+/// in `lines`, if there is one. The block runs to the next line starting
+/// in column 0; the child indent is that of its first real line (2 when
+/// the block is empty).
+fn jacal_block(lines: &[String]) -> Option<(usize, usize, usize)> {
+    let j = lines.iter().position(|l| {
         is_top_level_key(l) && {
             let rest = l.trim_end();
             rest == "jacal:" || rest.starts_with("jacal: #") || rest.starts_with("jacal:\t")
         }
+    })?;
+    let block_end = (j + 1..lines.len())
+        .find(|&i| is_top_level_key(&lines[i]) || lines[i].starts_with('#'))
+        .unwrap_or(lines.len());
+    let child_indent = (j + 1..block_end)
+        .find(|&i| !is_blank_or_comment(&lines[i]))
+        .map(|i| indent_of(&lines[i]))
+        .filter(|&n| n > 0)
+        .unwrap_or(2);
+    Some((j, block_end, child_indent))
+}
+
+/// Replace the lines of key `key` (a scalar or a list at the child indent
+/// of the `jacal:` block) with `replacement`, or append `replacement` at
+/// the end of the block when the key is absent — after the block's last
+/// non-blank line, so a blank separator before the next top-level key
+/// survives.
+fn upsert_jacal_key(lines: &mut Vec<String>, key: &str, replacement: Vec<String>) {
+    let Some((j, block_end, child_indent)) = jacal_block(lines) else {
+        return;
+    };
+    let key_idx = (j + 1..block_end).find(|&i| {
+        let l = &lines[i];
+        indent_of(l) == child_indent && {
+            let t = l.trim_start().trim_end();
+            t == format!("{key}:")
+                || t.starts_with(&format!("{key}: "))
+                || t.starts_with(&format!("{key}:\t"))
+        }
     });
-    match jacal_idx {
+    match key_idx {
+        Some(k) => {
+            // The key's lines end at the next thing at the same or a
+            // shallower indent, comments included.
+            let key_end = (k + 1..block_end)
+                .find(|&i| !lines[i].trim().is_empty() && indent_of(&lines[i]) <= child_indent)
+                .unwrap_or(block_end);
+            lines.splice(k..key_end, replacement);
+        }
         None => {
-            if lines.last().is_some_and(|l| !l.trim().is_empty()) {
-                lines.push(String::new());
-            }
-            lines.push("jacal:".to_string());
-            lines.extend(render_jacal_calendars(prefs, 2));
+            let insert_at = (j + 1..block_end)
+                .rev()
+                .find(|&i| !lines[i].trim().is_empty())
+                .map(|i| i + 1)
+                .unwrap_or(j + 1);
+            lines.splice(insert_at..insert_at, replacement);
         }
-        Some(j) => {
-            // The block runs to the next line starting in column 0.
-            let block_end = (j + 1..lines.len())
-                .find(|&i| is_top_level_key(&lines[i]) || lines[i].starts_with('#'))
-                .unwrap_or(lines.len());
-            let child_indent = (j + 1..block_end)
-                .find(|&i| !is_blank_or_comment(&lines[i]))
-                .map(|i| indent_of(&lines[i]))
-                .filter(|&n| n > 0)
-                .unwrap_or(2);
-            let block = render_jacal_calendars(prefs, child_indent);
-            let cal_idx = (j + 1..block_end).find(|&i| {
-                let l = &lines[i];
-                indent_of(l) == child_indent && {
-                    let t = l.trim_start().trim_end();
-                    t == "calendars:"
-                        || t == "calendars: []"
-                        || t.starts_with("calendars: #")
-                        || t.starts_with("calendars: [")
-                }
-            });
-            match cal_idx {
-                Some(c) => {
-                    let cal_end = (c + 1..block_end)
-                        .find(|&i| {
-                            // The list ends at the next thing at the same
-                            // or a shallower indent, comments included.
-                            !lines[i].trim().is_empty() && indent_of(&lines[i]) <= child_indent
-                        })
-                        .unwrap_or(block_end);
-                    lines.splice(c..cal_end, block);
-                }
-                None => {
-                    // After the block's last non-blank line, so a blank
-                    // separator before the next top-level key survives.
-                    let insert_at = (j + 1..block_end)
-                        .rev()
-                        .find(|&i| !lines[i].trim().is_empty())
-                        .map(|i| i + 1)
-                        .unwrap_or(j + 1);
-                    lines.splice(insert_at..insert_at, block);
-                }
-            }
+    }
+}
+
+/// [`splice_jacal_settings`] for the calendar list alone.
+pub fn splice_jacal_calendars(text: &str, prefs: &[JacalCalendarPref]) -> String {
+    splice_jacal_settings(text, prefs, None)
+}
+
+/// Return `text` (a whole `config.yaml`) with its `jacal.calendars` list
+/// replaced by `prefs` — and, when given, `jacal.show_declined` set — and
+/// **nothing else changed**: comments, ordering, quoting and every other
+/// key are kept byte for byte. A missing key is added at the end of the
+/// `jacal:` block; a missing `jacal:` block is appended to the file. Pure,
+/// so it is unit-tested on literal documents; [`save_jacal_settings`] does
+/// the I/O.
+pub fn splice_jacal_settings(
+    text: &str,
+    prefs: &[JacalCalendarPref],
+    show_declined: Option<bool>,
+) -> String {
+    let had_trailing_newline = text.is_empty() || text.ends_with('\n');
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    if jacal_block(&lines).is_none() {
+        if lines.last().is_some_and(|l| !l.trim().is_empty()) {
+            lines.push(String::new());
         }
+        lines.push("jacal:".to_string());
+    }
+    let child_indent = jacal_block(&lines).map(|b| b.2).unwrap_or(2);
+    upsert_jacal_key(
+        &mut lines,
+        "calendars",
+        render_jacal_calendars(prefs, child_indent),
+    );
+    if let Some(flag) = show_declined {
+        upsert_jacal_key(
+            &mut lines,
+            "show_declined",
+            vec![format!(
+                "{}show_declined: {}",
+                " ".repeat(child_indent),
+                flag
+            )],
+        );
     }
     let mut out = lines.join("\n");
     if had_trailing_newline || !out.is_empty() {
@@ -152,22 +204,39 @@ pub fn splice_jacal_calendars(text: &str, prefs: &[JacalCalendarPref]) -> String
     out
 }
 
-/// Persist `jacal.calendars` into the config file at `path` (see
-/// [`splice_jacal_calendars`]). The result is parsed back as a full
-/// [`JamailConfig`] and compared before anything is written, then written
-/// to a temporary file next to the original (same permissions — the file
-/// holds credentials) and renamed into place.
+/// [`save_jacal_settings`] for the calendar list alone.
 pub fn save_jacal_calendar_prefs(
     path: &std::path::Path,
     prefs: &[JacalCalendarPref],
 ) -> Result<()> {
+    save_jacal_settings_inner(path, prefs, None)
+}
+
+/// Persist `jacal.calendars` and `jacal.show_declined` into the config
+/// file at `path` (see [`splice_jacal_settings`]). The result is parsed
+/// back as a full [`JamailConfig`] and compared before anything is
+/// written, then written to a temporary file next to the original (same
+/// permissions — the file holds credentials) and renamed into place.
+pub fn save_jacal_settings(
+    path: &std::path::Path,
+    prefs: &[JacalCalendarPref],
+    show_declined: bool,
+) -> Result<()> {
+    save_jacal_settings_inner(path, prefs, Some(show_declined))
+}
+
+fn save_jacal_settings_inner(
+    path: &std::path::Path,
+    prefs: &[JacalCalendarPref],
+    show_declined: Option<bool>,
+) -> Result<()> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config: {}", path.display()))?;
-    let new_text = splice_jacal_calendars(&text, prefs);
+    let new_text = splice_jacal_settings(&text, prefs, show_declined);
     let parsed: JamailConfig = serde_yml::from_str(&new_text)
         .context("the rewritten config no longer parses; nothing was written")?;
-    let stored = parsed.jacal.map(|j| j.calendars).unwrap_or_default();
-    if stored != prefs {
+    let jacal = parsed.jacal.unwrap_or_default();
+    if jacal.calendars != prefs || show_declined.is_some_and(|f| jacal.show_declined != f) {
         anyhow::bail!(
             "the rewritten config does not round-trip the calendar settings; nothing was written"
         );
@@ -869,5 +938,31 @@ mod tests {
         }
         assert!(!dir.join("config.yaml.jacal-tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn show_declined_is_upserted_next_to_the_calendar_list() {
+        let text = "accounts: {}\njacal:\n  week_start: monday\n\nother: 1\n";
+        let out = splice_jacal_settings(text, &[], Some(false));
+        assert_eq!(
+            out,
+            "accounts: {}\njacal:\n  week_start: monday\n  calendars: []\n  show_declined: false\n\nother: 1\n"
+        );
+        let again = splice_jacal_settings(&out, &prefs(), Some(true));
+        assert!(again.contains("  show_declined: true\n"), "{again}");
+        assert_eq!(again.matches("show_declined").count(), 1);
+        assert!(again.contains("  calendars:\n    - url:"), "{again}");
+        let parsed: JamailConfig = serde_yml::from_str(&again).unwrap();
+        let jacal = parsed.jacal.unwrap();
+        assert!(jacal.show_declined);
+        assert_eq!(jacal.calendars, prefs());
+        let bare: JamailConfig =
+            serde_yml::from_str("accounts: {}\njacal:\n  week_start: monday\n").unwrap();
+        assert!(bare.jacal.unwrap().show_declined);
+        let fresh = splice_jacal_settings("accounts: {}\n", &[], Some(false));
+        assert_eq!(
+            fresh,
+            "accounts: {}\n\njacal:\n  calendars: []\n  show_declined: false\n"
+        );
     }
 }

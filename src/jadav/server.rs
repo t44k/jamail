@@ -78,6 +78,9 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Namespace of jadav's own WebDAV properties (`owner-identity`).
+pub const NS_JADAV: &str = "urn:jamail:jadav";
+
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUESTS_PER_CONNECTION: usize = 1000;
@@ -743,6 +746,7 @@ impl Ctx<'_> {
                 QName::dav("supported-report-set"),
                 QName::caldav("supported-calendar-component-set"),
                 QName::caldav("calendar-description"),
+                QName::new(NS_JADAV, "owner-identity"),
                 QName::apple("calendar-color"),
                 QName::apple("calendar-order"),
                 QName::caldav("calendar-timezone"),
@@ -887,6 +891,12 @@ impl Ctx<'_> {
             },
             (NS_APPLE, "calendar-color") => match res {
                 Res::Calendar(c) => c.color.as_ref().map(|col| xml::escape_text(col)),
+                _ => None,
+            },
+            // jadav's own: which of the principal's identities a calendar
+            // belongs to, so a client can set the right ORGANIZER.
+            (NS_JADAV, "owner-identity") => match res {
+                Res::Calendar(c) => Some(xml::escape_text(&format!("mailto:{}", c.identity))),
                 _ => None,
             },
             (NS_APPLE, "calendar-order") => match res {

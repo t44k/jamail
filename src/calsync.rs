@@ -264,6 +264,7 @@ fn run_one_cycle(
             &cal.url,
             &cal.display_name,
             cal.color.as_deref(),
+            cal.identity.as_deref(),
         );
         sync_one_calendar(account_name, &cal.url, client, db, tx);
     }

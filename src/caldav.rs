@@ -102,6 +102,9 @@ pub struct DiscoveredCalendar {
     /// Apple's `calendar-color` (`#rrggbb` or `#rrggbbaa`), the colour the
     /// server (or the user, on the phone) gave the calendar.
     pub color: Option<String>,
+    /// jadav's `owner-identity` (`urn:jamail:jadav`): the address this
+    /// calendar belongs to, bare (no `mailto:`). Other servers: `None`.
+    pub identity: Option<String>,
 }
 
 pub struct ChangedEvent {
@@ -271,6 +274,7 @@ impl CalDavClient {
                     display_name: r.displayname.unwrap_or_else(|| href.clone()),
                     ctag: r.ctag,
                     color: r.color,
+                    identity: r.identity,
                 });
             }
         }
@@ -635,6 +639,7 @@ struct ResponseAccum {
     calendar_data: Option<String>,
     displayname: Option<String>,
     color: Option<String>,
+    identity: Option<String>,
     ctag: Option<String>,
     is_calendar_collection: bool,
     current_user_principal: Option<String>,
@@ -653,6 +658,7 @@ struct PropStatBuf {
     calendar_data: Option<String>,
     displayname: Option<String>,
     color: Option<String>,
+    identity: Option<String>,
     ctag: Option<String>,
     is_calendar: bool,
     current_user_principal: Option<String>,
@@ -782,6 +788,13 @@ fn parse_multistatus(xml: &str) -> Result<MultiStatusDoc> {
                             buf.color = Some(c.to_string());
                         }
                     }
+                    "owner-identity" => {
+                        let v = text.trim();
+                        let v = v.strip_prefix("mailto:").unwrap_or(v).trim();
+                        if !v.is_empty() {
+                            buf.identity = Some(v.to_ascii_lowercase());
+                        }
+                    }
                     "getctag" => buf.ctag = Some(text.trim().to_string()),
                     "sync-token" => doc.sync_token = Some(text.trim().to_string()),
                     "status" => {
@@ -808,6 +821,9 @@ fn parse_multistatus(xml: &str) -> Result<MultiStatusDoc> {
                             }
                             if buf.color.is_some() {
                                 c.color = buf.color.take();
+                            }
+                            if buf.identity.is_some() {
+                                c.identity = buf.identity.take();
                             }
                             if buf.ctag.is_some() {
                                 c.ctag = buf.ctag.take();
@@ -853,12 +869,13 @@ const HOMESET_PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
 </D:propfind>"#;
 
 const CALENDAR_LIST_PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
-<D:propfind xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/" xmlns:A="http://apple.com/ns/ical/">
+<D:propfind xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/" xmlns:A="http://apple.com/ns/ical/" xmlns:J="urn:jamail:jadav">
   <D:prop>
     <D:resourcetype/>
     <D:displayname/>
     <CS:getctag/>
     <A:calendar-color/>
+    <J:owner-identity/>
   </D:prop>
 </D:propfind>"#;
 
@@ -962,6 +979,7 @@ mod tests {
         assert_eq!(calendars.len(), 1);
         assert_eq!(calendars[0].display_name, "Personal");
         assert_eq!(calendars[0].color.as_deref(), Some("#3366FFFF"));
+        assert_eq!(calendars[0].identity.as_deref(), Some("alice@example.com"));
         assert!(calendars[0].url.ends_with("/cal/personal/"));
         let requests = handle.join().unwrap();
         assert!(requests[0].starts_with("PROPFIND / HTTP/1.1"));
@@ -1235,6 +1253,7 @@ mod tests {
         <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
         <D:displayname>Personal</D:displayname>
         <A:calendar-color xmlns:A="http://apple.com/ns/ical/">#3366FFFF</A:calendar-color>
+        <J:owner-identity xmlns:J="urn:jamail:jadav">mailto:Alice@Example.com</J:owner-identity>
         <CS:getctag>"ctag-1"</CS:getctag>
       </D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>

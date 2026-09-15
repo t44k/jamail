@@ -271,7 +271,7 @@ pub struct Rsvp {
 /// attendees' lines, `VALARM`, `RRULE`, and any property this module
 /// doesn't model at all) is intentionally not editable and is always
 /// preserved verbatim.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EventEdits {
     pub summary: Option<String>,
     pub description: Option<String>,
@@ -292,6 +292,131 @@ pub struct EventEdits {
     /// `PARTSTAT` change into the iTIP `REPLY`.
     #[serde(default)]
     pub rsvp: Option<Rsvp>,
+    /// Replace every `VALARM` with one `DISPLAY` alarm per entry, each
+    /// this many minutes before the start (`0` = at the start). `None`
+    /// keeps the existing alarms verbatim. Alarms are ours alone, so this
+    /// never bumps `SEQUENCE`.
+    #[serde(default)]
+    pub alarms: Option<Vec<i64>>,
+    /// Replace the guest list with these addresses: attendees already on
+    /// the event keep their line (and so their `PARTSTAT`), new ones are
+    /// added as `NEEDS-ACTION` with `RSVP=TRUE`, and anyone missing is
+    /// removed. `None` leaves the guest list alone. Does not bump
+    /// `SEQUENCE`: the server invites the added and cancels the removed.
+    #[serde(default)]
+    pub attendees: Option<Vec<String>>,
+    /// The `ORGANIZER` to set when the event has attendees but no
+    /// organizer yet (our identity for the calendar). Ignored otherwise.
+    #[serde(default)]
+    pub organizer: Option<String>,
+}
+
+impl Alarm {
+    /// A `DISPLAY` alarm `minutes` before the event starts.
+    pub fn display_before(minutes: i64) -> Self {
+        Alarm {
+            trigger: AlarmTrigger::Relative {
+                offset: Duration::minutes(-minutes),
+                related: AlarmRelated::Start,
+            },
+            action: "DISPLAY".to_string(),
+            description: None,
+        }
+    }
+
+    /// The minutes before the start this alarm fires, when it is of that
+    /// simple relative-to-start kind; `None` for absolute or end-relative
+    /// triggers (which the edit form shows but cannot re-express).
+    pub fn minutes_before_start(&self) -> Option<i64> {
+        match &self.trigger {
+            AlarmTrigger::Relative {
+                offset,
+                related: AlarmRelated::Start,
+            } if offset.num_seconds() <= 0 => Some(-offset.num_minutes()),
+            _ => None,
+        }
+    }
+}
+
+/// Parse the edit form's alarm list: entries separated by commas or
+/// spaces, each a number with an optional unit — `15m`, `2h`, `1d`, `1w`,
+/// bare digits meaning minutes, `0` meaning "at the start" — as minutes
+/// before the start. Empty input is an empty list.
+pub fn parse_alarm_list(text: &str) -> Result<Vec<i64>, String> {
+    let mut out = Vec::new();
+    for raw in text.split([',', ' ', ';']) {
+        let token = raw.trim().to_ascii_lowercase();
+        if token.is_empty() {
+            continue;
+        }
+        let (digits, unit) = match token.find(|c: char| !c.is_ascii_digit()) {
+            Some(i) => (&token[..i], &token[i..]),
+            None => (token.as_str(), "m"),
+        };
+        let n: i64 = digits
+            .parse()
+            .map_err(|_| format!("invalid alarm {:?} (use e.g. 15m, 2h, 1d)", raw.trim()))?;
+        let minutes = match unit.trim_start() {
+            "" | "m" | "min" | "mins" | "minute" | "minutes" => n,
+            "h" | "hr" | "hour" | "hours" => n * 60,
+            "d" | "day" | "days" => n * 1440,
+            "w" | "week" | "weeks" => n * 10_080,
+            _ => {
+                return Err(format!(
+                    "invalid alarm {:?} (use e.g. 15m, 2h, 1d)",
+                    raw.trim()
+                ));
+            }
+        };
+        if !out.contains(&minutes) {
+            out.push(minutes);
+        }
+    }
+    Ok(out)
+}
+
+/// The short form the edit form and event view use for an alarm:
+/// `15m`, `2h`, `1d`, `1w`, `0m`, or `(other)` for triggers the form
+/// cannot express.
+pub fn format_alarm_short(alarm: &Alarm) -> String {
+    match alarm.minutes_before_start() {
+        Some(m) if m > 0 && m % 10_080 == 0 => format!("{}w", m / 10_080),
+        Some(m) if m > 0 && m % 1440 == 0 => format!("{}d", m / 1440),
+        Some(m) if m > 0 && m % 60 == 0 => format!("{}h", m / 60),
+        Some(m) => format!("{}m", m),
+        None => "(other)".to_string(),
+    }
+}
+
+/// A sentence for the event view: `15 minutes before`, `2 hours before`,
+/// `1 day before`, `at start`, or the raw trigger for anything else.
+pub fn describe_alarm(alarm: &Alarm) -> String {
+    match alarm.minutes_before_start() {
+        Some(0) => "at start".to_string(),
+        Some(m) if m % 10_080 == 0 => plural(m / 10_080, "week"),
+        Some(m) if m % 1440 == 0 => plural(m / 1440, "day"),
+        Some(m) if m % 60 == 0 => plural(m / 60, "hour"),
+        Some(m) => plural(m, "minute"),
+        None => match &alarm.trigger {
+            AlarmTrigger::Absolute(t) => format!("at {}", t.format("%Y-%m-%d %H:%M UTC")),
+            AlarmTrigger::Relative { offset, related } => format!(
+                "{} relative to the {}",
+                format_ical_duration(*offset),
+                match related {
+                    AlarmRelated::Start => "start",
+                    AlarmRelated::End => "end",
+                }
+            ),
+        },
+    }
+}
+
+fn plural(n: i64, unit: &str) -> String {
+    if n == 1 {
+        format!("1 {} before", unit)
+    } else {
+        format!("{} {}s before", n, unit)
+    }
 }
 
 /// Apply an [`Rsvp`] to a whole document: rewrite our `ATTENDEE` line's
@@ -1832,13 +1957,7 @@ impl VEvent {
             lines.push(render_attendee(a));
         }
         for alarm in &self.alarms {
-            lines.push("BEGIN:VALARM".to_string());
-            lines.push(format!("ACTION:{}", alarm.action));
-            lines.push(render_trigger(&alarm.trigger));
-            if let Some(d) = &alarm.description {
-                lines.push(format!("DESCRIPTION:{}", escape_text(d)));
-            }
-            lines.push("END:VALARM".to_string());
+            lines.extend(render_alarm_lines(alarm));
         }
         lines.push("END:VEVENT".to_string());
         lines.push("END:VCALENDAR".to_string());
@@ -1854,43 +1973,97 @@ impl VEvent {
     /// each significant revision.
     pub fn to_ics(&self, edits: &EventEdits, now: DateTime<Utc>) -> Result<String, CalendarError> {
         let mut updated = self.clone();
+        // Only a *different* value is a change: the edit form always sends
+        // every field, and an unchanged event must not have its SEQUENCE
+        // bumped (that would make the server re-invite every attendee).
         let mut changed = false;
-        if let Some(v) = &edits.summary {
+        if let Some(v) = &edits.summary
+            && *v != updated.summary
+        {
             updated.summary = v.clone();
             changed = true;
         }
-        if let Some(v) = &edits.description {
+        if let Some(v) = &edits.description
+            && *v != updated.description
+        {
             updated.description = v.clone();
             changed = true;
         }
-        if let Some(v) = &edits.location {
+        if let Some(v) = &edits.location
+            && *v != updated.location
+        {
             updated.location = v.clone();
             changed = true;
         }
-        if let Some(v) = edits.status {
+        if let Some(v) = edits.status
+            && v != updated.status
+        {
             updated.status = v;
             changed = true;
         }
-        if let Some(v) = &edits.dtstart {
+        if let Some(v) = &edits.dtstart
+            && *v != updated.dtstart
+        {
             updated.dtstart = v.clone();
             changed = true;
         }
-        if let Some(v) = &edits.dtend {
+        if let Some(v) = &edits.dtend
+            && *v != updated.dtend
+        {
             updated.dtend = v.clone();
             changed = true;
         }
         if let Some(v) = &edits.rrule {
             validate_rrule(v)?;
-            updated.rrule = Some(v.clone());
-            changed = true;
+            if updated.rrule.as_deref() != Some(v.as_str()) {
+                updated.rrule = Some(v.clone());
+                changed = true;
+            }
         }
         if changed {
             updated.sequence += 1;
             updated.dtstamp = Some(now);
         }
+        // Alarms and the guest list are re-rendered wholesale from the
+        // model when edited; neither is the organizer's SEQUENCE business.
+        let mut scope = PatchScope::default();
+        if let Some(minutes) = &edits.alarms {
+            updated.alarms = minutes.iter().map(|&m| Alarm::display_before(m)).collect();
+            scope.alarms = true;
+        }
+        if let Some(list) = &edits.attendees {
+            let mut kept: Vec<Attendee> = Vec::new();
+            for email in list {
+                let email = cal_address_email(email);
+                if email.is_empty() || kept.iter().any(|a| a.email.eq_ignore_ascii_case(&email)) {
+                    continue;
+                }
+                match updated
+                    .attendees
+                    .iter()
+                    .find(|a| a.email.eq_ignore_ascii_case(&email))
+                {
+                    Some(existing) => kept.push(existing.clone()),
+                    None => kept.push(Attendee {
+                        email,
+                        name: None,
+                        role: None,
+                        partstat: Some("NEEDS-ACTION".to_string()),
+                    }),
+                }
+            }
+            updated.attendees = kept;
+            if updated.organizer.is_none()
+                && !updated.attendees.is_empty()
+                && let Some(org) = &edits.organizer
+            {
+                updated.organizer = Some(cal_address_email(org));
+            }
+            scope.attendees = true;
+        }
 
         match &self.raw {
-            Some(raw) => patch_raw_vevent(raw, &updated, now),
+            Some(raw) => patch_raw_vevent(raw, &updated, now, scope),
             None => {
                 let ics = updated.to_new_ics(now);
                 match &edits.rsvp {
@@ -1900,6 +2073,33 @@ impl VEvent {
             }
         }
     }
+}
+
+/// What [`patch_raw_vevent`] re-renders from the model besides the
+/// [`PROPERTY_NAMES_TO_PATCH`] lines: `VALARM` blocks and/or the
+/// `ORGANIZER`/`ATTENDEE` lines. Everything not in scope is preserved
+/// verbatim, as always.
+#[derive(Clone, Copy, Default, Debug)]
+struct PatchScope {
+    alarms: bool,
+    attendees: bool,
+}
+
+/// The `VALARM` block lines for one alarm, unfolded.
+fn render_alarm_lines(alarm: &Alarm) -> Vec<String> {
+    let mut lines = vec![
+        "BEGIN:VALARM".to_string(),
+        format!("ACTION:{}", alarm.action),
+        render_trigger(&alarm.trigger),
+    ];
+    if let Some(d) = &alarm.description {
+        lines.push(format!("DESCRIPTION:{}", escape_text(d)));
+    } else if alarm.action.eq_ignore_ascii_case("DISPLAY") {
+        // RFC 5545 requires DESCRIPTION on a DISPLAY alarm.
+        lines.push("DESCRIPTION:Reminder".to_string());
+    }
+    lines.push("END:VALARM".to_string());
+    lines
 }
 
 fn render_attendee(a: &Attendee) -> String {
@@ -1912,6 +2112,10 @@ fn render_attendee(a: &Attendee) -> String {
     }
     if let Some(partstat) = &a.partstat {
         params.push_str(&format!(";PARTSTAT={}", partstat));
+        // An attendee who has not answered is being asked to.
+        if partstat.eq_ignore_ascii_case("NEEDS-ACTION") {
+            params.push_str(";RSVP=TRUE");
+        }
     }
     format!("ATTENDEE{}:mailto:{}", params, a.email)
 }
@@ -2129,6 +2333,7 @@ fn patch_raw_vevent(
     raw: &str,
     updated: &VEvent,
     now: DateTime<Utc>,
+    scope: PatchScope,
 ) -> Result<String, CalendarError> {
     let lines = unfold(raw);
     if lines.is_empty() || !lines[0].eq_ignore_ascii_case("BEGIN:VEVENT") {
@@ -2139,15 +2344,24 @@ fn patch_raw_vevent(
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut depth = 0i32;
     let mut inserted_replacements = false;
+    // While positive, we are inside a VALARM that is being replaced.
+    let mut skipping_alarm = 0i32;
     for line in &lines {
         if starts_with_ignore_case(line, "BEGIN:") {
-            if depth > 0 {
-                out.push(line.clone());
-            }
             depth += 1;
             if depth == 1 {
                 out.push(line.clone());
+                continue;
             }
+            if skipping_alarm > 0 {
+                skipping_alarm += 1;
+                continue;
+            }
+            if scope.alarms && depth == 2 && line.eq_ignore_ascii_case("BEGIN:VALARM") {
+                skipping_alarm = 1;
+                continue;
+            }
+            out.push(line.clone());
             continue;
         }
         if starts_with_ignore_case(line, "END:") {
@@ -2155,20 +2369,41 @@ fn patch_raw_vevent(
             if depth == 0 {
                 if !inserted_replacements {
                     out.extend(replacement_lines(updated, now));
+                    if scope.attendees {
+                        if let Some(org) = &updated.organizer {
+                            out.push(format!("ORGANIZER:mailto:{}", org));
+                        }
+                        out.extend(updated.attendees.iter().map(render_attendee));
+                    }
+                    if scope.alarms {
+                        for alarm in &updated.alarms {
+                            out.extend(render_alarm_lines(alarm));
+                        }
+                    }
                     inserted_replacements = true;
                 }
                 out.push(line.clone());
                 continue;
             }
+            if skipping_alarm > 0 {
+                skipping_alarm -= 1;
+                continue;
+            }
             out.push(line.clone());
             continue;
         }
-        if depth == 1 {
+        if skipping_alarm > 0 {
+            continue;
+        }
+        if depth == 1
+            && let Some(cl) = parse_content_line(line)
+        {
             // Top-level VEVENT property: drop it if it's one we patch —
             // the replacement set is inserted once, right before END.
-            if let Some(cl) = parse_content_line(line)
-                && PROPERTY_NAMES_TO_PATCH.contains(&cl.name.as_str())
-            {
+            if PROPERTY_NAMES_TO_PATCH.contains(&cl.name.as_str()) {
+                continue;
+            }
+            if scope.attendees && (cl.name == "ATTENDEE" || cl.name == "ORGANIZER") {
                 continue;
             }
         }
@@ -3146,5 +3381,119 @@ END:VCALENDAR\r\n";
                 .iter()
                 .any(|l| l == "ATTENDEE;PARTSTAT=TENTATIVE:mailto:me@example.com")
         );
+    }
+
+    #[test]
+    fn unchanged_form_values_do_not_bump_sequence() {
+        let doc = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:same\r\nDTSTART:20240115T090000Z\r\nDTEND:20240115T100000Z\r\nSUMMARY:Same\r\nLOCATION:Here\r\nSEQUENCE:4\r\nSTATUS:CONFIRMED\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let event = parse_vevents(doc).unwrap().remove(0);
+        let same = EventEdits {
+            summary: Some("Same".to_string()),
+            description: Some(String::new()),
+            location: Some("Here".to_string()),
+            status: Some(EventStatus::Confirmed),
+            dtstart: Some(event.dtstart.clone()),
+            dtend: Some(event.dtend.clone()),
+            ..Default::default()
+        };
+        let out = patch_document(doc, &event, &same, utc(2024, 1, 10, 0, 0, 0)).unwrap();
+        assert!(unfold(&out).iter().any(|l| l == "SEQUENCE:4"), "{out}");
+        let moved = EventEdits {
+            summary: Some("Same".to_string()),
+            dtstart: Some(EventTime::utc(utc(2024, 1, 15, 10, 0, 0))),
+            ..Default::default()
+        };
+        let out = patch_document(doc, &event, &moved, utc(2024, 1, 10, 0, 0, 0)).unwrap();
+        assert!(unfold(&out).iter().any(|l| l == "SEQUENCE:5"), "{out}");
+    }
+
+    #[test]
+    fn alarm_and_attendee_edits_rewrite_only_their_lines() {
+        let doc = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:g1\r\nDTSTART:20240115T090000Z\r\nDTEND:20240115T100000Z\r\nSUMMARY:Guests\r\nSEQUENCE:1\r\nX-KEEP:yes\r\nATTENDEE;CN=Bob;PARTSTAT=ACCEPTED:mailto:bob@example.com\r\nATTENDEE;PARTSTAT=DECLINED:mailto:gone@example.com\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT30M\r\nDESCRIPTION:old\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let event = parse_vevents(doc).unwrap().remove(0);
+        assert_eq!(event.alarms.len(), 1);
+        let edits = EventEdits {
+            alarms: Some(vec![15, 1440]),
+            attendees: Some(vec![
+                "Bob@Example.com".to_string(),
+                "carol@example.com".to_string(),
+            ]),
+            organizer: Some("mailto:me@example.com".to_string()),
+            ..Default::default()
+        };
+        let out = patch_document(doc, &event, &edits, utc(2024, 1, 10, 0, 0, 0)).unwrap();
+        let lines = unfold(&out);
+        assert!(
+            lines.iter().any(|l| l == "SEQUENCE:1"),
+            "guest/alarm edits are not a sequence bump"
+        );
+        assert!(lines.iter().any(|l| l == "X-KEEP:yes"));
+        assert!(
+            lines.iter().any(|l| l == "ORGANIZER:mailto:me@example.com"),
+            "{out}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "ATTENDEE;CN=Bob;PARTSTAT=ACCEPTED:mailto:bob@example.com"),
+            "kept with its answer"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:carol@example.com"),
+            "{out}"
+        );
+        assert!(!out.contains("gone@example.com"));
+        assert!(!out.contains("TRIGGER:-PT30M"));
+        assert!(lines.iter().any(|l| l == "TRIGGER:-PT15M"));
+        assert!(lines.iter().any(|l| l == "TRIGGER:-P1D"), "{out}");
+        assert_eq!(lines.iter().filter(|l| *l == "BEGIN:VALARM").count(), 2);
+        let reparsed = parse_vevents(&out).unwrap().remove(0);
+        assert_eq!(reparsed.alarms.len(), 2);
+        assert_eq!(reparsed.attendees.len(), 2);
+
+        // Removing everyone keeps the organizer line and drops the alarms.
+        let none = EventEdits {
+            alarms: Some(vec![]),
+            attendees: Some(vec![]),
+            ..Default::default()
+        };
+        let out = patch_document(&out, &reparsed, &none, utc(2024, 1, 10, 0, 0, 0)).unwrap();
+        assert!(!out.contains("ATTENDEE"));
+        assert!(!out.contains("VALARM"));
+        assert!(out.contains("ORGANIZER:mailto:me@example.com"));
+    }
+
+    #[test]
+    fn alarm_lists_parse_and_format_both_ways() {
+        assert_eq!(
+            parse_alarm_list("15m, 2h 1d;1w 0").unwrap(),
+            vec![15, 120, 1440, 10080, 0]
+        );
+        assert_eq!(parse_alarm_list("").unwrap(), Vec::<i64>::new());
+        assert_eq!(parse_alarm_list("10, 10").unwrap(), vec![10]);
+        assert!(parse_alarm_list("soon").is_err());
+        assert!(parse_alarm_list("5x").is_err());
+        assert_eq!(format_alarm_short(&Alarm::display_before(15)), "15m");
+        assert_eq!(format_alarm_short(&Alarm::display_before(120)), "2h");
+        assert_eq!(format_alarm_short(&Alarm::display_before(1440)), "1d");
+        assert_eq!(format_alarm_short(&Alarm::display_before(0)), "0m");
+        assert_eq!(describe_alarm(&Alarm::display_before(1)), "1 minute before");
+        assert_eq!(
+            describe_alarm(&Alarm::display_before(120)),
+            "2 hours before"
+        );
+        assert_eq!(describe_alarm(&Alarm::display_before(0)), "at start");
+        let end_relative = Alarm {
+            trigger: AlarmTrigger::Relative {
+                offset: Duration::minutes(5),
+                related: AlarmRelated::End,
+            },
+            action: "DISPLAY".to_string(),
+            description: None,
+        };
+        assert_eq!(format_alarm_short(&end_relative), "(other)");
+        assert!(describe_alarm(&end_relative).contains("end"));
     }
 }

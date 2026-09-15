@@ -13,7 +13,8 @@
 //! `app.rs`: TUI rendering itself isn't unit-tested in this crate).
 
 use crate::calendar::{
-    EventEdits, EventStatus, EventTime, VEvent, expand_occurrences, validate_rrule,
+    EventEdits, EventStatus, EventTime, VEvent, describe_alarm, expand_occurrences,
+    format_alarm_short, parse_alarm_list, validate_rrule,
 };
 use crate::config::{JacalCalendarPref, WeekStart};
 use crate::db::{CalendarEventRow, CalendarRow};
@@ -215,6 +216,13 @@ const GLYPH_MAYBE: &str = "○";
 const GLYPH_UNANSWERED: &str = "◦";
 /// A cross: we declined, or the organizer cancelled the event.
 const GLYPH_DECLINED: &str = "✕";
+/// The row the current time falls in, in today's column: a red band that
+/// carries the clock (`NOW 13:43`) so the eye finds "now" at once.
+const NOW_BG: Color = Color::Rgb(122, 30, 30);
+const NOW_FG: Color = Color::Rgb(255, 232, 232);
+/// The selected event keeps its calendar tint; its text turns this
+/// yellow and bold, and the column's borders show `>`/`<` on its row.
+const SELECTED_FG: Color = Color::Rgb(255, 220, 90);
 /// How much of a calendar's colour goes into its events' row background
 /// (the rest is the cell's own background), in percent. Strong enough to
 /// read the calendar from the row alone, weak enough to keep text legible.
@@ -352,8 +360,6 @@ const SLOT_LABEL_HOUR_FG: Color = Color::Rgb(88, 88, 106);
 /// Drawn in every time-grid slot an event covers *after* the one it starts
 /// in, so a long event reads as a continuous block down its column.
 const SLOT_CONTINUATION: &str = "│";
-/// Width of a ruler label (`09h`, `now`) — see [`CalApp::slot_label`].
-const HOUR_LABEL_WIDTH: usize = 3;
 /// At most this fraction of a column may be spent on cascade indentation,
 /// capping how far [`pack_cascade`] will step a deeply-clashing event right
 /// so its title always keeps most of the width. A share rather than a fixed
@@ -691,6 +697,9 @@ pub struct CalendarVisibility {
     pub color: Option<Color>,
     /// The colour the CalDAV server advertises (`calendar-color`).
     pub server_color: Option<Color>,
+    /// The address the server says this calendar belongs to (jadav's
+    /// `owner-identity`), used as `ORGANIZER` for events created here.
+    pub identity: Option<String>,
 }
 
 /// Everything that makes up "where you were looking": not just the view,
@@ -718,6 +727,8 @@ pub enum CalMode {
     Rsvp,
     /// The calendar list panel (`C`): show/hide and recolour calendars.
     Calendars,
+    /// The participants modal — see [`AttendeeEditor`].
+    Attendees,
 }
 
 /// The event a [`CalMode::ConfirmDelete`] prompt is about, captured when
@@ -756,8 +767,12 @@ pub struct PendingRsvp {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CalField {
+    /// Which calendar a new event is saved to (Left/Right cycle; fixed
+    /// once an event exists).
+    Calendar,
     Summary,
     Location,
+    /// Free-text notes (`DESCRIPTION`).
     Description,
     StartDate,
     StartTime,
@@ -765,12 +780,17 @@ pub enum CalField {
     EndTime,
     AllDay,
     Rrule,
+    /// Reminders before the start, `15m, 1h, 1d` style.
+    Alarms,
+    /// The guest list; Enter opens the participants modal.
+    Attendees,
 }
 
 impl CalField {
     fn next(self) -> CalField {
         use CalField::*;
         match self {
+            Calendar => Summary,
             Summary => Location,
             Location => Description,
             Description => AllDay,
@@ -779,14 +799,17 @@ impl CalField {
             StartTime => EndDate,
             EndDate => EndTime,
             EndTime => Rrule,
-            Rrule => Summary,
+            Rrule => Alarms,
+            Alarms => Attendees,
+            Attendees => Calendar,
         }
     }
 
     fn prev(self) -> CalField {
         use CalField::*;
         match self {
-            Summary => Rrule,
+            Calendar => Attendees,
+            Summary => Calendar,
             Location => Summary,
             Description => Location,
             AllDay => Description,
@@ -795,8 +818,59 @@ impl CalField {
             EndDate => StartTime,
             EndTime => EndDate,
             Rrule => EndTime,
+            Alarms => Rrule,
+            Attendees => Alarms,
         }
     }
+}
+
+/// One guest on the form / in the participants modal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttendeeEntry {
+    pub email: String,
+    pub name: Option<String>,
+    pub partstat: Option<String>,
+}
+
+impl AttendeeEntry {
+    pub fn new(email: &str) -> Self {
+        Self {
+            email: email.trim().to_string(),
+            name: None,
+            partstat: Some("NEEDS-ACTION".to_string()),
+        }
+    }
+}
+
+/// Whose guest list the participants modal edits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttendeeTarget {
+    /// The event form's draft; closing returns to `return_to`.
+    Draft { return_to: CalMode },
+    /// An existing event; closing with changes saves an edit.
+    Event { id: i64, summary: String },
+}
+
+/// The participants modal ([`CalMode::Attendees`]): a guest list with a
+/// cursor and an input line for a new address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttendeeEditor {
+    pub target: AttendeeTarget,
+    pub attendees: Vec<AttendeeEntry>,
+    pub input: String,
+    pub cursor: usize,
+    /// The `ORGANIZER` to write when the event gains its first guest.
+    pub organizer: Option<String>,
+    pub changed: bool,
+}
+
+/// What closing the participants modal of an existing event asks the
+/// caller to save.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AttendeeCommit {
+    pub id: i64,
+    pub summary: String,
+    pub edits: EventEdits,
 }
 
 /// Editable state for the create/edit form. Dates/times are kept as
@@ -821,6 +895,17 @@ pub struct DraftEvent {
     /// `Some(id)` when editing an existing `calendar_events` row;
     /// `None` for a brand-new event.
     pub editing_local_id: Option<i64>,
+    /// Reminders as typed: `15m, 1h, 1d` (minutes before the start).
+    pub alarms: String,
+    /// Whether the alarm text was edited; untouched alarms of an existing
+    /// event are preserved verbatim (including kinds the form cannot
+    /// express) instead of being re-rendered.
+    pub alarms_touched: bool,
+    pub attendees: Vec<AttendeeEntry>,
+    pub attendees_touched: bool,
+    /// Our identity for this calendar, written as `ORGANIZER` when the
+    /// event has guests.
+    pub organizer: Option<String>,
 }
 
 impl DraftEvent {
@@ -838,8 +923,13 @@ impl DraftEvent {
             rrule: String::new(),
             status: EventStatus::Confirmed,
             calendar_url: calendar_url.to_string(),
-            field: CalField::Summary,
+            field: CalField::Calendar,
             editing_local_id: None,
+            alarms: String::new(),
+            alarms_touched: false,
+            attendees: Vec::new(),
+            attendees_touched: false,
+            organizer: None,
         }
     }
 
@@ -863,7 +953,56 @@ impl DraftEvent {
             calendar_url: row.calendar_url.clone(),
             field: CalField::Summary,
             editing_local_id: Some(row.id),
+            alarms: event
+                .alarms
+                .iter()
+                .map(format_alarm_short)
+                .collect::<Vec<_>>()
+                .join(", "),
+            alarms_touched: false,
+            attendees: event
+                .attendees
+                .iter()
+                .map(|a| AttendeeEntry {
+                    email: a.email.clone(),
+                    name: a.name.clone(),
+                    partstat: a.partstat.clone(),
+                })
+                .collect(),
+            attendees_touched: false,
+            organizer: event.organizer.clone(),
         })
+    }
+
+    /// Move a *new* event to the next/previous of `calendars` (visible
+    /// ones only, unless none is). An existing event stays where it is.
+    pub fn cycle_calendar(&mut self, calendars: &[CalendarVisibility], step: i32) {
+        if self.editing_local_id.is_some() || calendars.is_empty() {
+            return;
+        }
+        let visible: Vec<&CalendarVisibility> = calendars.iter().filter(|c| c.visible).collect();
+        let candidates: Vec<&CalendarVisibility> = if visible.is_empty() {
+            calendars.iter().collect()
+        } else {
+            visible
+        };
+        let n = candidates.len() as i32;
+        let current = candidates
+            .iter()
+            .position(|c| c.url == self.calendar_url)
+            .map(|i| i as i32)
+            .unwrap_or(-1);
+        let next = (current + step).rem_euclid(n) as usize;
+        self.calendar_url = candidates[next].url.clone();
+    }
+
+    /// The reminders the form should save: `None` when the text was never
+    /// touched (keep the event's alarms as they are).
+    fn edited_alarms(&self) -> Result<Option<Vec<i64>>, String> {
+        if !self.alarms_touched {
+            return Ok(None);
+        }
+        parse_alarm_list(&self.alarms).map(Some)
     }
 
     pub fn next_field(&mut self) {
@@ -887,7 +1026,11 @@ impl DraftEvent {
             CalField::EndDate => Some(&mut self.end_date),
             CalField::EndTime => Some(&mut self.end_time),
             CalField::Rrule => Some(&mut self.rrule),
-            CalField::AllDay => None,
+            CalField::Alarms => {
+                self.alarms_touched = true;
+                Some(&mut self.alarms)
+            }
+            CalField::AllDay | CalField::Calendar | CalField::Attendees => None,
         }
     }
 
@@ -1014,6 +1157,11 @@ impl DraftEvent {
             dtend: Some(dtend),
             rrule,
             rsvp: None,
+            alarms: self.edited_alarms()?,
+            attendees: self
+                .attendees_touched
+                .then(|| self.attendees.iter().map(|a| a.email.clone()).collect()),
+            organizer: self.organizer.clone(),
         })
     }
 
@@ -1025,19 +1173,42 @@ impl DraftEvent {
         }
         let (dtstart, dtend) = self.parse_times()?;
         let rrule = self.validated_rrule()?;
+        let alarms = parse_alarm_list(&self.alarms)?
+            .into_iter()
+            .map(crate::calendar::Alarm::display_before)
+            .collect();
+        let attendees: Vec<crate::calendar::Attendee> = self
+            .attendees
+            .iter()
+            .map(|a| crate::calendar::Attendee {
+                email: a.email.clone(),
+                name: a.name.clone(),
+                role: None,
+                partstat: Some(
+                    a.partstat
+                        .clone()
+                        .unwrap_or_else(|| "NEEDS-ACTION".to_string()),
+                ),
+            })
+            .collect();
+        let organizer = if attendees.is_empty() {
+            None
+        } else {
+            self.organizer.clone()
+        };
         Ok(VEvent {
             uid: generate_uid(),
             summary: self.summary.clone(),
             description: self.description.clone(),
             location: self.location.clone(),
             status: self.status,
-            organizer: None,
-            attendees: Vec::new(),
+            organizer,
+            attendees,
             dtstart,
             dtend,
             rrule,
             exdates: Vec::new(),
-            alarms: Vec::new(),
+            alarms,
             sequence: 0,
             dtstamp: None,
             recurrence_id: None,
@@ -1107,6 +1278,10 @@ pub struct CalApp {
     /// Our answer per loaded event (by row id), computed once per load so
     /// rendering never re-parses ICS — see [`participation_of`].
     participation: HashMap<i64, Participation>,
+    /// Whether events we declined are shown at all (`jacal.show_declined`).
+    pub show_declined: bool,
+    /// The participants modal while `mode` is [`CalMode::Attendees`].
+    pub attendee_editor: Option<AttendeeEditor>,
     pub status: Option<String>,
     pub ipc_connected: bool,
 }
@@ -1134,6 +1309,8 @@ impl CalApp {
             prefs_dirty: false,
             calendar_cursor: 0,
             participation: HashMap::new(),
+            show_declined: true,
+            attendee_editor: None,
             status: None,
             ipc_connected: false,
         }
@@ -1419,6 +1596,7 @@ impl CalApp {
                 });
                 CalendarVisibility {
                     server_color: r.color.as_deref().and_then(parse_hex_color),
+                    identity: r.identity.clone(),
                     url: r.url,
                     display_name: r.display_name,
                     visible,
@@ -1520,6 +1698,192 @@ impl CalApp {
             .map(|c| c.url.clone())
     }
 
+    /// Show or hide the events we declined (persisted as
+    /// `jacal.show_declined`).
+    pub fn toggle_show_declined(&mut self) {
+        self.show_declined = !self.show_declined;
+        self.prefs_dirty = true;
+        self.refilter();
+    }
+
+    /// The address events created in `calendar_url` are organised as: the
+    /// identity the server attached to the calendar, else our primary one.
+    pub fn calendar_identity(&self, calendar_url: &str) -> Option<String> {
+        self.calendars
+            .iter()
+            .find(|c| c.url == calendar_url)
+            .and_then(|c| c.identity.clone())
+            .or_else(|| self.identities.first().cloned())
+    }
+
+    // -- Participants modal ----------------------------------------------
+
+    /// Open the participants modal for the event form's draft.
+    pub fn begin_attendees_for_draft(&mut self) {
+        let Some(draft) = &self.draft else {
+            return;
+        };
+        let return_to = self.mode;
+        let organizer = draft
+            .organizer
+            .clone()
+            .or_else(|| self.calendar_identity(&draft.calendar_url));
+        self.attendee_editor = Some(AttendeeEditor {
+            target: AttendeeTarget::Draft { return_to },
+            attendees: draft.attendees.clone(),
+            input: String::new(),
+            cursor: 0,
+            organizer,
+            changed: false,
+        });
+        self.mode = CalMode::Attendees;
+    }
+
+    /// Open the participants modal for the selected event. Only an event
+    /// we organise (or one without an organizer yet) can have its guest
+    /// list changed; for anyone else's invitation the answer is `r`.
+    pub fn begin_attendees_for_selected(&mut self) -> Result<(), String> {
+        let ev = self
+            .selected_event()
+            .ok_or_else(|| "no event selected".to_string())?;
+        let parsed = ev
+            .to_vevent()
+            .map_err(|e| format!("could not read event: {}", e))?;
+        let organizer_addr = parsed
+            .organizer
+            .as_deref()
+            .map(crate::calendar::cal_address_email)
+            .filter(|o| !o.is_empty());
+        if let Some(org) = &organizer_addr
+            && !self.identities.iter().any(|i| i.eq_ignore_ascii_case(org))
+        {
+            return Err(format!(
+                "{} organises this event — only the organizer can change the guest list (r to answer)",
+                org
+            ));
+        }
+        let organizer = organizer_addr.or_else(|| self.calendar_identity(&ev.calendar_url));
+        self.attendee_editor = Some(AttendeeEditor {
+            target: AttendeeTarget::Event {
+                id: ev.id,
+                summary: ev.summary.clone(),
+            },
+            attendees: parsed
+                .attendees
+                .iter()
+                .map(|a| AttendeeEntry {
+                    email: a.email.clone(),
+                    name: a.name.clone(),
+                    partstat: a.partstat.clone(),
+                })
+                .collect(),
+            input: String::new(),
+            cursor: 0,
+            organizer,
+            changed: false,
+        });
+        self.mode = CalMode::Attendees;
+        Ok(())
+    }
+
+    pub fn attendee_editor_input(&mut self, c: char) {
+        if let Some(ed) = self.attendee_editor.as_mut()
+            && !c.is_control()
+        {
+            ed.input.push(c);
+        }
+    }
+
+    pub fn attendee_editor_backspace(&mut self) {
+        if let Some(ed) = self.attendee_editor.as_mut() {
+            ed.input.pop();
+        }
+    }
+
+    pub fn attendee_editor_move(&mut self, delta: i32) {
+        if let Some(ed) = self.attendee_editor.as_mut()
+            && !ed.attendees.is_empty()
+        {
+            let n = ed.attendees.len() as i32;
+            ed.cursor = (ed.cursor as i32 + delta).rem_euclid(n) as usize;
+        }
+    }
+
+    /// Add the typed address to the guest list. Explicit errors for an
+    /// address without `@` or one already on the list.
+    pub fn attendee_editor_add(&mut self) -> Result<(), String> {
+        let Some(ed) = self.attendee_editor.as_mut() else {
+            return Ok(());
+        };
+        let addr = crate::calendar::cal_address_email(ed.input.trim());
+        if addr.is_empty() {
+            return Ok(());
+        }
+        if !addr.contains('@') || addr.starts_with('@') || addr.ends_with('@') {
+            return Err(format!("{:?} is not an email address", ed.input.trim()));
+        }
+        if ed
+            .attendees
+            .iter()
+            .any(|a| a.email.eq_ignore_ascii_case(&addr))
+        {
+            return Err(format!("{} is already on the list", addr));
+        }
+        ed.attendees.push(AttendeeEntry::new(&addr));
+        ed.cursor = ed.attendees.len() - 1;
+        ed.input.clear();
+        ed.changed = true;
+        Ok(())
+    }
+
+    /// Remove the guest under the cursor.
+    pub fn attendee_editor_remove(&mut self) {
+        if let Some(ed) = self.attendee_editor.as_mut()
+            && ed.cursor < ed.attendees.len()
+        {
+            ed.attendees.remove(ed.cursor);
+            ed.cursor = ed.cursor.min(ed.attendees.len().saturating_sub(1));
+            ed.changed = true;
+        }
+    }
+
+    /// Close the participants modal. For a draft the list goes back into
+    /// the form; for an existing event with changes, the edit to save is
+    /// returned to the caller.
+    pub fn finish_attendee_editor(&mut self) -> Option<AttendeeCommit> {
+        let ed = self.attendee_editor.take()?;
+        match ed.target {
+            AttendeeTarget::Draft { return_to } => {
+                if let Some(draft) = self.draft.as_mut() {
+                    if ed.changed {
+                        draft.attendees = ed.attendees;
+                        draft.attendees_touched = true;
+                    }
+                    if draft.organizer.is_none() {
+                        draft.organizer = ed.organizer;
+                    }
+                }
+                self.mode = return_to;
+                None
+            }
+            AttendeeTarget::Event { id, summary } => {
+                self.mode = CalMode::Browse;
+                if !ed.changed {
+                    return None;
+                }
+                Some(AttendeeCommit {
+                    id,
+                    summary,
+                    edits: EventEdits {
+                        attendees: Some(ed.attendees.iter().map(|a| a.email.clone()).collect()),
+                        organizer: ed.organizer,
+                        ..Default::default()
+                    },
+                })
+            }
+        }
+    }
+
     /// Our answer to `ev`'s invitation (cached per row id at load time).
     pub fn participation(&self, ev: &CalendarEventRow) -> Participation {
         self.participation
@@ -1608,6 +1972,7 @@ impl CalApp {
             .all_events
             .iter()
             .filter(|e| self.is_calendar_visible(&e.calendar_url))
+            .filter(|e| self.show_declined || self.participation(e) != Participation::Declined)
             .cloned()
             .collect();
         events.sort_by_key(|e| e.dtstart_utc);
@@ -1672,7 +2037,9 @@ impl CalApp {
             .and_hms_opt(9, 0, 0)
             .and_then(|naive| Local.from_local_datetime(&naive).single())
             .unwrap_or_else(Local::now);
-        self.draft = Some(DraftEvent::blank(&default_calendar, start));
+        let mut draft = DraftEvent::blank(&default_calendar, start);
+        draft.organizer = self.calendar_identity(&default_calendar);
+        self.draft = Some(draft);
         self.mode = CalMode::Create;
     }
 
@@ -1684,7 +2051,10 @@ impl CalApp {
         let row = self
             .selected_event()
             .ok_or_else(|| "no event selected".to_string())?;
-        let draft = DraftEvent::from_row(row)?;
+        let mut draft = DraftEvent::from_row(row)?;
+        if draft.organizer.is_none() {
+            draft.organizer = self.calendar_identity(&draft.calendar_url);
+        }
         self.draft = Some(draft);
         self.mode = CalMode::Edit;
         Ok(())
@@ -1840,8 +2210,89 @@ impl CalApp {
             CalMode::ConfirmDelete => self.render_delete_confirm(frame, area),
             CalMode::Rsvp => self.render_rsvp_prompt(frame, area),
             CalMode::Calendars => self.render_calendar_panel(frame, area),
+            CalMode::Attendees => self.render_attendee_editor(frame, area),
             CalMode::Browse => {}
         }
+    }
+
+    /// The participants modal: the guest list with each answer, a cursor,
+    /// and an input line for the next address.
+    fn render_attendee_editor(&self, frame: &mut Frame, area: Rect) {
+        let Some(ed) = &self.attendee_editor else {
+            return;
+        };
+        let rows = ed.attendees.len().max(1) as u16;
+        let popup = centered_rect(
+            70.min(area.width.saturating_sub(2)),
+            (rows + 7).min(area.height.saturating_sub(2)),
+            area,
+        );
+        frame.render_widget(Clear, popup);
+        let title = match &ed.target {
+            AttendeeTarget::Draft { .. } => " Participants ".to_string(),
+            AttendeeTarget::Event { summary, .. } => format!(" Participants — {} ", summary),
+        };
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .style(Style::default().bg(theme::HELP_BG).fg(theme::HELP_BORDER));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Organizer: {}",
+                ed.organizer
+                    .as_deref()
+                    .unwrap_or("(none — set an identity)")
+            ),
+            Style::default().fg(theme::HELP_DESC),
+        )));
+        if ed.attendees.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No guests yet.",
+                Style::default().fg(theme::FG_DIM),
+            )));
+        }
+        for (i, a) in ed.attendees.iter().enumerate() {
+            let bg = if i == ed.cursor {
+                theme::BG_SELECTED
+            } else {
+                theme::HELP_BG
+            };
+            let partstat = a
+                .partstat
+                .as_deref()
+                .unwrap_or("NEEDS-ACTION")
+                .to_ascii_lowercase();
+            let who = match &a.name {
+                Some(n) if !n.is_empty() => format!("{} <{}>", n, a.email),
+                _ => a.email.clone(),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {}  ", who),
+                    Style::default().fg(theme::FG_TEXT).bg(bg),
+                ),
+                Span::styled(partstat, Style::default().fg(theme::FG_DIM).bg(bg)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Add: ",
+                Style::default()
+                    .fg(theme::COMPOSE_FIELD_ACTIVE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(ed.input.clone(), Style::default().fg(theme::FG_TEXT)),
+            Span::styled("▌", Style::default().fg(theme::COMPOSE_CURSOR)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "Enter add   Up/Down select   Delete or Ctrl+D remove   Esc done",
+            Style::default().fg(theme::FG_DIM),
+        )));
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
     /// The calendar panel: one row per calendar with its glyph in its
@@ -1851,7 +2302,7 @@ impl CalApp {
         let rows = self.calendars.len().max(1) as u16;
         let popup = centered_rect(
             72.min(area.width.saturating_sub(2)),
-            (rows + 4).min(area.height.saturating_sub(2)),
+            (rows + 5).min(area.height.saturating_sub(2)),
             area,
         );
         frame.render_widget(Clear, popup);
@@ -1865,7 +2316,25 @@ impl CalApp {
             );
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.calendars.len() + 2);
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.calendars.len() + 3);
+        lines.push(Line::from(vec![
+            Span::styled("Declined events: ", Style::default().fg(theme::HELP_DESC)),
+            Span::styled(
+                if self.show_declined {
+                    "shown"
+                } else {
+                    "hidden"
+                },
+                Style::default()
+                    .fg(if self.show_declined {
+                        theme::STATUS_SUCCESS
+                    } else {
+                        theme::FG_DIM
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   (D toggles)", Style::default().fg(theme::FG_DIM)),
+        ]));
         if self.calendars.is_empty() {
             lines.push(Line::from(Span::styled(
                 "No calendars discovered yet — try 's' to sync.",
@@ -1911,7 +2380,7 @@ impl CalApp {
             ]));
         }
         lines.push(Line::from(Span::styled(
-            "j/k move   space show/hide   c/→ next colour   ← previous   x server colour   Esc close",
+            "j/k move   space show/hide   c/→ next colour   ← previous   x server colour   D declined   Esc close",
             Style::default().fg(theme::FG_DIM),
         )));
         frame.render_widget(Paragraph::new(lines), inner);
@@ -2064,9 +2533,9 @@ impl CalApp {
         max_lines: usize,
         compact: bool,
         width: u16,
-    ) -> Vec<Line<'static>> {
+    ) -> (Vec<Line<'static>>, Option<usize>) {
         if indices.is_empty() {
-            return if compact {
+            let lines = if compact {
                 Vec::new()
             } else {
                 vec![Line::from(Span::styled(
@@ -2074,6 +2543,7 @@ impl CalApp {
                     Style::default().fg(theme::FG_DIM),
                 ))]
             };
+            return (lines, None);
         }
         let is_focused_day = day == self.focused_date;
         let cell_bg = if is_weekend(day) {
@@ -2092,9 +2562,13 @@ impl CalApp {
         show_count = show_count.min(indices.len());
 
         let mut lines = Vec::with_capacity(show_count + 1);
+        let mut selected_line = None;
         for (pos, &idx) in indices.iter().take(show_count).enumerate() {
             let ev = &self.events[idx];
             let selected = is_focused_day && pos == self.event_cursor;
+            if selected {
+                selected_line = Some(lines.len());
+            }
             let text_level = if compact {
                 CellText::for_width(width).min_detail()
             } else {
@@ -2110,7 +2584,24 @@ impl CalApp {
                     .add_modifier(Modifier::ITALIC),
             )));
         }
-        lines
+        (lines, selected_line)
+    }
+
+    /// Put the selection marks on a column's borders: `>` on the left
+    /// border and `<` on the right, on the row of the selected event.
+    fn mark_selected_row(frame: &mut Frame, area: Rect, y: u16) {
+        if area.width < 2 || y < area.y || y >= area.y + area.height {
+            return;
+        }
+        let style = Style::default()
+            .fg(SELECTED_FG)
+            .add_modifier(Modifier::BOLD);
+        let buf = frame.buffer_mut();
+        for (x, sym) in [(area.x, ">"), (area.x + area.width - 1, "<")] {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_symbol(sym).set_style(style);
+            }
+        }
     }
 
     /// One event as a "[color dot] text" cell, padded to exactly `width`
@@ -2176,12 +2667,13 @@ impl CalApp {
         };
         let avail = (width as usize).saturating_sub(2);
         let text = truncate_str(&text, avail);
-        let line_bg = if selected {
-            theme::BG_SELECTED
-        } else {
-            self.event_row_bg(ev, cell_bg)
-        };
+        // Selection keeps the calendar's tint and speaks through the text
+        // (bold yellow) and the `>`/`<` marks on the column borders.
+        let line_bg = self.event_row_bg(ev, cell_bg);
         let mut base_style = Style::default().bg(line_bg).fg(theme::SUBJECT_COLOR);
+        if selected {
+            base_style = base_style.fg(SELECTED_FG).add_modifier(Modifier::BOLD);
+        }
         if ev.status.eq_ignore_ascii_case("CANCELLED") {
             base_style = base_style.add_modifier(Modifier::CROSSED_OUT);
         } else if self.participation(ev) == Participation::Declined {
@@ -2299,7 +2791,7 @@ impl CalApp {
         all_day_rows: usize,
         width: u16,
         cell_bg: Color,
-    ) -> Vec<Line<'static>> {
+    ) -> (Vec<Line<'static>>, Option<usize>) {
         let (all_day, timed) = self.layout_day(day, axis);
         let selected = if day == self.focused_date {
             Some(self.event_cursor)
@@ -2309,6 +2801,7 @@ impl CalApp {
         let banner_text = CellText::for_width(width);
         let blank = || Line::from(Span::styled(String::new(), Style::default().bg(cell_bg)));
         let mut lines = Vec::with_capacity(all_day_rows + axis.rows);
+        let mut selected_line: Option<usize> = None;
 
         // -- All-day banners, padded out to the shared reserved height.
         let shown = if all_day.len() > all_day_rows {
@@ -2328,6 +2821,9 @@ impl CalApp {
         }
         for row in 0..all_day_rows {
             if let Some(&(pos, idx)) = visible.get(row) {
+                if selected == Some(pos) {
+                    selected_line = Some(lines.len());
+                }
                 lines.push(self.render_event_line(
                     &self.events[idx],
                     selected == Some(pos),
@@ -2383,23 +2879,34 @@ impl CalApp {
                 .unwrap_or(bar_limit);
             let mut line: Vec<Span<'static>> = Vec::new();
             let mut col = 0usize;
+            // Today's current slot is a red band carrying the clock; its
+            // empty stretches and bars take that colour, event titles keep
+            // their own tint so they stay legible.
+            let is_now_row = now_row == Some(row);
+            let row_bg = if is_now_row { NOW_BG } else { cell_bg };
 
             // The ruler only gets a say where nothing has claimed the left
             // edge — otherwise the hour would collide with a bar or a title.
-            if first_busy > HOUR_LABEL_WIDTH && owner.is_none_or(|o| o.indent > 0) {
-                let label = self.slot_label(axis, row, now_row == Some(row));
-                if !label.0.is_empty() {
-                    line.push(Span::styled(
-                        label.0.clone(),
-                        Style::default().fg(label.1).bg(cell_bg),
-                    ));
-                    col = label.0.chars().count();
+            let label = self.slot_label(axis, row, is_now_row);
+            let label_len = label.0.chars().count();
+            if !label.0.is_empty()
+                && first_busy > label_len
+                && owner.is_none_or(|o| o.indent > label_len)
+            {
+                let mut style = Style::default().fg(label.1).bg(row_bg);
+                if is_now_row {
+                    style = style.add_modifier(Modifier::BOLD);
                 }
+                line.push(Span::styled(label.0.clone(), style));
+                col = label_len;
             }
             while col < width as usize {
                 if let Some(o) = owner.filter(|o| o.indent == col) {
                     if let Some(&(_, idx, first_row, _)) = of_pos(o.pos) {
                         let is_selected = selected == Some(o.pos);
+                        if is_selected {
+                            selected_line = Some(lines.len());
+                        }
                         let cell_width = width - col as u16;
                         // An event the cascade slid off its own slot must
                         // print its real start time even in a narrow
@@ -2419,9 +2926,9 @@ impl CalApp {
                     col = width as usize;
                     continue;
                 }
-                if let Some((pos, idx)) = bar_at(col) {
-                    let bg = if selected == Some(pos) {
-                        theme::BG_SELECTED
+                if let Some((_, idx)) = bar_at(col) {
+                    let bg = if is_now_row {
+                        NOW_BG
                     } else {
                         self.event_row_bg(&self.events[idx], cell_bg)
                     };
@@ -2444,17 +2951,15 @@ impl CalApp {
                             || (c < bar_limit && bar_at(c).is_some())
                     })
                     .unwrap_or(width as usize);
-                let fill_bg = (0..col.min(bar_limit))
-                    .rev()
-                    .find_map(bar_at)
-                    .map(|(pos, idx)| {
-                        if selected == Some(pos) {
-                            theme::BG_SELECTED
-                        } else {
-                            self.event_row_bg(&self.events[idx], cell_bg)
-                        }
-                    })
-                    .unwrap_or(cell_bg);
+                let fill_bg = if is_now_row {
+                    NOW_BG
+                } else {
+                    (0..col.min(bar_limit))
+                        .rev()
+                        .find_map(bar_at)
+                        .map(|(_, idx)| self.event_row_bg(&self.events[idx], cell_bg))
+                        .unwrap_or(cell_bg)
+                };
                 line.push(Span::styled(
                     " ".repeat(next - col),
                     Style::default().bg(fill_bg),
@@ -2463,7 +2968,7 @@ impl CalApp {
             }
             lines.push(Line::from(line));
         }
-        lines
+        (lines, selected_line)
     }
 
     /// The ruler text for a row: the hour, and only the hour — `09h` on the
@@ -2475,7 +2980,7 @@ impl CalApp {
     fn slot_label(&self, axis: &TimeAxis, row: usize, is_now: bool) -> (String, Color) {
         let minutes = axis.row_start_minutes(row);
         if is_now {
-            ("now".to_string(), theme::TIME_RELATIVE)
+            (format!("NOW {}", Local::now().format("%H:%M")), NOW_FG)
         } else if minutes.is_multiple_of(60) {
             (format!("{:02}h", minutes / 60), SLOT_LABEL_HOUR_FG)
         } else {
@@ -2553,15 +3058,19 @@ impl CalApp {
             // Grid rows are position-critical: one line per slot, never
             // wrapped, or the columns stop lining up with each other.
             if let Some(axis) = &axis {
-                let lines = self.grid_column_lines(day, axis, all_day_rows, inner.width, cell_bg);
+                let (lines, sel) =
+                    self.grid_column_lines(day, axis, all_day_rows, inner.width, cell_bg);
                 frame.render_widget(
                     Paragraph::new(lines).style(Style::default().bg(cell_bg)),
                     inner,
                 );
+                if is_focused && let Some(row) = sel {
+                    Self::mark_selected_row(frame, *col, inner.y + row as u16);
+                }
                 continue;
             }
             let indices = self.event_indices_for(day);
-            let lines =
+            let (lines, sel) =
                 self.cell_event_lines(day, &indices, inner.height as usize, false, inner.width);
             frame.render_widget(
                 Paragraph::new(lines)
@@ -2569,6 +3078,9 @@ impl CalApp {
                     .style(Style::default().bg(cell_bg)),
                 inner,
             );
+            if is_focused && let Some(row) = sel {
+                Self::mark_selected_row(frame, *col, inner.y + row as u16);
+            }
         }
     }
 
@@ -2671,13 +3183,21 @@ impl CalApp {
             lines.push(self.event_dot_strip(&indices, inner.width, cell_bg));
         }
         let text_rows = (inner.height as usize).saturating_sub(lines.len());
+        let mut selected_row = None;
         if text_rows > 0 {
-            lines.extend(self.cell_event_lines(day, &indices, text_rows, true, inner.width));
+            let offset = lines.len();
+            let (event_lines, sel) =
+                self.cell_event_lines(day, &indices, text_rows, true, inner.width);
+            lines.extend(event_lines);
+            selected_row = sel.map(|s| offset + s);
         }
         frame.render_widget(
             Paragraph::new(lines).style(Style::default().bg(cell_bg)),
             inner,
         );
+        if is_focused && let Some(row) = selected_row {
+            Self::mark_selected_row(frame, area, inner.y + row as u16);
+        }
     }
 
     /// Render Year: a 4x3 grid of mini-months (a "table of tables"), each
@@ -2965,6 +3485,28 @@ impl CalApp {
         if let Some(rrule) = &ev.rrule {
             lines.push(row("Repeats", rrule.clone()));
         }
+        if let Ok(parsed) = ev.to_vevent() {
+            let alarms = if parsed.alarms.is_empty() {
+                "none".to_string()
+            } else {
+                parsed
+                    .alarms
+                    .iter()
+                    .map(describe_alarm)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            lines.push(row("Alarms", alarms));
+            let ours = parsed
+                .organizer
+                .as_deref()
+                .map(crate::calendar::cal_address_email)
+                .filter(|o| !o.is_empty())
+                .is_none_or(|o| self.identities.iter().any(|i| i.eq_ignore_ascii_case(&o)));
+            if ours && parsed.attendees.is_empty() {
+                lines.push(row("Guests", "none — a to invite".to_string()));
+            }
+        }
         let mine = self.participation(ev);
         if mine != Participation::NotInvited {
             let (label, color) = match mine {
@@ -3029,7 +3571,7 @@ impl CalApp {
         let text = if let Some(status) = &self.status {
             status.clone()
         } else {
-            "hjkl move  [/] jump period  Tab/S-Tab narrow/widen  Enter zoom  Esc back  t today  n new  e edit  d del  r rsvp  v/C cals  1-9 cal  s sync  q quit"
+            "hjkl move  [/] jump period  Tab/S-Tab narrow/widen  Enter zoom  Esc back  t today  n new  e edit  d del  a guests  r rsvp  v/C cals  1-9 cal  s sync  q quit"
                 .to_string()
         };
         frame.render_widget(
@@ -3043,8 +3585,8 @@ impl CalApp {
     }
 
     fn render_form(&self, frame: &mut Frame, area: Rect, draft: &DraftEvent) {
-        let width = area.width.clamp(40, 70);
-        let height = 16u16.min(area.height);
+        let width = area.width.clamp(40, 74);
+        let height = 21u16.min(area.height);
         let popup = centered_rect(width, height, area);
         frame.render_widget(Clear, popup);
         let title = if draft.editing_local_id.is_some() {
@@ -3077,16 +3619,40 @@ impl CalApp {
         };
 
         let all_day_value = if draft.all_day { "yes" } else { "no" };
+        let calendar_name = self
+            .calendars
+            .iter()
+            .find(|c| c.url == draft.calendar_url)
+            .map(|c| c.display_name.clone())
+            .unwrap_or_else(|| draft.calendar_url.clone());
+        let calendar_value = if draft.editing_local_id.is_some() {
+            calendar_name
+        } else {
+            format!("{}   (←/→ to change)", calendar_name)
+        };
+        let alarms_value = if draft.alarms.is_empty() {
+            "none   (e.g. 15m, 1h, 1d)".to_string()
+        } else {
+            draft.alarms.clone()
+        };
+        let guests_value = match draft.attendees.len() {
+            0 => "none   (Enter to invite)".to_string(),
+            1 => format!("{}   (Enter to edit)", draft.attendees[0].email),
+            n => format!("{} guests   (Enter to edit)", n),
+        };
         let lines = vec![
+            field_line("Calendar:", &calendar_value, CalField::Calendar),
             field_line("Summary:", &draft.summary, CalField::Summary),
             field_line("Location:", &draft.location, CalField::Location),
-            field_line("Description:", &draft.description, CalField::Description),
+            field_line("Notes:", &draft.description, CalField::Description),
             field_line("All day:", all_day_value, CalField::AllDay),
             field_line("Start date:", &draft.start_date, CalField::StartDate),
             field_line("Start time:", &draft.start_time, CalField::StartTime),
             field_line("End date:", &draft.end_date, CalField::EndDate),
             field_line("End time:", &draft.end_time, CalField::EndTime),
             field_line("Repeats:", &draft.rrule, CalField::Rrule),
+            field_line("Alarms:", &alarms_value, CalField::Alarms),
+            field_line("Guests:", &guests_value, CalField::Attendees),
             Line::from(""),
             Line::from(Span::styled(
                 format!("Status: {} (Ctrl+X to cycle)", draft.status),
@@ -3361,6 +3927,7 @@ mod tests {
             ctag: None,
             sync_token: None,
             color: None,
+            identity: None,
         }
     }
 
@@ -4351,16 +4918,40 @@ mod tests {
     #[test]
     fn draft_field_navigation_wraps_both_directions() {
         let mut draft = DraftEvent::blank("c1", Local::now());
-        assert_eq!(draft.field, CalField::Summary);
+        assert_eq!(
+            draft.field,
+            CalField::Calendar,
+            "a new event starts by picking its calendar"
+        );
         draft.prev_field();
-        assert_eq!(draft.field, CalField::Rrule);
+        assert_eq!(draft.field, CalField::Attendees);
+        draft.next_field();
+        assert_eq!(draft.field, CalField::Calendar);
         draft.next_field();
         assert_eq!(draft.field, CalField::Summary);
+        // The full cycle visits every field exactly once.
+        let mut seen = vec![draft.field];
+        loop {
+            draft.next_field();
+            if draft.field == CalField::Summary {
+                break;
+            }
+            assert!(
+                !seen.contains(&draft.field),
+                "{:?} visited twice",
+                draft.field
+            );
+            seen.push(draft.field);
+        }
+        assert_eq!(seen.len(), 12);
     }
 
     #[test]
     fn input_char_and_backspace_edit_the_focused_field() {
         let mut draft = DraftEvent::blank("c1", Local::now());
+        draft.input_char('Z');
+        assert_eq!(draft.summary, "", "the calendar field takes no text");
+        draft.next_field(); // -> Summary
         draft.input_char('H');
         draft.input_char('i');
         assert_eq!(draft.summary, "Hi");
@@ -4662,5 +5253,142 @@ mod tests {
         assert_eq!(app.panel_calendar_url().as_deref(), Some("c1"));
         app.close_calendar_panel();
         assert_eq!(app.mode, CalMode::Browse);
+    }
+
+    #[test]
+    fn new_event_form_starts_on_the_calendar_field_and_cycles_visible_calendars() {
+        let mut app = test_app();
+        let mut c2 = cal_row("c2", "Two");
+        c2.identity = Some("work@example.com".to_string());
+        app.identities = vec!["me@example.com".to_string()];
+        app.set_calendars(vec![cal_row("c1", "One"), c2, cal_row("c3", "Three")]);
+        app.toggle_calendar_visible("c3");
+        app.begin_create();
+        let mut draft = app.draft.clone().unwrap();
+        assert_eq!(draft.field, CalField::Calendar);
+        assert_eq!(draft.calendar_url, "c1");
+        assert_eq!(draft.organizer.as_deref(), Some("me@example.com"));
+        draft.cycle_calendar(&app.calendars, 1);
+        assert_eq!(draft.calendar_url, "c2");
+        assert_eq!(
+            app.calendar_identity("c2").as_deref(),
+            Some("work@example.com")
+        );
+        draft.cycle_calendar(&app.calendars, 1);
+        assert_eq!(draft.calendar_url, "c1", "hidden c3 is skipped");
+        draft.cycle_calendar(&app.calendars, -1);
+        assert_eq!(draft.calendar_url, "c2");
+        draft.editing_local_id = Some(1);
+        draft.cycle_calendar(&app.calendars, 1);
+        assert_eq!(draft.calendar_url, "c2", "an existing event stays put");
+    }
+
+    #[test]
+    fn draft_alarms_and_guests_reach_the_event_only_when_edited() {
+        let start = Local
+            .from_local_datetime(&date(2024, 1, 15).and_hms_opt(9, 0, 0).unwrap())
+            .unwrap();
+        let mut draft = DraftEvent::blank("c1", start);
+        draft.summary = "Plan".to_string();
+        draft.organizer = Some("me@example.com".to_string());
+        draft.field = CalField::Alarms;
+        for c in "15m, 1d".chars() {
+            draft.input_char(c);
+        }
+        draft.field = CalField::Attendees;
+        draft.input_char('x');
+        assert!(draft.alarms_touched);
+        let edits = draft.to_event_edits().unwrap();
+        assert_eq!(edits.alarms, Some(vec![15, 1440]));
+        assert_eq!(edits.attendees, None, "guest list not touched");
+        let new = draft.to_new_vevent().unwrap();
+        assert_eq!(new.alarms.len(), 2);
+        assert!(new.attendees.is_empty());
+        assert_eq!(new.organizer, None, "no guests, no organizer line");
+
+        draft.attendees.push(AttendeeEntry::new("bob@example.com"));
+        draft.attendees_touched = true;
+        let edits = draft.to_event_edits().unwrap();
+        assert_eq!(edits.attendees, Some(vec!["bob@example.com".to_string()]));
+        assert_eq!(edits.organizer.as_deref(), Some("me@example.com"));
+        let new = draft.to_new_vevent().unwrap();
+        assert_eq!(new.attendees[0].partstat.as_deref(), Some("NEEDS-ACTION"));
+        assert_eq!(new.organizer.as_deref(), Some("me@example.com"));
+        assert!(new.to_new_ics(Utc::now()).contains("RSVP=TRUE"));
+
+        draft.alarms = "soon".to_string();
+        assert!(draft.to_event_edits().is_err());
+        let mut untouched = DraftEvent::blank("c1", start);
+        untouched.summary = "x".to_string();
+        assert_eq!(untouched.to_event_edits().unwrap().alarms, None);
+    }
+
+    #[test]
+    fn participants_modal_edits_a_draft_or_produces_a_commit() {
+        let mut app = test_app();
+        app.identities = vec!["me@example.com".to_string()];
+        app.set_calendars(vec![cal_row("c1", "One")]);
+        app.begin_create();
+        app.begin_attendees_for_draft();
+        assert_eq!(app.mode, CalMode::Attendees);
+        for c in "Bob@Example.com".chars() {
+            app.attendee_editor_input(c);
+        }
+        app.attendee_editor_add().unwrap();
+        for c in "nope".chars() {
+            app.attendee_editor_input(c);
+        }
+        assert!(app.attendee_editor_add().is_err());
+        app.attendee_editor.as_mut().unwrap().input.clear();
+        for c in "bob@example.com".chars() {
+            app.attendee_editor_input(c);
+        }
+        assert!(app.attendee_editor_add().is_err(), "duplicates are refused");
+        assert!(app.finish_attendee_editor().is_none());
+        assert_eq!(app.mode, CalMode::Create);
+        let draft = app.draft.clone().unwrap();
+        assert_eq!(draft.attendees.len(), 1);
+        assert_eq!(draft.attendees[0].email, "bob@example.com");
+        assert!(draft.attendees_touched);
+
+        let mut row = invited_row("me@example.com", "ACCEPTED");
+        row.id = 42;
+        app.cancel_form();
+        app.set_events(vec![row.clone()]);
+        app.focused_date = local_date_of(row.dtstart_utc);
+        app.event_cursor = 0;
+        app.begin_attendees_for_selected().unwrap();
+        assert_eq!(app.attendee_editor.as_ref().unwrap().attendees.len(), 2);
+        app.attendee_editor_move(1);
+        app.attendee_editor_remove();
+        let commit = app.finish_attendee_editor().unwrap();
+        assert_eq!(commit.id, 42);
+        assert_eq!(commit.edits.attendees.as_ref().unwrap().len(), 1);
+        assert_eq!(commit.edits.organizer.as_deref(), Some("me@example.com"));
+        assert_eq!(app.mode, CalMode::Browse);
+
+        app.set_events(vec![invited_row("boss@example.com", "NEEDS-ACTION")]);
+        let err = app.begin_attendees_for_selected().unwrap_err();
+        assert!(err.contains("boss@example.com"), "{err}");
+        assert_eq!(app.mode, CalMode::Browse);
+    }
+
+    #[test]
+    fn declined_events_can_be_hidden() {
+        let mut app = test_app();
+        app.identities = vec!["me@example.com".to_string()];
+        let mut going = invited_row("boss@example.com", "ACCEPTED");
+        going.id = 1;
+        let mut declined = invited_row("boss@example.com", "DECLINED");
+        declined.id = 2;
+        app.set_events(vec![going, declined]);
+        assert_eq!(app.events.len(), 2);
+        app.toggle_show_declined();
+        assert!(!app.show_declined);
+        assert_eq!(app.events.len(), 1);
+        assert_eq!(app.events[0].id, 1);
+        assert!(app.take_prefs_dirty());
+        app.toggle_show_declined();
+        assert_eq!(app.events.len(), 2);
     }
 }
