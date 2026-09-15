@@ -2333,7 +2333,7 @@ impl CalApp {
                     })
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("   (D toggles)", Style::default().fg(theme::FG_DIM)),
+            Span::styled("   (d toggles)", Style::default().fg(theme::FG_DIM)),
         ]));
         if self.calendars.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -2380,7 +2380,7 @@ impl CalApp {
             ]));
         }
         lines.push(Line::from(Span::styled(
-            "j/k move   space show/hide   c/→ next colour   ← previous   x server colour   D declined   Esc close",
+            "j/k move   space show/hide   c/→ next colour   ← previous   x server colour   d declined   Esc close",
             Style::default().fg(theme::FG_DIM),
         )));
         frame.render_widget(Paragraph::new(lines), inner);

@@ -302,7 +302,7 @@ fn run_app(
                 CalMode::Rsvp => {
                     handle_rsvp_key(app, db, ipc_client, key.code);
                 }
-                CalMode::Calendars => handle_calendar_panel_key(app, key.code),
+                CalMode::Calendars => handle_calendar_panel_key(app, key.code, key.modifiers),
                 CalMode::Attendees => {
                     handle_attendee_editor_key(app, db, ipc_client, key.code, key.modifiers);
                 }
@@ -477,6 +477,13 @@ fn handle_browse_key(
             });
             app.set_status("Requested sync…");
         }
+        // Say so when a key does nothing: it also shows exactly what the
+        // terminal delivered, which is what matters when a Shift+letter
+        // binding seems dead.
+        KeyCode::Char(c) => app.set_status(format!(
+            "No action for {:?} ({:?}) — see the key hints below",
+            c, modifiers
+        )),
         _ => {}
     }
     true
@@ -614,7 +621,8 @@ fn submit_form(app: &mut CalApp, db: &MailDb, ipc_client: &ipc::IpcClient) {
 }
 
 /// Keys in the calendar panel (`C`): move, show/hide, recolour, close.
-fn handle_calendar_panel_key(app: &mut CalApp, code: KeyCode) {
+fn handle_calendar_panel_key(app: &mut CalApp, code: KeyCode, modifiers: KeyModifiers) {
+    app.clear_status();
     match code {
         KeyCode::Char('j') | KeyCode::Down => app.calendar_panel_move(1),
         KeyCode::Char('k') | KeyCode::Up => app.calendar_panel_move(-1),
@@ -638,7 +646,9 @@ fn handle_calendar_panel_key(app: &mut CalApp, code: KeyCode) {
                 app.clear_calendar_color(&url);
             }
         }
-        KeyCode::Char('D') => app.toggle_show_declined(),
+        // `d`/`D` (either case: some terminals report Shift+d as a lowercase
+        // `d` with the SHIFT modifier) shows or hides declined events.
+        KeyCode::Char('d') | KeyCode::Char('D') => app.toggle_show_declined(),
         KeyCode::Char(digit @ '1'..='9') => {
             let idx = digit as usize - '1' as usize;
             if let Some(cal) = app.calendars.get(idx).cloned() {
@@ -648,6 +658,10 @@ fn handle_calendar_panel_key(app: &mut CalApp, code: KeyCode) {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('C') | KeyCode::Char('v') => {
             app.close_calendar_panel()
         }
+        KeyCode::Char(c) => app.set_status(format!(
+            "No panel action for {:?} ({:?}); keys: j/k space c ← → x d Esc",
+            c, modifiers
+        )),
         _ => {}
     }
 }
