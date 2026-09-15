@@ -1828,6 +1828,62 @@ const MAX_EXPANDED_OCCURRENCES: u16 = 3660;
 /// the module docs for exactly what's *not* handled (`RDATE`, `EXRULE`,
 /// and a malformed/unsupported `RRULE`, which falls back to just the
 /// master occurrence).
+/// Every occurrence of the event in `ics` (one `VCALENDAR`, or a bare
+/// `VEVENT`) overlapping `[window_start, window_end)`, as one [`VEvent`]
+/// per occurrence with `dtstart`/`dtend` set to that occurrence's own
+/// instants — with the document's `RECURRENCE-ID` overrides applied the
+/// way RFC 5545 §3.8.4.4 means them: a master occurrence an override
+/// claims is replaced by that override at *its* time (a moved instance
+/// shows up on its new day, not its old one), an override whose `STATUS`
+/// is `CANCELLED` removes the occurrence, and an override that moves an
+/// instance into the window from outside it is included. Unparsable
+/// input yields nothing.
+pub fn expand_document_occurrences(
+    ics: &str,
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> Vec<VEvent> {
+    let Ok(doc) = parse_document(ics) else {
+        return Vec::new();
+    };
+    let Some(master) = doc.master() else {
+        return Vec::new();
+    };
+    let overrides: Vec<&VEvent> = doc.overrides().collect();
+    let claimed: std::collections::HashSet<i64> = overrides
+        .iter()
+        .filter_map(|o| o.recurrence_id.as_ref().map(|r| r.utc.timestamp()))
+        .collect();
+    let mut out = Vec::new();
+    if !is_recurrence_override(master) {
+        for (start, end) in expand_occurrences(master, window_start, window_end) {
+            if claimed.contains(&start.timestamp()) {
+                continue;
+            }
+            let mut occurrence = master.clone();
+            occurrence.dtstart = EventTime {
+                utc: start,
+                ..master.dtstart.clone()
+            };
+            occurrence.dtend = EventTime {
+                utc: end,
+                ..master.dtend.clone()
+            };
+            out.push(occurrence);
+        }
+    }
+    for o in overrides {
+        if o.status == EventStatus::Cancelled {
+            continue;
+        }
+        if o.dtstart.utc < window_end && o.dtend.utc > window_start {
+            out.push(o.clone());
+        }
+    }
+    out.sort_by_key(|e| e.dtstart.utc);
+    out
+}
+
 pub fn expand_occurrences(
     ev: &VEvent,
     window_start: DateTime<Utc>,
@@ -1865,11 +1921,24 @@ fn expand_rrule_occurrences(
     duration: Duration,
 ) -> Option<Vec<(DateTime<Utc>, DateTime<Utc>)>> {
     let unvalidated: RRule<Unvalidated> = rrule_str.parse().ok()?;
-    let dt_start = ev.dtstart.utc.with_timezone(&RRuleTz::UTC);
+    // Expand in the event's own zone: a weekly 16:00 Berlin meeting stays
+    // at 16:00 Berlin across the DST change, which in UTC is an hour
+    // apart. Floating/UTC/all-day events (no resolvable TZID) expand in UTC.
+    let zone = ev
+        .dtstart
+        .tzid
+        .as_deref()
+        .and_then(resolve_tz)
+        .and_then(|alias| match alias {
+            TzAlias::Iana(tz) => Some(RRuleTz::Tz(tz)),
+            TzAlias::Fixed(_) => None,
+        })
+        .unwrap_or(RRuleTz::UTC);
+    let dt_start = ev.dtstart.utc.with_timezone(&zone);
     let validated = unvalidated.validate(dt_start).ok()?;
     let mut set = RRuleSet::new(dt_start).rrule(validated);
     for ex in &ev.exdates {
-        set = set.exdate(ex.with_timezone(&RRuleTz::UTC));
+        set = set.exdate(ex.with_timezone(&zone));
     }
 
     // Look back by one event-duration before the window so an occurrence
@@ -1881,8 +1950,8 @@ fn expand_rrule_occurrences(
     } else {
         Duration::zero()
     };
-    let after = (window_start - lookback).with_timezone(&RRuleTz::UTC);
-    let before = window_end.with_timezone(&RRuleTz::UTC);
+    let after = (window_start - lookback).with_timezone(&zone);
+    let before = window_end.with_timezone(&zone);
 
     let result = set
         .after(after)
@@ -3495,5 +3564,72 @@ END:VCALENDAR\r\n";
         };
         assert_eq!(format_alarm_short(&end_relative), "(other)");
         assert!(describe_alarm(&end_relative).contains("end"));
+    }
+
+    #[test]
+    fn document_expansion_applies_moved_and_cancelled_overrides() {
+        // Monthly on the 3rd Wednesday; the 16 Sep instance moved to 23 Sep,
+        // the 21 Oct one cancelled.
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:cs\r\nDTSTART;TZID=Europe/Berlin:20260916T160000\r\nDTEND;TZID=Europe/Berlin:20260916T173000\r\nRRULE:FREQ=MONTHLY;BYDAY=3WE\r\nSUMMARY:CS Retro\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:cs\r\nRECURRENCE-ID;TZID=Europe/Berlin:20260916T160000\r\nDTSTART;TZID=Europe/Berlin:20260923T160000\r\nDTEND;TZID=Europe/Berlin:20260923T173000\r\nSUMMARY:CS Retro (moved)\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:cs\r\nRECURRENCE-ID;TZID=Europe/Berlin:20261021T160000\r\nDTSTART;TZID=Europe/Berlin:20261021T160000\r\nDTEND;TZID=Europe/Berlin:20261021T173000\r\nSUMMARY:CS Retro\r\nSTATUS:CANCELLED\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let week =
+            expand_document_occurrences(ics, utc(2026, 9, 14, 0, 0, 0), utc(2026, 9, 21, 0, 0, 0));
+        assert!(week.is_empty(), "the 16 Sep slot moved away: {week:?}");
+        let next_week =
+            expand_document_occurrences(ics, utc(2026, 9, 21, 0, 0, 0), utc(2026, 9, 28, 0, 0, 0));
+        assert_eq!(next_week.len(), 1);
+        assert_eq!(next_week[0].summary, "CS Retro (moved)");
+        assert_eq!(next_week[0].dtstart.utc, utc(2026, 9, 23, 14, 0, 0));
+        let october =
+            expand_document_occurrences(ics, utc(2026, 10, 1, 0, 0, 0), utc(2026, 11, 1, 0, 0, 0));
+        assert!(
+            october.is_empty(),
+            "cancelled override removes the slot: {october:?}"
+        );
+        let november =
+            expand_document_occurrences(ics, utc(2026, 11, 1, 0, 0, 0), utc(2026, 12, 1, 0, 0, 0));
+        assert_eq!(november.len(), 1);
+        assert_eq!(november[0].summary, "CS Retro");
+        assert_eq!(november[0].dtstart.utc, utc(2026, 11, 18, 15, 0, 0));
+        // A bare, non-recurring VEVENT still yields itself when it overlaps.
+        let plain = "BEGIN:VEVENT\r\nUID:p\r\nDTSTART:20260916T140000Z\r\nDTEND:20260916T150000Z\r\nSUMMARY:P\r\nEND:VEVENT\r\n";
+        assert_eq!(
+            expand_document_occurrences(
+                plain,
+                utc(2026, 9, 16, 0, 0, 0),
+                utc(2026, 9, 17, 0, 0, 0)
+            )
+            .len(),
+            1
+        );
+        assert!(
+            expand_document_occurrences(
+                "garbage",
+                utc(2026, 9, 16, 0, 0, 0),
+                utc(2026, 9, 17, 0, 0, 0)
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn recurrences_keep_their_local_time_across_the_dst_change() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:w\r\nDTSTART;TZID=Europe/Berlin:20261014T160000\r\nDTEND;TZID=Europe/Berlin:20261014T170000\r\nRRULE:FREQ=WEEKLY;BYDAY=WE\r\nSUMMARY:Weekly\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let ev = parse_vevents(ics).unwrap().remove(0);
+        let occ = expand_occurrences(&ev, utc(2026, 10, 12, 0, 0, 0), utc(2026, 11, 9, 0, 0, 0));
+        let starts: Vec<DateTime<Utc>> = occ.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            starts,
+            vec![
+                utc(2026, 10, 14, 14, 0, 0), // CEST
+                utc(2026, 10, 21, 14, 0, 0),
+                utc(2026, 10, 28, 15, 0, 0), // CET: still 16:00 in Berlin
+                utc(2026, 11, 4, 15, 0, 0),
+            ]
+        );
+        // A UTC series stays on fixed UTC instants.
+        let utc_ics = "BEGIN:VEVENT\r\nUID:u\r\nDTSTART:20261014T140000Z\r\nDTEND:20261014T150000Z\r\nRRULE:FREQ=WEEKLY;BYDAY=WE\r\nSUMMARY:U\r\nEND:VEVENT\r\n";
+        let ev = parse_vevents(utc_ics).unwrap().remove(0);
+        let occ = expand_occurrences(&ev, utc(2026, 10, 26, 0, 0, 0), utc(2026, 11, 2, 0, 0, 0));
+        assert_eq!(occ[0].0, utc(2026, 10, 28, 14, 0, 0));
     }
 }

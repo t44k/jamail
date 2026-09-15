@@ -13,8 +13,8 @@
 //! `app.rs`: TUI rendering itself isn't unit-tested in this crate).
 
 use crate::calendar::{
-    EventEdits, EventStatus, EventTime, VEvent, describe_alarm, expand_occurrences,
-    format_alarm_short, parse_alarm_list, validate_rrule,
+    EventEdits, EventStatus, EventTime, VEvent, describe_alarm, expand_document_occurrences,
+    expand_occurrences, format_alarm_short, parse_alarm_list, validate_rrule,
 };
 use crate::config::{JacalCalendarPref, WeekStart};
 use crate::db::{CalendarEventRow, CalendarRow};
@@ -685,6 +685,23 @@ pub fn expand_recurring_events(
             }
             continue;
         }
+        // The stored document carries the series' RECURRENCE-ID overrides
+        // — a moved instance shows on its new day, a cancelled one not at
+        // all — so expand the document, not just the master's rule.
+        if let Some(raw) = &row.raw_ics {
+            for ev in expand_document_occurrences(raw, window_start, window_end) {
+                let mut occurrence = row.clone();
+                occurrence.dtstart_utc = ev.dtstart.utc.timestamp();
+                occurrence.dtend_utc = ev.dtend.utc.timestamp();
+                occurrence.all_day = ev.dtstart.all_day;
+                occurrence.summary = ev.summary;
+                occurrence.location = ev.location;
+                occurrence.description = ev.description;
+                occurrence.status = ev.status.as_ics().to_string();
+                out.push(occurrence);
+            }
+            continue;
+        }
         let Ok(vevent) = row.to_vevent() else {
             out.push(row);
             continue;
@@ -741,6 +758,8 @@ pub enum CalMode {
     Calendars,
     /// The participants modal — see [`AttendeeEditor`].
     Attendees,
+    /// The invitations panel (`i`): every invitation, unanswered first.
+    Invitations,
 }
 
 /// The event a [`CalMode::ConfirmDelete`] prompt is about, captured when
@@ -1294,6 +1313,13 @@ pub struct CalApp {
     pub show_declined: bool,
     /// The participants modal while `mode` is [`CalMode::Attendees`].
     pub attendee_editor: Option<AttendeeEditor>,
+    /// Every upcoming event we are invited to (one row per series),
+    /// unanswered ones first, then by start — see [`Self::set_invitations`].
+    pub invitations: Vec<CalendarEventRow>,
+    pub invitation_cursor: usize,
+    /// An event to put the cursor on once its day's events are loaded
+    /// (jumping to an invitation outside the displayed range).
+    pending_focus_id: Option<i64>,
     pub status: Option<String>,
     pub ipc_connected: bool,
 }
@@ -1323,6 +1349,9 @@ impl CalApp {
             participation: HashMap::new(),
             show_declined: true,
             attendee_editor: None,
+            invitations: Vec::new(),
+            invitation_cursor: 0,
+            pending_focus_id: None,
             status: None,
             ipc_connected: false,
         }
@@ -1933,7 +1962,109 @@ impl CalApp {
                 .unwrap_or(Participation::NotInvited);
             map.insert(row.id, p);
         }
+        // Keep what the invitations list already knows about rows that
+        // are not in the displayed window.
+        for row in &self.invitations {
+            if let Some(p) = self.participation.get(&row.id) {
+                map.entry(row.id).or_insert(*p);
+            }
+        }
         self.participation = map;
+    }
+
+    // -- Invitations ---------------------------------------------------
+
+    /// Install the upcoming events (`rows`, one per series) and keep the
+    /// ones we are invited to — unanswered first, then by start. Their
+    /// participation is cached alongside the displayed events'.
+    pub fn set_invitations(&mut self, rows: Vec<CalendarEventRow>) {
+        let mut kept: Vec<(Participation, CalendarEventRow)> = Vec::new();
+        for row in rows {
+            let p = row
+                .to_vevent()
+                .map(|e| participation_of(&e, &self.identities))
+                .unwrap_or(Participation::NotInvited);
+            self.participation.insert(row.id, p);
+            if matches!(
+                p,
+                Participation::NotAnswered
+                    | Participation::Going
+                    | Participation::Maybe
+                    | Participation::Declined
+            ) {
+                kept.push((p, row));
+            }
+        }
+        kept.sort_by_key(|(p, row)| (*p != Participation::NotAnswered, row.dtstart_utc));
+        self.invitations = kept.into_iter().map(|(_, row)| row).collect();
+        if self.invitation_cursor >= self.invitations.len() {
+            self.invitation_cursor = self.invitations.len().saturating_sub(1);
+        }
+    }
+
+    /// How many invitations still wait for an answer.
+    pub fn unanswered_invitations(&self) -> usize {
+        self.invitations
+            .iter()
+            .filter(|row| self.participation(row) == Participation::NotAnswered)
+            .count()
+    }
+
+    pub fn begin_invitations(&mut self) {
+        self.invitation_cursor = self
+            .invitation_cursor
+            .min(self.invitations.len().saturating_sub(1));
+        self.mode = CalMode::Invitations;
+    }
+
+    pub fn close_invitations(&mut self) {
+        self.mode = CalMode::Browse;
+    }
+
+    pub fn invitations_move(&mut self, delta: i32) {
+        if self.invitations.is_empty() {
+            return;
+        }
+        let n = self.invitations.len() as i32;
+        self.invitation_cursor = (self.invitation_cursor as i32 + delta).rem_euclid(n) as usize;
+    }
+
+    pub fn selected_invitation(&self) -> Option<&CalendarEventRow> {
+        self.invitations.get(self.invitation_cursor)
+    }
+
+    /// The RSVP target for the invitation under the panel cursor.
+    pub fn invitation_rsvp_target(&self) -> Result<PendingRsvp, String> {
+        let row = self
+            .selected_invitation()
+            .ok_or_else(|| "no invitation selected".to_string())?;
+        let attendee = self
+            .own_attendee(row)
+            .ok_or_else(|| "none of your addresses is an attendee of this event".to_string())?;
+        Ok(PendingRsvp {
+            id: row.id,
+            summary: row.summary.clone(),
+            attendee: attendee.email,
+            current: attendee.partstat,
+        })
+    }
+
+    /// Leave the panel for the invitation under the cursor: focus its
+    /// day, open the Event view and put the cursor on it once the day's
+    /// events are (re)loaded.
+    pub fn jump_to_selected_invitation(&mut self) -> bool {
+        let Some(row) = self.selected_invitation().cloned() else {
+            return false;
+        };
+        self.push_history();
+        self.mode = CalMode::Browse;
+        self.pending_focus_id = Some(row.id);
+        self.focused_date = local_date_of(row.dtstart_utc);
+        self.view = CalView::Event;
+        self.anchor = self.focused_date;
+        self.event_cursor = 0;
+        self.refilter();
+        true
     }
 
     /// Toggle a calendar's visibility and immediately re-filter the
@@ -1996,6 +2127,13 @@ impl CalApp {
             .collect();
         events.sort_by_key(|e| e.dtstart_utc);
         self.events = events;
+        if let Some(id) = self.pending_focus_id {
+            let indices = self.event_indices_for(self.focused_date);
+            if let Some(pos) = indices.iter().position(|&i| self.events[i].id == id) {
+                self.event_cursor = pos;
+                self.pending_focus_id = None;
+            }
+        }
         let count = self.event_indices_for(self.focused_date).len();
         if count == 0 {
             self.event_cursor = 0;
@@ -2230,8 +2368,108 @@ impl CalApp {
             CalMode::Rsvp => self.render_rsvp_prompt(frame, area),
             CalMode::Calendars => self.render_calendar_panel(frame, area),
             CalMode::Attendees => self.render_attendee_editor(frame, area),
+            CalMode::Invitations => self.render_invitations_panel(frame, area),
             CalMode::Browse => {}
         }
+    }
+
+    /// The invitations panel: unanswered invitations first (marked NEW),
+    /// then the ones already answered, each with when, what and who asks;
+    /// answer the highlighted one with `a`/`t`/`d`, open it with Enter.
+    fn render_invitations_panel(&self, frame: &mut Frame, area: Rect) {
+        let rows = self.invitations.len().max(1) as u16;
+        let popup = centered_rect(
+            90.min(area.width.saturating_sub(2)),
+            (rows + 4).min(area.height.saturating_sub(2)),
+            area,
+        );
+        frame.render_widget(Clear, popup);
+        let unanswered = self.unanswered_invitations();
+        let block = Block::default()
+            .title(format!(
+                " Invitations — {} new, {} total ",
+                unanswered,
+                self.invitations.len()
+            ))
+            .borders(Borders::ALL)
+            .style(Style::default().bg(theme::HELP_BG).fg(theme::HELP_BORDER));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.invitations.len() + 2);
+        if self.invitations.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No invitations in the coming year.",
+                Style::default().fg(theme::FG_DIM),
+            )));
+        }
+        let organizer_width = 26usize;
+        let when_width = 17usize;
+        let summary_width = (inner.width as usize)
+            .saturating_sub(8 + when_width + organizer_width + 4)
+            .max(10);
+        for (i, row) in self.invitations.iter().enumerate() {
+            let bg = if i == self.invitation_cursor {
+                theme::BG_SELECTED
+            } else {
+                theme::HELP_BG
+            };
+            let mine = self.participation(row);
+            let (badge, badge_color) = match mine {
+                Participation::NotAnswered => ("NEW", theme::STATUS_ERROR),
+                Participation::Going => ("going", theme::STATUS_SUCCESS),
+                Participation::Maybe => ("maybe", theme::STATUS_PENDING),
+                Participation::Declined => ("no", theme::FG_DIM),
+                Participation::Organizer | Participation::NotInvited => ("", theme::FG_DIM),
+            };
+            let when = if row.all_day {
+                format!(
+                    "{} all day",
+                    local_date_of(row.dtstart_utc).format("%a %-d %b")
+                )
+            } else {
+                local_time_of(row.dtstart_utc)
+                    .format("%a %-d %b %H:%M")
+                    .to_string()
+            };
+            let repeats = if row.rrule.is_some() { " ↻" } else { "" };
+            let organizer = crate::calendar::cal_address_email(&row.organizer);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {:<6} ", badge),
+                    Style::default()
+                        .fg(badge_color)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:<w$} ", truncate_str(&when, when_width), w = when_width),
+                    Style::default().fg(theme::FG_TEXT).bg(bg),
+                ),
+                Span::styled(
+                    format!(
+                        "{:<w$} ",
+                        truncate_str(&format!("{}{}", row.summary, repeats), summary_width),
+                        w = summary_width
+                    ),
+                    Style::default()
+                        .fg(if i == self.invitation_cursor {
+                            SELECTED_FG
+                        } else {
+                            theme::SUBJECT_COLOR
+                        })
+                        .bg(bg),
+                ),
+                Span::styled(
+                    truncate_str(&organizer, organizer_width),
+                    Style::default().fg(theme::FG_DIM).bg(bg),
+                ),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            "a accept   t tentative   d decline   Enter open   j/k move   Esc close",
+            Style::default().fg(theme::FG_DIM),
+        )));
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     /// The participants modal: the guest list with each answer, a cursor,
@@ -2432,26 +2670,90 @@ impl CalApp {
                 self.calendars.len()
             )
         };
-        let lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    format!(" {} ", self.view.label()),
+        // The selected event, in full, so a title cropped inside a narrow
+        // column can still be read up here.
+        let mut first_line = vec![
+            Span::styled(
+                format!(" {} ", self.view.label()),
+                Style::default()
+                    .fg(theme::MODE_INDICATOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(range_label.clone(), Style::default().fg(theme::FG_TEXT)),
+            Span::raw("   "),
+            Span::styled(
+                format!("focused: {}", self.focused_date.format("%a %b %-d")),
+                Style::default().fg(theme::FG_DIM),
+            ),
+        ];
+        if let Some(ev) = self.selected_event() {
+            let used: usize = first_line
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+                + 4;
+            let room = (area.width as usize).saturating_sub(used);
+            if room > 8 {
+                let when = if ev.all_day {
+                    format!(
+                        "All day {}",
+                        local_date_of(ev.dtstart_utc).format("%a %-d %b")
+                    )
+                } else {
+                    let start = local_time_of(ev.dtstart_utc);
+                    let end = local_time_of(ev.dtend_utc);
+                    if start.date_naive() == end.date_naive() {
+                        format!(
+                            "{} {}–{}",
+                            start.format("%a %-d %b"),
+                            start.format("%H:%M"),
+                            end.format("%H:%M")
+                        )
+                    } else {
+                        format!(
+                            "{} – {}",
+                            start.format("%a %-d %b %H:%M"),
+                            end.format("%a %-d %b %H:%M")
+                        )
+                    }
+                };
+                let text = truncate_str(&format!("{}  {}", when, ev.summary), room);
+                first_line.push(Span::styled("  │ ", Style::default().fg(theme::FG_DIM)));
+                first_line.push(Span::styled(
+                    format!("{} ", self.event_glyph(ev)),
+                    Style::default().fg(self.event_dot_color(ev)),
+                ));
+                first_line.push(Span::styled(
+                    text,
                     Style::default()
-                        .fg(theme::MODE_INDICATOR)
+                        .fg(SELECTED_FG)
                         .add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+        let unanswered = self.unanswered_invitations();
+        let invitations_span = if unanswered > 0 {
+            Span::styled(
+                format!(
+                    "{} unanswered invitation{} (i)  ",
+                    unanswered,
+                    if unanswered == 1 { "" } else { "s" }
                 ),
-                Span::styled(range_label, Style::default().fg(theme::FG_TEXT)),
-                Span::raw("   "),
-                Span::styled(
-                    format!("focused: {}", self.focused_date.format("%a %b %-d")),
-                    Style::default().fg(theme::FG_DIM),
-                ),
-            ]),
+                Style::default()
+                    .fg(theme::STATUS_ERROR)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled("no new invitations  ", Style::default().fg(theme::FG_DIM))
+        };
+        let lines = vec![
+            Line::from(first_line),
             Line::from(vec![
                 Span::styled(
                     format!(" {} ", self.current_account),
                     Style::default().fg(theme::SENDER_COLOR),
                 ),
+                invitations_span,
                 Span::styled(cal_summary, Style::default().fg(theme::FG_DIM)),
                 Span::raw("  "),
                 Span::styled(
@@ -3641,7 +3943,7 @@ impl CalApp {
         let text = if let Some(status) = &self.status {
             status.clone()
         } else {
-            "hjkl move  [/] jump period  Tab/S-Tab narrow/widen  Enter zoom  Esc back  t today  n new  e edit  d del  a guests  r rsvp  v/C cals  1-9 cal  s sync  q quit"
+            "hjkl move  [/] jump period  Tab/S-Tab narrow/widen  Enter zoom  Esc back  t today  n new  e edit  d del  a guests  r rsvp  i invites  v/C cals  1-9 cal  s sync  q quit"
                 .to_string()
         };
         frame.render_widget(
@@ -5509,5 +5811,80 @@ mod tests {
         assert_eq!(week_columns(&week, false), (week.clone(), Vec::new()));
         let three: Vec<NaiveDate> = week[4..7].to_vec();
         assert_eq!(week_columns(&three, true), (three.clone(), Vec::new()));
+    }
+
+    #[test]
+    fn expansion_shows_a_moved_instance_on_its_new_day_only() {
+        let doc = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:cs\r\nDTSTART:20260916T140000Z\r\nDTEND:20260916T153000Z\r\nRRULE:FREQ=MONTHLY;BYDAY=3WE\r\nSUMMARY:CS Retro\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:cs\r\nRECURRENCE-ID:20260916T140000Z\r\nDTSTART:20260923T140000Z\r\nDTEND:20260923T153000Z\r\nSUMMARY:CS Retro (moved)\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let start = Utc
+            .with_ymd_and_hms(2026, 9, 16, 14, 0, 0)
+            .unwrap()
+            .timestamp();
+        let mut row = make_row(
+            "cs",
+            start,
+            start + 5400,
+            Some("FREQ=MONTHLY;BYDAY=3WE"),
+            false,
+        );
+        row.raw_ics = Some(doc.to_string());
+        let week_start = Utc
+            .with_ymd_and_hms(2026, 9, 14, 0, 0, 0)
+            .unwrap()
+            .timestamp();
+        let this_week =
+            expand_recurring_events(vec![row.clone()], week_start, week_start + 7 * 86400);
+        assert_eq!(this_week.len(), 0, "the moved 16 Sep slot must not show");
+        let next_week =
+            expand_recurring_events(vec![row], week_start + 7 * 86400, week_start + 14 * 86400);
+        assert_eq!(next_week.len(), 1);
+        assert_eq!(next_week[0].summary, "CS Retro (moved)");
+        assert_eq!(
+            next_week[0].dtstart_utc,
+            Utc.with_ymd_and_hms(2026, 9, 23, 14, 0, 0)
+                .unwrap()
+                .timestamp()
+        );
+    }
+
+    #[test]
+    fn invitations_list_unanswered_first_and_counts_them() {
+        let mut app = test_app();
+        app.identities = vec!["me@example.com".to_string()];
+        let mut going = invited_row("boss@example.com", "ACCEPTED");
+        going.id = 1;
+        going.dtstart_utc -= 86400;
+        let mut new_later = invited_row("boss@example.com", "NEEDS-ACTION");
+        new_later.id = 2;
+        new_later.dtstart_utc += 86400;
+        let mut new_soon = invited_row("boss@example.com", "NEEDS-ACTION");
+        new_soon.id = 3;
+        let mut mine = invited_row("me@example.com", "ACCEPTED");
+        mine.id = 4;
+        app.set_invitations(vec![going, new_later, new_soon, mine]);
+        let ids: Vec<i64> = app.invitations.iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            vec![3, 2, 1],
+            "NEW first by start, then answered; own events excluded"
+        );
+        assert_eq!(app.unanswered_invitations(), 2);
+        app.begin_invitations();
+        assert_eq!(app.mode, CalMode::Invitations);
+        let target = app.invitation_rsvp_target().unwrap();
+        assert_eq!(target.id, 3);
+        assert_eq!(target.attendee, "Me@Example.com");
+        app.invitations_move(-1);
+        assert_eq!(app.selected_invitation().unwrap().id, 1);
+        app.invitations_move(1);
+        // Jumping opens the event view on that day with the cursor on it.
+        let row = app.selected_invitation().cloned().unwrap();
+        app.set_events(vec![row.clone()]);
+        assert!(app.jump_to_selected_invitation());
+        assert_eq!(app.mode, CalMode::Browse);
+        assert_eq!(app.view, CalView::Event);
+        assert_eq!(app.focused_date, local_date_of(row.dtstart_utc));
+        assert_eq!(app.selected_event().unwrap().id, 3);
+        assert!(app.go_back());
     }
 }

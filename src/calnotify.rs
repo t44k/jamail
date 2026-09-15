@@ -44,7 +44,9 @@
 //! notification for a meeting that already started an hour ago on
 //! restart).
 
-use crate::calendar::{EventStatus, EventTime, VEvent, expand_occurrences};
+use crate::calendar::{
+    EventStatus, EventTime, VEvent, expand_document_occurrences, expand_occurrences,
+};
 use crate::db::MailDb;
 use chrono::{DateTime, Duration, Local, Utc};
 use std::collections::HashSet;
@@ -209,6 +211,12 @@ pub fn events_for_alarm_window(db: &MailDb, account: &str, now: DateTime<Utc>) -
         .unwrap_or_default();
     let mut out = Vec::new();
     for row in &rows {
+        // The stored document carries the series' overrides (moved or
+        // cancelled instances); a not-yet-uploaded local creation has none.
+        if let Some(raw) = &row.raw_ics {
+            out.extend(expand_document_occurrences(raw, window_start, window_end));
+            continue;
+        }
         let Ok(vevent) = row.to_vevent() else {
             continue;
         };

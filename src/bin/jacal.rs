@@ -82,6 +82,7 @@ fn main() -> Result<()> {
     app.set_calendar_prefs(jacal_prefs);
     reload_calendars(&mut app, &db);
     reload_events(&mut app, &db);
+    reload_invitations(&mut app, &db);
 
     let socket_path = ipc::resolve_socket_path(daemon_socket_override.as_deref());
     daemon::try_autostart(&socket_path);
@@ -127,6 +128,20 @@ fn reload_calendars(app: &mut CalApp, db: &MailDb) {
     if let Ok(calendars) = db.get_calendars(&app.current_account) {
         app.set_calendars(calendars);
     }
+}
+
+/// Load the coming year's events (one row per series) for the invitations
+/// list and the header's unanswered count — independent of the displayed
+/// range.
+fn reload_invitations(app: &mut CalApp, db: &MailDb) {
+    let now = Utc::now().timestamp();
+    let rows = db
+        .get_calendar_events_in_range(Some(&app.current_account), now - 3600, now + 365 * 86400)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.dtend_utc > now || r.rrule.is_some())
+        .collect();
+    app.set_invitations(rows);
 }
 
 fn reload_events(app: &mut CalApp, db: &MailDb) {
@@ -190,6 +205,7 @@ fn run_app(
         if last_calendar_reload.elapsed() >= CALENDAR_RELOAD_INTERVAL {
             reload_calendars(app, db);
             reload_events(app, db);
+            reload_invitations(app, db);
             last_calendar_reload = Instant::now();
         }
 
@@ -220,6 +236,7 @@ fn run_app(
                 CalMode::Attendees => {
                     handle_attendee_editor_key(app, db, ipc_client, key.code, key.modifiers);
                 }
+                CalMode::Invitations => handle_invitations_key(app, db, ipc_client, key.code),
             }
             persist_calendar_prefs(app);
         }
@@ -379,6 +396,7 @@ fn handle_browse_key(
                 app.set_status(e);
             }
         }
+        KeyCode::Char('i') => app.begin_invitations(),
         KeyCode::Char(digit @ '1'..='9') => {
             let idx = digit as usize - '1' as usize;
             if let Some(cal) = app.calendars.get(idx).cloned() {
@@ -686,6 +704,19 @@ fn handle_rsvp_key(app: &mut CalApp, db: &MailDb, ipc_client: &ipc::IpcClient, c
     let Some(target) = app.take_pending_rsvp() else {
         return;
     };
+    apply_rsvp(app, db, ipc_client, &target, partstat, verb);
+}
+
+/// Answer `target`'s invitation with `partstat`: rewrite our ATTENDEE line
+/// locally and queue the Update the server turns into the iTIP REPLY.
+fn apply_rsvp(
+    app: &mut CalApp,
+    db: &MailDb,
+    ipc_client: &ipc::IpcClient,
+    target: &jamail::calapp::PendingRsvp,
+    partstat: &str,
+    verb: &str,
+) {
     let account = app.current_account.clone();
     let edits = EventEdits {
         rsvp: Some(Rsvp {
@@ -704,9 +735,45 @@ fn handle_rsvp_key(app: &mut CalApp, db: &MailDb, ipc_client: &ipc::IpcClient, c
                 },
             });
             reload_events(app, db);
+            reload_invitations(app, db);
             app.set_status(format!("{} \"{}\", syncing…", verb, target.summary));
         }
         Err(e) => app.set_status(format!("Could not respond: {}", e)),
+    }
+}
+
+/// Keys in the invitations panel: `a`/`t`/`d` answer the highlighted
+/// invitation (the list re-sorts, so the cursor lands on the next new
+/// one), Enter opens it, j/k move, Esc closes.
+fn handle_invitations_key(
+    app: &mut CalApp,
+    db: &MailDb,
+    ipc_client: &ipc::IpcClient,
+    code: KeyCode,
+) {
+    let answer = match code {
+        KeyCode::Char('a') => Some(("ACCEPTED", "Accepted")),
+        KeyCode::Char('t') => Some(("TENTATIVE", "Tentatively accepted")),
+        KeyCode::Char('d') => Some(("DECLINED", "Declined")),
+        _ => None,
+    };
+    if let Some((partstat, verb)) = answer {
+        match app.invitation_rsvp_target() {
+            Ok(target) => apply_rsvp(app, db, ipc_client, &target, partstat, verb),
+            Err(e) => app.set_status(e),
+        }
+        return;
+    }
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => app.invitations_move(1),
+        KeyCode::Char('k') | KeyCode::Up => app.invitations_move(-1),
+        KeyCode::Enter => {
+            if app.jump_to_selected_invitation() {
+                reload_events(app, db);
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => app.close_invitations(),
+        _ => {}
     }
 }
 
