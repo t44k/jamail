@@ -554,14 +554,17 @@ pub fn plan_time_axis(rows_available: usize, spans: &[(i64, i64)]) -> Option<Tim
         if need_rows > rows {
             continue; // too fine a slot to fit what must be shown
         }
-        // Show exactly what must be shown — the working day, stretched
-        // only as far as the events on the displayed days require — and
-        // spend any leftover rows on a finer slot, never on extra hours.
-        let _ = rows;
+        // The slot is the finest one that fits what must be shown (the
+        // working day, stretched as far as the displayed days' events
+        // require); the rows left over at that slot widen the window around
+        // it, evenly at both ends and slid back inside the day, so the grid
+        // fills its column instead of leaving it blank below 21:00.
+        let first_row =
+            (need_first - ((rows - need_rows) / 2) as i64).clamp(0, (day_rows - rows) as i64);
         return Some(TimeAxis {
-            start_minutes: (need_first * slot_min) as u32,
+            start_minutes: (first_row * slot_min) as u32,
             slot_minutes: slot,
-            rows: need_rows,
+            rows,
         });
     }
     None
@@ -5077,21 +5080,31 @@ mod tests {
     }
 
     #[test]
-    fn the_axis_is_exactly_the_working_day_unless_an_event_needs_more() {
-        // Plenty of rows: they buy a finer slot, never extra hours.
+    fn the_working_day_picks_the_slot_and_leftover_rows_widen_around_it() {
+        // 60 rows: 15-minute slots fit the 14-hour working day (56 rows) and
+        // the 4 rows left over widen it by half an hour at each end.
         let axis = plan_time_axis(60, &[(9 * 60, 10 * 60)]).unwrap();
-        assert_eq!(axis.start_minutes as i64, DAY_CORE.0);
-        assert_eq!(axis.end_minutes() as i64, DAY_CORE.1);
         assert_eq!(axis.slot_minutes, 15);
-        assert_eq!(axis.rows, 14 * 4);
-        // An event at 22:30 on some displayed day pulls the end out to the
-        // next whole hour; the start stays at 07:00.
+        assert_eq!(axis.rows, 60, "the grid fills its column");
+        assert_eq!(axis.start_minutes as i64, DAY_CORE.0 - 30);
+        assert_eq!(axis.end_minutes() as i64, DAY_CORE.1 + 30);
+        // An event at 22:30 on some displayed day pulls the window out to
+        // cover it; the day's end clamps the widening so it stays before
+        // midnight and the spare rows go to the morning instead.
         let late = plan_time_axis(60, &[(22 * 60 + 30, 23 * 60 + 15)]).unwrap();
-        assert_eq!(late.start_minutes as i64, DAY_CORE.0);
+        // 07–24 is 68 quarter-hours, too many for 60 rows, so the slot is
+        // 30 minutes; the whole day is then 48 rows, and that is the grid.
+        assert_eq!(late.slot_minutes, 30);
+        assert_eq!(late.rows, 48);
+        assert_eq!(late.start_minutes, 0);
         assert_eq!(late.end_minutes(), MINUTES_PER_DAY as u32);
         let early = plan_time_axis(60, &[(5 * 60 + 40, 6 * 60)]).unwrap();
-        assert_eq!(early.start_minutes, 5 * 60);
-        assert_eq!(early.end_minutes() as i64, DAY_CORE.1);
+        assert!(early.start_minutes <= 5 * 60);
+        assert!(early.end_minutes() as i64 >= DAY_CORE.1);
+        // Exactly enough rows for the working day: no widening at all.
+        let exact = plan_time_axis(14 * 4, &[]).unwrap();
+        assert_eq!(exact.start_minutes as i64, DAY_CORE.0);
+        assert_eq!(exact.end_minutes() as i64, DAY_CORE.1);
     }
 
     #[test]
