@@ -468,7 +468,7 @@ const MINUTES_PER_DAY: i64 = 24 * 60;
 /// meeting would be drawn as a two-hour close-up around it — technically
 /// "the events in their relative positions", but no longer recognisable as
 /// a day, and useless for comparing against a neighbouring column.
-const DAY_CORE: (i64, i64) = (8 * 60, 20 * 60);
+const DAY_CORE: (i64, i64) = (7 * 60, 21 * 60);
 
 /// The vertical time ruler shared by every column of a Day/3-Day/Week
 /// grid: `rows` consecutive slots of `slot_minutes`, the first starting
@@ -554,15 +554,14 @@ pub fn plan_time_axis(rows_available: usize, spans: &[(i64, i64)]) -> Option<Tim
         if need_rows > rows {
             continue; // too fine a slot to fit what must be shown
         }
-        // Spend the leftover rows widening the window around what must be
-        // shown, so the grid fills its column instead of floating in it,
-        // then slide the whole thing back inside the day at either end.
-        let first_row =
-            (need_first - ((rows - need_rows) / 2) as i64).clamp(0, (day_rows - rows) as i64);
+        // Show exactly what must be shown — the working day, stretched
+        // only as far as the events on the displayed days require — and
+        // spend any leftover rows on a finer slot, never on extra hours.
+        let _ = rows;
         return Some(TimeAxis {
-            start_minutes: (first_row * slot_min) as u32,
+            start_minutes: (need_first * slot_min) as u32,
             slot_minutes: slot,
-            rows,
+            rows: need_rows,
         });
     }
     None
@@ -584,25 +583,46 @@ pub struct Placement {
 }
 
 /// Where the `NOW hh:mm` label goes when the current time falls in `now_row`
-/// of a grid with `rows` rows and these `placements`: on the row itself when
-/// its first `label_len` columns are free of event lines and bars, else on
-/// the row above (or below, at the top) if that one is free there, else
-/// nowhere. The red band itself is drawn on `now_row` whenever no event
-/// *starts* there; when one does, the event stays legible and only the
-/// label carries the red, on the neighbouring row.
-pub fn now_label_row(
+/// of a `width`-column grid with `rows` rows and these `placements`, as
+/// `(row, column)`: on the row itself when it has room — at the left edge
+/// when that is free, otherwise inside the line of the event running
+/// through it (right after its bar), which is how a long event's empty
+/// rows carry the clock; when a title starts on the slot and leaves no
+/// room, on the row above (or below, at the top); else nowhere. The full
+/// red band is drawn on `now_row` only when no event touches it at all;
+/// everywhere else red sits under the label's characters alone.
+pub fn now_label_position(
     now_row: usize,
     rows: usize,
     placements: &[Placement],
     label_len: usize,
-) -> Option<usize> {
-    let fits = |row: usize| {
-        !placements
+    width: usize,
+) -> Option<(usize, usize)> {
+    let place = |row: usize| -> Option<usize> {
+        // An event whose title starts on this row owns it from its indent
+        // on; the label may only sit to the left of that.
+        let limit = placements
             .iter()
-            .any(|p| p.indent < label_len && p.start_row <= row && row <= p.end_row)
+            .filter(|p| p.start_row == row)
+            .map(|p| p.indent)
+            .min()
+            .unwrap_or(width);
+        // Bars of the events running through this row (an event's "empty"
+        // lines). Room at the left edge wins; otherwise the label goes
+        // right after the rightmost bar, inside that event's line.
+        let bars: Vec<usize> = placements
+            .iter()
+            .filter(|p| p.start_row < row && row <= p.end_row && p.indent < limit)
+            .map(|p| p.indent)
+            .collect();
+        let col = match (bars.iter().min(), bars.iter().max()) {
+            (Some(&first), Some(&last)) if first < label_len => last + 1,
+            _ => 0,
+        };
+        (col + label_len <= limit).then_some(col)
     };
-    if fits(now_row) {
-        return Some(now_row);
+    if let Some(col) = place(now_row) {
+        return Some((now_row, col));
     }
     let mut candidates = Vec::new();
     if now_row > 0 {
@@ -611,7 +631,9 @@ pub fn now_label_row(
     if now_row + 1 < rows {
         candidates.push(now_row + 1);
     }
-    candidates.into_iter().find(|&c| fits(c))
+    candidates
+        .into_iter()
+        .find_map(|r| place(r).map(|c| (r, c)))
 }
 
 /// Lay a day's overlapping events out as a staircase.
@@ -3218,9 +3240,16 @@ impl CalApp {
         // otherwise on the neighbouring row with red only under the text.
         let now_label = now_row.map(|_| self.slot_label(axis, 0, true).0);
         let now_label_len = now_label.as_ref().map_or(0, |l| l.chars().count());
-        let now_covered = now_row.is_some_and(|r| placements.iter().any(|p| p.start_row == r));
-        let now_label_at =
-            now_row.and_then(|r| now_label_row(r, axis.rows, &placements, now_label_len));
+        // The band needs a row no event touches; an event's own rows keep
+        // their tint and show the clock as red characters only.
+        let now_free = now_row.is_some_and(|r| {
+            !placements
+                .iter()
+                .any(|p| p.start_row <= r && r <= p.end_row)
+        });
+        let now_label_at = now_row.and_then(|r| {
+            now_label_position(r, axis.rows, &placements, now_label_len, width as usize)
+        });
 
         for row in 0..axis.rows {
             let owner = placements.iter().find(|p| p.start_row == row);
@@ -3241,16 +3270,20 @@ impl CalApp {
             let mut line: Vec<Span<'static>> = Vec::new();
             let mut col = 0usize;
             let is_now_row = now_row == Some(row);
-            let paint_now_band = is_now_row && !now_covered;
-            let show_now_label = now_label_at == Some(row);
+            let paint_now_band = is_now_row && now_free;
+            let now_label_col = now_label_at.filter(|&(r, _)| r == row).map(|(_, c)| c);
             let row_bg = if paint_now_band { NOW_BG } else { cell_bg };
+            let now_style = Style::default()
+                .fg(NOW_FG)
+                .bg(NOW_BG)
+                .add_modifier(Modifier::BOLD);
 
             // The ruler only gets a say where nothing has claimed the left
             // edge — otherwise the hour would collide with a bar or a title.
-            let label: (String, Color) = if show_now_label {
+            let label: (String, Color) = if now_label_col == Some(0) {
                 (now_label.clone().unwrap_or_default(), NOW_FG)
-            } else if is_now_row {
-                (String::new(), NOW_FG) // the band alone; the label sits next door
+            } else if is_now_row || now_label_col.is_some() {
+                (String::new(), NOW_FG) // the clock sits further right, or next door
             } else {
                 self.slot_label(axis, row, false)
             };
@@ -3259,14 +3292,26 @@ impl CalApp {
                 && first_busy >= label_len
                 && owner.is_none_or(|o| o.indent >= label_len)
             {
-                let mut style = Style::default().fg(label.1).bg(row_bg);
-                if show_now_label {
-                    style = style.bg(NOW_BG).add_modifier(Modifier::BOLD);
-                }
+                let style = if now_label_col == Some(0) {
+                    now_style
+                } else {
+                    Style::default().fg(label.1).bg(row_bg)
+                };
                 line.push(Span::styled(label.0.clone(), style));
                 col = label_len;
             }
             while col < width as usize {
+                // The clock inside an event's empty line: red only under
+                // its own characters, the event's tint on either side.
+                if let Some(lc) = now_label_col
+                    && lc > 0
+                    && lc == col
+                    && let Some(text) = &now_label
+                {
+                    line.push(Span::styled(text.clone(), now_style));
+                    col += now_label_len;
+                    continue;
+                }
                 if let Some(o) = owner.filter(|o| o.indent == col) {
                     if let Some(&(_, idx, first_row, _)) = of_pos(o.pos) {
                         let is_selected = selected == Some(o.pos);
@@ -3311,12 +3356,17 @@ impl CalApp {
                 // It belongs to the event whose bar is nearest on the left,
                 // so a running event fills its column in its own tint, not
                 // just its one-character bar.
-                let next = (col + 1..width as usize)
+                let mut next = (col + 1..width as usize)
                     .find(|&c| {
                         owner.is_some_and(|o| o.indent == c)
                             || (c < bar_limit && bar_at(c).is_some())
                     })
                     .unwrap_or(width as usize);
+                if let Some(lc) = now_label_col
+                    && lc > col
+                {
+                    next = next.min(lc);
+                }
                 let fill_bg = if paint_now_band {
                     NOW_BG
                 } else {
@@ -3374,12 +3424,15 @@ impl CalApp {
         let columns = Layout::horizontal(constraints).split(area);
         let today = Local::now().date_naive();
 
+        // One time range for every visible day: an early or late event on
+        // any of them stretches all the columns, so they keep lining up.
+        let all_spans = self.timed_spans_for(days);
         let placed: Vec<(Rect, NaiveDate)> = single
             .iter()
             .zip(columns.iter())
             .map(|(d, r)| (*r, *d))
             .collect();
-        let (axis, all_day_rows) = self.plan_group_axis(&placed);
+        let (axis, all_day_rows) = self.plan_group_axis(&placed, &all_spans);
         for (rect, day) in &placed {
             self.render_day_column(frame, *rect, *day, axis.as_ref(), all_day_rows, today);
         }
@@ -3396,7 +3449,7 @@ impl CalApp {
                 .zip(parts.iter())
                 .map(|(d, r)| (*r, *d))
                 .collect();
-            let (axis, all_day_rows) = self.plan_group_axis(&placed);
+            let (axis, all_day_rows) = self.plan_group_axis(&placed, &all_spans);
             for (rect, day) in &placed {
                 self.render_day_column(frame, *rect, *day, axis.as_ref(), all_day_rows, today);
             }
@@ -3406,7 +3459,11 @@ impl CalApp {
     /// One time axis for a group of columns, decided from the
     /// narrowest/shortest inner rect so no column has to render something
     /// that doesn't fit, plus the all-day banner rows the group reserves.
-    fn plan_group_axis(&self, placed: &[(Rect, NaiveDate)]) -> (Option<TimeAxis>, usize) {
+    fn plan_group_axis(
+        &self,
+        placed: &[(Rect, NaiveDate)],
+        spans: &[(i64, i64)],
+    ) -> (Option<TimeAxis>, usize) {
         let days: Vec<NaiveDate> = placed.iter().map(|(_, d)| *d).collect();
         let inner_height = placed
             .iter()
@@ -3420,10 +3477,7 @@ impl CalApp {
             .unwrap_or(0);
         let all_day_rows = self.all_day_rows_for(&days);
         let axis = if inner_width >= MIN_GRID_COL_WIDTH {
-            plan_time_axis(
-                inner_height.saturating_sub(all_day_rows),
-                &self.timed_spans_for(&days),
-            )
+            plan_time_axis(inner_height.saturating_sub(all_day_rows), spans)
         } else {
             None
         };
@@ -5023,6 +5077,24 @@ mod tests {
     }
 
     #[test]
+    fn the_axis_is_exactly_the_working_day_unless_an_event_needs_more() {
+        // Plenty of rows: they buy a finer slot, never extra hours.
+        let axis = plan_time_axis(60, &[(9 * 60, 10 * 60)]).unwrap();
+        assert_eq!(axis.start_minutes as i64, DAY_CORE.0);
+        assert_eq!(axis.end_minutes() as i64, DAY_CORE.1);
+        assert_eq!(axis.slot_minutes, 15);
+        assert_eq!(axis.rows, 14 * 4);
+        // An event at 22:30 on some displayed day pulls the end out to the
+        // next whole hour; the start stays at 07:00.
+        let late = plan_time_axis(60, &[(22 * 60 + 30, 23 * 60 + 15)]).unwrap();
+        assert_eq!(late.start_minutes as i64, DAY_CORE.0);
+        assert_eq!(late.end_minutes(), MINUTES_PER_DAY as u32);
+        let early = plan_time_axis(60, &[(5 * 60 + 40, 6 * 60)]).unwrap();
+        assert_eq!(early.start_minutes, 5 * 60);
+        assert_eq!(early.end_minutes() as i64, DAY_CORE.1);
+    }
+
+    #[test]
     fn row_span_is_inclusive_and_treats_the_end_as_exclusive() {
         let axis = TimeAxis {
             start_minutes: 8 * 60,
@@ -5934,32 +6006,34 @@ mod tests {
     }
 
     #[test]
-    fn now_label_moves_next_door_when_an_event_covers_the_slot() {
+    fn now_label_sits_on_free_rows_inside_event_bodies_or_next_door() {
         let free: Vec<Placement> = Vec::new();
-        assert_eq!(now_label_row(5, 10, &free, 9), Some(5));
-        // An event starting on the slot at indent 0 pushes the label up.
+        assert_eq!(now_label_position(5, 10, &free, 9, 40), Some((5, 0)));
+        // A title starting on the slot at indent 0 pushes the label up.
         let covering = pack_cascade(&[(0, 5, 7)], 10, 4);
-        assert_eq!(now_label_row(5, 10, &covering, 9), Some(4));
-        // Rows 4..=7 all busy at the left edge: below is taken too, so the
-        // label goes above the block; at the very top it goes below.
-        let block = pack_cascade(&[(0, 4, 7)], 10, 4);
-        assert_eq!(
-            now_label_row(5, 10, &block, 9),
-            None,
-            "both neighbours covered"
-        );
+        assert_eq!(now_label_position(5, 10, &covering, 9, 40), Some((4, 0)));
+        // An event's empty row: the clock goes inside it, after its bar.
+        let body = pack_cascade(&[(0, 3, 7)], 10, 4);
+        assert_eq!(now_label_position(5, 10, &body, 9, 40), Some((5, 1)));
+        // Two nested events: after the rightmost bar.
+        let nested = pack_cascade(&[(0, 3, 7), (1, 3, 7)], 10, 4);
+        assert_eq!(now_label_position(5, 10, &nested, 9, 40), Some((5, 2)));
+        // Too narrow for the label inside the event, and the neighbouring
+        // rows are the same event's body: no clock rather than a clipped one.
+        assert_eq!(now_label_position(5, 10, &body, 9, 9), None);
+        // At the very top, a covered slot sends the label below.
         let top = pack_cascade(&[(0, 0, 0)], 10, 4);
-        assert_eq!(now_label_row(0, 10, &top, 9), Some(1));
-        // A bar far enough to the right leaves room for the label.
+        assert_eq!(now_label_position(0, 10, &top, 9, 40), Some((1, 0)));
+        // A bar far enough right leaves the left edge for the label.
         let indented = vec![Placement {
             pos: 0,
             start_row: 2,
             end_row: 8,
             indent: 12,
         }];
-        assert_eq!(now_label_row(5, 10, &indented, 9), Some(5));
-        // Bottom row with the slot covered: only "above" exists.
+        assert_eq!(now_label_position(5, 10, &indented, 9, 40), Some((5, 0)));
+        // Bottom row with a title on the slot: only "above" exists.
         let last = pack_cascade(&[(0, 9, 9)], 10, 4);
-        assert_eq!(now_label_row(9, 10, &last, 9), Some(8));
+        assert_eq!(now_label_position(9, 10, &last, 9, 40), Some((8, 0)));
     }
 }
