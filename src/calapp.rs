@@ -583,6 +583,37 @@ pub struct Placement {
     pub indent: usize,
 }
 
+/// Where the `NOW hh:mm` label goes when the current time falls in `now_row`
+/// of a grid with `rows` rows and these `placements`: on the row itself when
+/// its first `label_len` columns are free of event lines and bars, else on
+/// the row above (or below, at the top) if that one is free there, else
+/// nowhere. The red band itself is drawn on `now_row` whenever no event
+/// *starts* there; when one does, the event stays legible and only the
+/// label carries the red, on the neighbouring row.
+pub fn now_label_row(
+    now_row: usize,
+    rows: usize,
+    placements: &[Placement],
+    label_len: usize,
+) -> Option<usize> {
+    let fits = |row: usize| {
+        !placements
+            .iter()
+            .any(|p| p.indent < label_len && p.start_row <= row && row <= p.end_row)
+    };
+    if fits(now_row) {
+        return Some(now_row);
+    }
+    let mut candidates = Vec::new();
+    if now_row > 0 {
+        candidates.push(now_row - 1);
+    }
+    if now_row + 1 < rows {
+        candidates.push(now_row + 1);
+    }
+    candidates.into_iter().find(|&c| fits(c))
+}
+
 /// Lay a day's overlapping events out as a staircase.
 ///
 /// `events` is `(pos, first_row, last_row)` per timed event. Every event
@@ -3181,6 +3212,15 @@ impl CalApp {
             .collect();
         let placements = pack_cascade(&spans, axis.rows, (width / CASCADE_INDENT_SHARE) as usize);
         let of_pos = |pos: usize| timed.iter().find(|&&(p, ..)| p == pos);
+        // Today's current slot: a red band across the whole column unless an
+        // event's title line starts there (then the event keeps its row);
+        // the `NOW hh:mm` label sits on the band when its left end is free,
+        // otherwise on the neighbouring row with red only under the text.
+        let now_label = now_row.map(|_| self.slot_label(axis, 0, true).0);
+        let now_label_len = now_label.as_ref().map_or(0, |l| l.chars().count());
+        let now_covered = now_row.is_some_and(|r| placements.iter().any(|p| p.start_row == r));
+        let now_label_at =
+            now_row.and_then(|r| now_label_row(r, axis.rows, &placements, now_label_len));
 
         for row in 0..axis.rows {
             let owner = placements.iter().find(|p| p.start_row == row);
@@ -3200,23 +3240,28 @@ impl CalApp {
                 .unwrap_or(bar_limit);
             let mut line: Vec<Span<'static>> = Vec::new();
             let mut col = 0usize;
-            // Today's current slot is a red band carrying the clock; its
-            // empty stretches and bars take that colour, event titles keep
-            // their own tint so they stay legible.
             let is_now_row = now_row == Some(row);
-            let row_bg = if is_now_row { NOW_BG } else { cell_bg };
+            let paint_now_band = is_now_row && !now_covered;
+            let show_now_label = now_label_at == Some(row);
+            let row_bg = if paint_now_band { NOW_BG } else { cell_bg };
 
             // The ruler only gets a say where nothing has claimed the left
             // edge — otherwise the hour would collide with a bar or a title.
-            let label = self.slot_label(axis, row, is_now_row);
+            let label: (String, Color) = if show_now_label {
+                (now_label.clone().unwrap_or_default(), NOW_FG)
+            } else if is_now_row {
+                (String::new(), NOW_FG) // the band alone; the label sits next door
+            } else {
+                self.slot_label(axis, row, false)
+            };
             let label_len = label.0.chars().count();
             if !label.0.is_empty()
-                && first_busy > label_len
-                && owner.is_none_or(|o| o.indent > label_len)
+                && first_busy >= label_len
+                && owner.is_none_or(|o| o.indent >= label_len)
             {
                 let mut style = Style::default().fg(label.1).bg(row_bg);
-                if is_now_row {
-                    style = style.add_modifier(Modifier::BOLD);
+                if show_now_label {
+                    style = style.bg(NOW_BG).add_modifier(Modifier::BOLD);
                 }
                 line.push(Span::styled(label.0.clone(), style));
                 col = label_len;
@@ -3248,7 +3293,7 @@ impl CalApp {
                     continue;
                 }
                 if let Some((_, idx)) = bar_at(col) {
-                    let bg = if is_now_row {
+                    let bg = if paint_now_band {
                         NOW_BG
                     } else {
                         self.event_row_bg(&self.events[idx], cell_bg)
@@ -3272,7 +3317,7 @@ impl CalApp {
                             || (c < bar_limit && bar_at(c).is_some())
                     })
                     .unwrap_or(width as usize);
-                let fill_bg = if is_now_row {
+                let fill_bg = if paint_now_band {
                     NOW_BG
                 } else {
                     (0..col.min(bar_limit))
@@ -5886,5 +5931,35 @@ mod tests {
         assert_eq!(app.focused_date, local_date_of(row.dtstart_utc));
         assert_eq!(app.selected_event().unwrap().id, 3);
         assert!(app.go_back());
+    }
+
+    #[test]
+    fn now_label_moves_next_door_when_an_event_covers_the_slot() {
+        let free: Vec<Placement> = Vec::new();
+        assert_eq!(now_label_row(5, 10, &free, 9), Some(5));
+        // An event starting on the slot at indent 0 pushes the label up.
+        let covering = pack_cascade(&[(0, 5, 7)], 10, 4);
+        assert_eq!(now_label_row(5, 10, &covering, 9), Some(4));
+        // Rows 4..=7 all busy at the left edge: below is taken too, so the
+        // label goes above the block; at the very top it goes below.
+        let block = pack_cascade(&[(0, 4, 7)], 10, 4);
+        assert_eq!(
+            now_label_row(5, 10, &block, 9),
+            None,
+            "both neighbours covered"
+        );
+        let top = pack_cascade(&[(0, 0, 0)], 10, 4);
+        assert_eq!(now_label_row(0, 10, &top, 9), Some(1));
+        // A bar far enough to the right leaves room for the label.
+        let indented = vec![Placement {
+            pos: 0,
+            start_row: 2,
+            end_row: 8,
+            indent: 12,
+        }];
+        assert_eq!(now_label_row(5, 10, &indented, 9), Some(5));
+        // Bottom row with the slot covered: only "above" exists.
+        let last = pack_cascade(&[(0, 9, 9)], 10, 4);
+        assert_eq!(now_label_row(9, 10, &last, 9), Some(8));
     }
 }
