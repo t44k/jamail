@@ -460,3 +460,48 @@ fn sync_loop(
         quick_reconnect = false;
     }
 }
+
+#[cfg(test)]
+mod pending_action_tests {
+    use super::*;
+
+    #[test]
+    fn a_locally_read_message_is_queued_and_shielded_then_expires_by_ttl() {
+        let control = SyncControl::new("INBOX");
+        assert!(!control.recently_seen("INBOX", 7));
+        control.enqueue_mark_seen("INBOX".to_string(), 7);
+        assert!(control.recently_seen("INBOX", 7));
+        assert!(!control.recently_seen("Archive", 7), "shield is per folder");
+        assert!(control.has_pending_actions());
+        let queued: Vec<MarkSeenRequest> = control
+            .mark_seen_queue
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            (queued[0].folder.as_str(), queued[0].uid, queued[0].attempts),
+            ("INBOX", 7, 0)
+        );
+        assert!(!control.has_pending_actions());
+        // Force an expired entry: shielding must not outlive the TTL.
+        control.recently_seen.lock().unwrap().insert(
+            ("INBOX".to_string(), 8),
+            std::time::Instant::now() - RECENTLY_SEEN_TTL,
+        );
+        assert!(!control.recently_seen("INBOX", 8));
+        assert!(
+            control.recently_seen("INBOX", 7),
+            "fresh entry still shielded"
+        );
+        // The next enqueue prunes the expired one.
+        control.enqueue_mark_seen("INBOX".to_string(), 9);
+        assert!(
+            !control
+                .recently_seen
+                .lock()
+                .unwrap()
+                .contains_key(&("INBOX".to_string(), 8))
+        );
+    }
+}
