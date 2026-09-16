@@ -9,6 +9,13 @@
 //!   (folder-of-interest hints, mark-seen, Sent/Draft uploads) and for the
 //!   background sync-progress/event stream.
 //!
+//! - `jacal` (src/bin/jacal.rs) — the calendar terminal UI, a second client
+//!   of `jamaild` over the same IPC protocol.
+//! - `jadav` (src/bin/jadav.rs) — a standalone, self-hosted CalDAV server
+//!   daemon (see [`jadav`]) meant to run on a server host rather than next
+//!   to the TUIs; it shares this crate's iCalendar, HTTP and CalDAV code
+//!   but has its own store and no IPC socket.
+//!
 //! See `ipc` and `daemon` module docs for the protocol/lifecycle details.
 
 pub mod app;
@@ -23,6 +30,7 @@ pub mod daemon;
 pub mod db;
 pub mod httpc;
 pub mod ipc;
+pub mod jadav;
 pub mod mail;
 pub mod notify;
 pub mod smtp;

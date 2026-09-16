@@ -1,0 +1,44 @@
+# Compose service for jadav. Merge into the host's docker-compose.yml next
+# to the reverse proxy; the traefik labels mirror the ones the previous
+# CalDAV server used so the public hostname stays the same at cutover.
+#
+#   mkdir -p docker-data/jadav/{config,state}
+#   install -m 0600 config.yaml docker-data/jadav/config/config.yaml   # jadav: section only
+#   docker compose run --rm jadav check-config
+#   docker compose up -d jadav
+services:
+  jadav:
+    image: jadav:local
+    container_name: jadav
+    restart: unless-stopped
+    command: ["serve"]
+    environment:
+      - JAMAIL_CONFIG=/config/config.yaml
+      - RUST_BACKTRACE=1
+    volumes:
+      - ./docker-data/jadav/config:/config:ro
+      - ./docker-data/jadav/state:/state
+    # The mail server jadav reads iTIP mail from and sends iMIP through
+    # (jadav.mail.imap/smtp) presents a certificate for its public name, so
+    # jadav must reach it by that name. A container cannot rely on hairpinning
+    # through the host's published ports on every Docker setup, so give the
+    # mail server that name as a network alias on the shared network instead
+    # (see the `mailserver` service below). Do not use `extra_hosts` with
+    # `host-gateway` for this — it hangs where the hairpin is blocked.
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.jadav.rule=Host(`dav.example.com`)
+      - traefik.http.routers.jadav.entrypoints=websecure
+      - traefik.http.routers.jadav.tls.certresolver=letsencrypt
+      - traefik.http.services.jadav.loadbalancer.server.port=5232
+      - traefik.http.routers.jadav-http.rule=Host(`dav.example.com`)
+      - traefik.http.routers.jadav-http.entrypoints=web
+      - traefik.http.routers.jadav-http.middlewares=jadav-redirect
+      - traefik.http.middlewares.jadav-redirect.redirectscheme.scheme=https
+  # The operator's mail server, already defined in the host's compose file;
+  # this fragment only adds the alias jadav connects by.
+  mailserver:
+    networks:
+      default:
+        aliases:
+          - mail.example.com

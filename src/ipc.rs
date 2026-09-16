@@ -230,6 +230,9 @@ pub enum ServerHello {
 /// A client-to-daemon request. See module docs for error semantics.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+// `EnqueueCalendarMutation` carries an `EventEdits`; a request is built
+// once per user action, so the size skew between variants is irrelevant.
+#[allow(clippy::large_enum_variant)]
 pub enum Request {
     /// Health check; always answered with [`Response::Pong`]. Used by
     /// [`ping`] and by the client's autostart-probe before spawning a new
@@ -266,6 +269,9 @@ pub enum Request {
     /// each account's loop also detects this independently via its own IDLE
     /// timing, so this is a latency optimization, not the only path).
     ForceReconnect { account: String },
+    /// Run a full sync pass for the account now instead of at the end of
+    /// the current IDLE period (jamail's `u` key).
+    SyncNow { account: String },
     /// Ask the daemon to shut down gracefully (see module docs). Answered
     /// with [`Response::Ok`] before the daemon begins tearing down.
     Shutdown,

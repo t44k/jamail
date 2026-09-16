@@ -329,6 +329,15 @@ fn run_app(
                                 KeyCode::Char('/') => app.enter_search(),
                                 KeyCode::Char('F') => app.enter_folder_select(),
                                 KeyCode::Char('n') => app.enter_compose_new(db),
+                                KeyCode::Char('u') => {
+                                    ipc_client.send(ipc::Request::SyncNow {
+                                        account: app.current_account.clone(),
+                                    });
+                                    app.spinner_active = true;
+                                    if !app.status_sticky {
+                                        app.status_msg = "Syncing now…".to_string();
+                                    }
+                                }
                                 _ => {}
                             }
                         } // end Ctrl+D branch

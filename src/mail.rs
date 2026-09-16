@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, NaiveDateTime};
 use imap::Connection;
+use imap::extensions::idle;
 use mailparse::{DispositionType, MailHeaderMap, parse_mail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -82,22 +83,113 @@ pub struct MailClient {
     session: imap::Session<Connection>,
 }
 
+/// One message fetched by [`MailClient::fetch_new_bodies`].
+pub struct FetchedMessage {
+    pub uid: u32,
+    pub is_unread: bool,
+    /// IMAP keywords (custom flags) set on the message, e.g. the
+    /// `acct-<label>` tags a mail-puller adds.
+    pub keywords: Vec<String>,
+    pub body: Vec<u8>,
+}
+
 impl MailClient {
     pub fn connect(account: &JamailAccount) -> Result<Self> {
-        let host = &account.imap.host;
-        let port = account.imap.port;
-        let login = &account.imap.login;
-        let password = account.imap.auth.resolve_password()?;
+        Self::connect_imap(&account.imap)
+    }
 
-        let client = imap::ClientBuilder::new(host.as_str(), port)
+    /// Connect and log in with just an [`crate::config::ImapConfig`] (what
+    /// `jadav`'s inbound-mail watcher has; `jamaild` goes through
+    /// [`Self::connect`] with a whole account).
+    pub fn connect_imap(imap_cfg: &crate::config::ImapConfig) -> Result<Self> {
+        let password = imap_cfg.auth.resolve_password()?;
+
+        let client = imap::ClientBuilder::new(imap_cfg.host.as_str(), imap_cfg.port)
             .connect()
             .context("Failed to connect to IMAP server")?;
 
         let session = client
-            .login(login, &password)
+            .login(&imap_cfg.login, &password)
             .map_err(|e| anyhow::anyhow!("IMAP login failed: {}", e.0))?;
 
         Ok(Self { session })
+    }
+
+    /// SELECT a folder and report its `UIDVALIDITY` and `UIDNEXT`.
+    pub fn select_folder_info(&mut self, folder: &str) -> Result<(u32, Option<u32>)> {
+        let mailbox = self
+            .session
+            .select(folder)
+            .with_context(|| format!("Failed to select folder: {}", folder))?;
+        Ok((mailbox.uid_validity.unwrap_or(0), mailbox.uid_next))
+    }
+
+    /// UIDs strictly greater than `last_uid` in the selected folder,
+    /// ascending.
+    pub fn search_uids_after(&mut self, last_uid: u32) -> Result<Vec<u32>> {
+        let range = format!("{}:*", last_uid.saturating_add(1));
+        let results = self
+            .session
+            .uid_fetch(&range, "UID")
+            .context("Failed to fetch UIDs")?;
+        let mut uids: Vec<u32> = results
+            .iter()
+            .filter_map(|m| m.uid)
+            .filter(|&u| u > last_uid)
+            .collect();
+        uids.sort_unstable();
+        Ok(uids)
+    }
+
+    /// UIDs of messages received since `date` (IMAP `SINCE`, day granularity)
+    /// in the selected folder, ascending.
+    pub fn search_uids_since(&mut self, date: chrono::NaiveDate) -> Result<Vec<u32>> {
+        let query = format!("SINCE {}", date.format("%d-%b-%Y"));
+        let set = self
+            .session
+            .uid_search(&query)
+            .context("Failed to search by date")?;
+        let mut uids: Vec<u32> = set.into_iter().collect();
+        uids.sort_unstable();
+        Ok(uids)
+    }
+
+    /// Fetch full bodies (with flags/keywords) for `uids`, in chunks. The
+    /// DB-free counterpart of the fetch inside [`Self::sync_folder`].
+    pub fn fetch_new_bodies(&mut self, uids: &[u32]) -> Result<Vec<FetchedMessage>> {
+        let mut out = Vec::with_capacity(uids.len());
+        for chunk in uids.chunks(50) {
+            let uid_list: String = chunk
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let messages = self
+                .session
+                .uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")
+                .context("Failed to fetch message batch")?;
+            for msg in messages.iter() {
+                let Some(uid) = msg.uid else { continue };
+                let Some(body) = msg.body() else { continue };
+                let mut keywords = Vec::new();
+                let mut is_unread = true;
+                for f in msg.flags() {
+                    match f {
+                        imap::types::Flag::Seen => is_unread = false,
+                        imap::types::Flag::Custom(k) => keywords.push(k.to_string()),
+                        _ => {}
+                    }
+                }
+                out.push(FetchedMessage {
+                    uid,
+                    is_unread,
+                    keywords,
+                    body: body.to_vec(),
+                });
+            }
+        }
+        out.sort_by_key(|m| m.uid);
+        Ok(out)
     }
 
     /// List all folders on the IMAP server, filtering out \Noselect folders.
@@ -317,12 +409,14 @@ impl MailClient {
 
     /// Block until new mail arrives (via IMAP IDLE) or timeout expires.
     /// Falls back to sleeping if IDLE isn't supported.
-    pub fn wait_for_changes(&mut self, timeout: Duration) {
-        use imap::extensions::idle;
-
+    /// IDLE on the selected folder until the server reports a change or
+    /// `timeout` passes. `Err` means the connection is no longer usable
+    /// (the `DONE` that ends the IDLE could not be exchanged) — the caller
+    /// should reconnect rather than keep waiting on a dead socket.
+    pub fn wait_for_changes(&mut self, timeout: Duration) -> Result<idle::WaitOutcome> {
         let mut handle = self.session.idle();
         handle.timeout(timeout).keepalive(false);
-        let _ = handle.wait_while(idle::stop_on_any);
+        handle.wait_while(idle::stop_on_any).context("IDLE failed")
     }
 
     /// Mark the given UIDs as \Seen on the server.
@@ -374,7 +468,25 @@ impl MailClient {
 
     /// Fetch server flags for all known UIDs in a folder and reconcile with DB.
     /// Returns true if any flags changed.
-    pub fn sync_flags(&mut self, db: &MailDb, account: &str, folder: &str) -> Result<bool> {
+    /// Bring the cached copies of `folder` in line with the server for
+    /// everything `sync_folder` does not cover: the `\\Seen` flag of every
+    /// known message, and messages that are **gone** from the folder — a
+    /// `UID FETCH … FLAGS` answers only for UIDs that still exist there, so
+    /// any known UID the server stays silent about was moved or expunged by
+    /// another client and its cached copy is removed (with FTS row and
+    /// attachments). Returns whether anything changed, so the UI reloads.
+    ///
+    /// `just_read_locally(uid)` names messages the user opened in jamail
+    /// moments ago whose `\\Seen` may not have reached the server yet: the
+    /// server's stale "unseen" for those is ignored instead of flipping the
+    /// local copy back to unread.
+    pub fn sync_flags(
+        &mut self,
+        db: &MailDb,
+        account: &str,
+        folder: &str,
+        just_read_locally: &dyn Fn(u32) -> bool,
+    ) -> Result<bool> {
         let known_uids = db.get_all_uids(account, folder)?;
         if known_uids.is_empty() {
             return Ok(false);
@@ -383,7 +495,20 @@ impl MailClient {
             .select(folder)
             .with_context(|| format!("Failed to select folder for flag sync: {}", folder))?;
         let server_flags = self.fetch_flags(&known_uids)?;
-        db.update_flags(account, folder, &server_flags)
+        let present: std::collections::HashSet<u32> =
+            server_flags.iter().map(|(uid, _)| *uid).collect();
+        let server_flags: Vec<(u32, bool)> = server_flags
+            .into_iter()
+            .filter(|(uid, is_unread)| !(*is_unread && just_read_locally(*uid)))
+            .collect();
+        let vanished: Vec<u32> = known_uids
+            .iter()
+            .copied()
+            .filter(|uid| !present.contains(uid))
+            .collect();
+        let removed = db.delete_emails_by_uid(account, folder, &vanished)?;
+        let flags_changed = db.update_flags(account, folder, &server_flags)?;
+        Ok(flags_changed || removed > 0)
     }
 
     #[allow(dead_code)]

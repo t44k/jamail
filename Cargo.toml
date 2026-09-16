@@ -19,6 +19,10 @@ path = "src/bin/jamaild.rs"
 name = "jacal"
 path = "src/bin/jacal.rs"
 
+[[bin]]
+name = "jadav"
+path = "src/bin/jadav.rs"
+
 [dependencies]
 imap = { version = "3.0.0-alpha.15", features = ["native-tls"] }
 imap-proto = "0.16.6"
@@ -48,3 +52,5 @@ libc = "0.2"
 chrono-tz = "0.10"
 quick-xml = "0.42"
 rrule = "0.14"
+sha2 = "0.10"
+percent-encoding = "2"

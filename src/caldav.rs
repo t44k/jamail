@@ -99,6 +99,12 @@ pub struct DiscoveredCalendar {
     pub url: String,
     pub display_name: String,
     pub ctag: Option<String>,
+    /// Apple's `calendar-color` (`#rrggbb` or `#rrggbbaa`), the colour the
+    /// server (or the user, on the phone) gave the calendar.
+    pub color: Option<String>,
+    /// jadav's `owner-identity` (`urn:jamail:jadav`): the address this
+    /// calendar belongs to, bare (no `mailto:`). Other servers: `None`.
+    pub identity: Option<String>,
 }
 
 pub struct ChangedEvent {
@@ -118,41 +124,95 @@ pub enum SyncOutcome {
         token: Option<String>,
         changed: Vec<ChangedEvent>,
         deleted: Vec<String>,
+        /// The server paged the answer (RFC 6578 §3.6: a `507` status on
+        /// the collection's own href — Google does this at ~230 members):
+        /// the caller must call again with `token` to get the rest before
+        /// treating the listing as complete.
+        truncated: bool,
     },
     /// The server rejected the token or doesn't support `sync-collection`
     /// at all; the caller should fall back to [`CalDavClient::list_all_events`].
     FullResyncRequired,
 }
 
+/// Supplies bearer tokens for [`AuthScheme::Bearer`]: `token()` returns a
+/// currently-valid access token (refreshing as needed), `invalidate()` is
+/// called after a `401` so the next call fetches a fresh one.
+pub trait TokenSource: Send {
+    fn token(&mut self) -> Result<String>;
+    fn invalidate(&mut self);
+}
+
+pub enum AuthScheme {
+    Basic { login: String, password: String },
+    Bearer(std::sync::Arc<std::sync::Mutex<dyn TokenSource>>),
+}
+
 pub struct CalDavClient {
     base_url: HttpUrl,
-    login: String,
-    password: String,
+    auth: AuthScheme,
     timeout: Duration,
 }
 
 impl CalDavClient {
     pub fn new(base_url: &str, login: &str, password: &str) -> Result<Self> {
+        Self::new_with_auth(
+            base_url,
+            AuthScheme::Basic {
+                login: login.to_string(),
+                password: password.to_string(),
+            },
+        )
+    }
+
+    pub fn new_with_auth(base_url: &str, auth: AuthScheme) -> Result<Self> {
         Ok(Self {
             base_url: HttpUrl::parse(base_url)?,
-            login: login.to_string(),
-            password: password.to_string(),
+            auth,
             timeout: DEFAULT_TIMEOUT,
         })
+    }
+
+    /// The absolute base URL this client resolves relative hrefs against.
+    pub fn base_url(&self) -> &HttpUrl {
+        &self.base_url
+    }
+
+    fn auth_header(&self) -> Result<String> {
+        match &self.auth {
+            AuthScheme::Basic { login, password } => Ok(httpc::basic_auth_header(login, password)),
+            AuthScheme::Bearer(source) => {
+                let mut src = source
+                    .lock()
+                    .map_err(|_| anyhow!("token source poisoned"))?;
+                Ok(format!("Bearer {}", src.token()?))
+            }
+        }
     }
 
     fn request(
         &self,
         method: &str,
         url: &HttpUrl,
-        mut headers: Vec<(String, String)>,
+        headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> Result<HttpResponse> {
-        headers.push((
-            "Authorization".to_string(),
-            httpc::basic_auth_header(&self.login, &self.password),
-        ));
-        httpc::send(method, url, &headers, body.as_deref(), self.timeout)
+        let mut with_auth = headers.clone();
+        with_auth.push(("Authorization".to_string(), self.auth_header()?));
+        let resp = httpc::send(method, url, &with_auth, body.as_deref(), self.timeout)?;
+        if resp.status == 401
+            && let AuthScheme::Bearer(source) = &self.auth
+        {
+            // An expired/revoked access token: drop it and retry once with
+            // a freshly issued one.
+            if let Ok(mut src) = source.lock() {
+                src.invalidate();
+            }
+            let mut retry = headers;
+            retry.push(("Authorization".to_string(), self.auth_header()?));
+            return httpc::send(method, url, &retry, body.as_deref(), self.timeout);
+        }
+        Ok(resp)
     }
 
     fn propfind(&self, url: &HttpUrl, depth: u8, body: &str) -> Result<MultiStatusDoc> {
@@ -213,6 +273,8 @@ impl CalDavClient {
                     url: resolved.to_absolute_string(),
                     display_name: r.displayname.unwrap_or_else(|| href.clone()),
                     ctag: r.ctag,
+                    color: r.color,
+                    identity: r.identity,
                 });
             }
         }
@@ -249,10 +311,35 @@ impl CalDavClient {
         match resp.status {
             200 | 207 => {
                 let doc = parse_multistatus(&resp.body_str())?;
+                let collection_path =
+                    httpc::percent_decode(url.path_and_query.split('?').next().unwrap_or(""))
+                        .trim_end_matches('/')
+                        .to_string();
                 let mut changed = Vec::new();
                 let mut deleted = Vec::new();
+                let mut truncated = false;
                 for r in doc.responses {
                     let Some(href) = r.href else { continue };
+                    let href_path = httpc::percent_decode(href.split('?').next().unwrap_or(""));
+                    let is_collection = href_path.trim_end_matches('/') == collection_path
+                        || href_path
+                            .find("://")
+                            .and_then(|i| {
+                                href_path[i + 3..]
+                                    .find('/')
+                                    .map(|j| &href_path[i + 3 + j..])
+                            })
+                            .map(|p| p.trim_end_matches('/') == collection_path)
+                            .unwrap_or(false);
+                    if is_collection {
+                        // A status on the collection itself is not a member:
+                        // 507 means "result truncated, continue with the
+                        // returned token" (RFC 6578 §3.6).
+                        if r.response_status == Some(507) {
+                            truncated = true;
+                        }
+                        continue;
+                    }
                     if let Some(code) = r.response_status
                         && code == 404
                     {
@@ -269,6 +356,7 @@ impl CalDavClient {
                     token: doc.sync_token,
                     changed,
                     deleted,
+                    truncated,
                 })
             }
             400 | 403 | 405 | 501 | 507 => Ok(SyncOutcome::FullResyncRequired),
@@ -310,6 +398,112 @@ impl CalDavClient {
         Ok(doc
             .responses
             .into_iter()
+            .filter_map(|r| {
+                r.href.map(|href| ChangedEvent {
+                    href,
+                    etag: r.etag,
+                    calendar_data: r.calendar_data,
+                })
+            })
+            .collect())
+    }
+
+    /// `calendar-query` REPORT restricted to `VEVENT`s overlapping
+    /// `[start, end)` (RFC 4791 §9.9 `time-range`; recurring masters are
+    /// reported when any occurrence overlaps). `end = None` leaves the
+    /// range open-ended.
+    pub fn list_events_in_range(
+        &self,
+        calendar_url: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<ChangedEvent>, CalDavError> {
+        let url = HttpUrl::parse(calendar_url)?;
+        let end_attr = end
+            .map(|e| format!(" end=\"{}\"", e.format("%Y%m%dT%H%M%SZ")))
+            .unwrap_or_default();
+        let body = format!(
+            r#"<?xml version="1.0" encoding="utf-8" ?>
+<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop>
+    <D:getetag/>
+    <C:calendar-data/>
+  </D:prop>
+  <C:filter>
+    <C:comp-filter name="VCALENDAR">
+      <C:comp-filter name="VEVENT">
+        <C:time-range start="{}"{}/>
+      </C:comp-filter>
+    </C:comp-filter>
+  </C:filter>
+</C:calendar-query>"#,
+            start.format("%Y%m%dT%H%M%SZ"),
+            end_attr
+        );
+        self.report_events(&url, body, "calendar-query (time-range) REPORT failed")
+    }
+
+    /// `calendar-multiget` REPORT: fetch `getetag` + `calendar-data` for
+    /// specific hrefs in one round trip (servers that omit `calendar-data`
+    /// from `sync-collection` answers, e.g. Google's CalDAV, hand it out
+    /// this way). Callers batch — 50 hrefs per call is a safe size.
+    pub fn multiget(
+        &self,
+        calendar_url: &str,
+        hrefs: &[String],
+    ) -> Result<Vec<ChangedEvent>, CalDavError> {
+        if hrefs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let url = HttpUrl::parse(calendar_url)?;
+        let mut body = String::from(
+            r#"<?xml version="1.0" encoding="utf-8" ?>
+<C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop>
+    <D:getetag/>
+    <C:calendar-data/>
+  </D:prop>
+"#,
+        );
+        for href in hrefs {
+            body.push_str("  <D:href>");
+            body.push_str(&xml_escape_text(href));
+            body.push_str("</D:href>\n");
+        }
+        body.push_str("</C:calendar-multiget>");
+        self.report_events(&url, body, "calendar-multiget REPORT failed")
+    }
+
+    fn report_events(
+        &self,
+        url: &HttpUrl,
+        body: String,
+        context: &str,
+    ) -> Result<Vec<ChangedEvent>, CalDavError> {
+        let resp = self.request(
+            "REPORT",
+            url,
+            vec![
+                ("Depth".to_string(), "1".to_string()),
+                (
+                    "Content-Type".to_string(),
+                    "application/xml; charset=utf-8".to_string(),
+                ),
+            ],
+            Some(body.into_bytes()),
+        )?;
+        if resp.status != 207 && resp.status != 200 {
+            return Err(CalDavError::Other(httpc::err_status(
+                context,
+                resp.status,
+                &resp.body_str(),
+            )));
+        }
+        let doc = parse_multistatus(&resp.body_str())?;
+        Ok(doc
+            .responses
+            .into_iter()
+            .filter(|r| r.response_status.is_none_or(|c| (200..300).contains(&c)))
             .filter_map(|r| {
                 r.href.map(|href| ChangedEvent {
                     href,
@@ -444,6 +638,8 @@ struct ResponseAccum {
     etag: Option<String>,
     calendar_data: Option<String>,
     displayname: Option<String>,
+    color: Option<String>,
+    identity: Option<String>,
     ctag: Option<String>,
     is_calendar_collection: bool,
     current_user_principal: Option<String>,
@@ -461,11 +657,19 @@ struct PropStatBuf {
     etag: Option<String>,
     calendar_data: Option<String>,
     displayname: Option<String>,
+    color: Option<String>,
+    identity: Option<String>,
     ctag: Option<String>,
     is_calendar: bool,
     current_user_principal: Option<String>,
     calendar_home_set: Option<String>,
     status_ok: bool,
+}
+
+fn xml_escape_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn local_name(qname: &str) -> String {
@@ -478,6 +682,23 @@ fn local_name(qname: &str) -> String {
 
 fn parse_http_status_line(text: &str) -> Option<u16> {
     text.split_whitespace().nth(1).and_then(|c| c.parse().ok())
+}
+
+/// Resolve one `XmlEvent::GeneralRef` (the text between `&` and `;`) to
+/// the characters it stands for: numeric character references
+/// (`&#38;`, `&#x26;`), then the five predefined XML entities
+/// (`amp`, `lt`, `gt`, `quot`, `apos`). Anything else (a document-defined
+/// entity we have no DTD for) is kept verbatim as `&name;` rather than
+/// dropped, so no bytes of the server's text ever vanish.
+pub(crate) fn general_ref_text(reference: &quick_xml::events::BytesRef<'_>) -> String {
+    if let Ok(Some(ch)) = reference.resolve_char_ref() {
+        return ch.to_string();
+    }
+    let name: &str = reference;
+    match quick_xml::escape::resolve_predefined_entity(name) {
+        Some(s) => s.to_string(),
+        None => format!("&{};", name),
+    }
 }
 
 fn parse_multistatus(xml: &str) -> Result<MultiStatusDoc> {
@@ -525,6 +746,16 @@ fn parse_multistatus(xml: &str) -> Result<MultiStatusDoc> {
                     Err(_) => text.push_str(raw),
                 }
             }
+            // quick-xml (>= 0.38) reports entity and character references
+            // (`&quot;`, `&amp;`, `&#38;`, `&#x26;`, ...) as their own event
+            // rather than as part of the surrounding `Text`. Servers routinely
+            // escape the quotes around ETags and any `&`/`<`/`>` inside
+            // `calendar-data`, so dropping these silently would store
+            // unquoted ETags (breaking every `If-Match`) and corrupt event
+            // text.
+            XmlEvent::GeneralRef(e) => {
+                text.push_str(&general_ref_text(&e));
+            }
             XmlEvent::CData(e) => {
                 let raw: &str = e.as_ref();
                 text.push_str(raw);
@@ -551,6 +782,19 @@ fn parse_multistatus(xml: &str) -> Result<MultiStatusDoc> {
                     "getetag" => buf.etag = Some(text.trim().to_string()),
                     "calendar-data" => buf.calendar_data = Some(text.clone()),
                     "displayname" => buf.displayname = Some(text.trim().to_string()),
+                    "calendar-color" => {
+                        let c = text.trim();
+                        if !c.is_empty() {
+                            buf.color = Some(c.to_string());
+                        }
+                    }
+                    "owner-identity" => {
+                        let v = text.trim();
+                        let v = v.strip_prefix("mailto:").unwrap_or(v).trim();
+                        if !v.is_empty() {
+                            buf.identity = Some(v.to_ascii_lowercase());
+                        }
+                    }
                     "getctag" => buf.ctag = Some(text.trim().to_string()),
                     "sync-token" => doc.sync_token = Some(text.trim().to_string()),
                     "status" => {
@@ -574,6 +818,12 @@ fn parse_multistatus(xml: &str) -> Result<MultiStatusDoc> {
                             }
                             if buf.displayname.is_some() {
                                 c.displayname = buf.displayname.take();
+                            }
+                            if buf.color.is_some() {
+                                c.color = buf.color.take();
+                            }
+                            if buf.identity.is_some() {
+                                c.identity = buf.identity.take();
                             }
                             if buf.ctag.is_some() {
                                 c.ctag = buf.ctag.take();
@@ -619,11 +869,13 @@ const HOMESET_PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
 </D:propfind>"#;
 
 const CALENDAR_LIST_PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
-<D:propfind xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/">
+<D:propfind xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/" xmlns:A="http://apple.com/ns/ical/" xmlns:J="urn:jamail:jadav">
   <D:prop>
     <D:resourcetype/>
     <D:displayname/>
     <CS:getctag/>
+    <A:calendar-color/>
+    <J:owner-identity/>
   </D:prop>
 </D:propfind>"#;
 
@@ -726,6 +978,8 @@ mod tests {
         let calendars = client.discover_calendars().unwrap();
         assert_eq!(calendars.len(), 1);
         assert_eq!(calendars[0].display_name, "Personal");
+        assert_eq!(calendars[0].color.as_deref(), Some("#3366FFFF"));
+        assert_eq!(calendars[0].identity.as_deref(), Some("alice@example.com"));
         assert!(calendars[0].url.ends_with("/cal/personal/"));
         let requests = handle.join().unwrap();
         assert!(requests[0].starts_with("PROPFIND / HTTP/1.1"));
@@ -751,18 +1005,19 @@ mod tests {
                 token,
                 changed,
                 deleted,
+                ..
             } => {
                 assert_eq!(token.as_deref(), Some("https://cal.example.com/sync/2"));
                 assert_eq!(changed.len(), 1);
                 assert_eq!(changed[0].href, "/cal/personal/event1.ics");
+                // The fixture escapes the ETag quotes and the `&`/`<`/`>` in
+                // the body the way real servers (sabre/dav, Google) do; the
+                // decoded values must come back byte-exact.
                 assert_eq!(changed[0].etag.as_deref(), Some("\"etag-1\""));
-                assert!(
-                    changed[0]
-                        .calendar_data
-                        .as_ref()
-                        .unwrap()
-                        .contains("UID:event1")
-                );
+                let data = changed[0].calendar_data.as_ref().unwrap();
+                assert!(data.contains("UID:event1"));
+                assert!(data.contains("SUMMARY:Product Q&A Drop-In"), "{data}");
+                assert!(data.contains("DESCRIPTION:a <b> & c & d"), "{data}");
                 assert_eq!(deleted, vec!["/cal/personal/event2.ics".to_string()]);
             }
             SyncOutcome::FullResyncRequired => panic!("expected Delta"),
@@ -894,8 +1149,55 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].href, "/cal/personal/a.ics");
+        assert_eq!(events[0].etag.as_deref(), Some("\"a1\""));
         assert!(events[0].calendar_data.as_ref().unwrap().contains("UID:a"));
         assert_eq!(events[1].href, "/cal/personal/b.ics");
+        assert_eq!(events[1].etag.as_deref(), Some("\"b1\""));
+    }
+
+    #[test]
+    fn initial_sync_sends_an_empty_sync_token_element() {
+        // An RFC 6578 initial sync (no prior token) must send an empty
+        // `<D:sync-token/>`, which makes the server enumerate every member
+        // — the path `calsync` relies on to repair legacy caches.
+        let body = sync_collection_body(None);
+        assert!(body.contains("<D:sync-token></D:sync-token>"), "{body}");
+        let body2 = sync_collection_body(Some("urn:x:7"));
+        assert!(
+            body2.contains("<D:sync-token>urn:x:7</D:sync-token>"),
+            "{body2}"
+        );
+    }
+
+    #[test]
+    fn parse_multistatus_resolves_entity_and_character_references() {
+        // Entity references arrive as separate quick-xml events; every
+        // form must be decoded and accumulated in document order, and an
+        // entity we cannot resolve must be kept verbatim, never dropped.
+        let xml = r#"<?xml version="1.0"?>
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/cal/r&amp;d/</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+        <D:displayname>R&amp;D &lt;team&gt; &#39;quoted&#x27; &unknown;</D:displayname>
+        <D:getetag>&quot;e1&quot;</D:getetag>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+        let doc = parse_multistatus(xml).unwrap();
+        assert_eq!(doc.responses.len(), 1);
+        let r = &doc.responses[0];
+        assert_eq!(r.href.as_deref(), Some("/cal/r&d/"));
+        assert_eq!(
+            r.displayname.as_deref(),
+            Some("R&D <team> 'quoted' &unknown;")
+        );
+        assert_eq!(r.etag.as_deref(), Some("\"e1\""));
+        assert!(r.is_calendar_collection);
     }
 
     #[test]
@@ -950,6 +1252,8 @@ mod tests {
       <D:prop>
         <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
         <D:displayname>Personal</D:displayname>
+        <A:calendar-color xmlns:A="http://apple.com/ns/ical/">#3366FFFF</A:calendar-color>
+        <J:owner-identity xmlns:J="urn:jamail:jadav">mailto:Alice@Example.com</J:owner-identity>
         <CS:getctag>"ctag-1"</CS:getctag>
       </D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>
@@ -963,8 +1267,8 @@ mod tests {
     <D:href>/cal/personal/event1.ics</D:href>
     <D:propstat>
       <D:prop>
-        <D:getetag>"etag-1"</D:getetag>
-        <C:calendar-data>BEGIN:VEVENT\r\nUID:event1\r\nEND:VEVENT\r\n</C:calendar-data>
+        <D:getetag>&quot;etag-1&quot;</D:getetag>
+        <C:calendar-data>BEGIN:VEVENT\r\nUID:event1\r\nSUMMARY:Product Q&amp;A Drop-In\r\nDESCRIPTION:a &lt;b&gt; &#38; c &#x26; d\r\nEND:VEVENT\r\n</C:calendar-data>
       </D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>
     </D:propstat>
@@ -982,7 +1286,7 @@ mod tests {
     <D:href>/cal/personal/a.ics</D:href>
     <D:propstat>
       <D:prop>
-        <D:getetag>"a1"</D:getetag>
+        <D:getetag>&quot;a1&quot;</D:getetag>
         <C:calendar-data>BEGIN:VEVENT\r\nUID:a\r\nEND:VEVENT\r\n</C:calendar-data>
       </D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>
@@ -992,7 +1296,7 @@ mod tests {
     <D:href>/cal/personal/b.ics</D:href>
     <D:propstat>
       <D:prop>
-        <D:getetag>"b1"</D:getetag>
+        <D:getetag>&quot;b1&quot;</D:getetag>
         <C:calendar-data>BEGIN:VEVENT\r\nUID:b\r\nEND:VEVENT\r\n</C:calendar-data>
       </D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>

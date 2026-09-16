@@ -42,12 +42,13 @@
 //! account switches already abandoned sync threads the same way).
 
 use crate::caldav_server;
+use crate::calnotify;
 use crate::calsync::{self, CalSyncControl, CalSyncEvent};
 use crate::config::{JamailAccount, JamailConfig};
 use crate::db;
 use crate::ipc::{self, ClientHello, Request, Response, ServerHello, ServerMessage};
 use crate::notify;
-use crate::sync::{self, MarkSeenRequest, SyncControl, SyncEvent, UploadRequest};
+use crate::sync::{self, SyncControl, SyncEvent, UploadRequest};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io;
@@ -272,9 +273,7 @@ fn handle_request(daemon: &Daemon, req: Request) -> Response {
             folder,
             uid,
         } => with_account(daemon, &account, |rt| {
-            if let Ok(mut q) = rt.control.mark_seen_queue.lock() {
-                q.push(MarkSeenRequest { folder, uid });
-            }
+            rt.control.enqueue_mark_seen(folder, uid);
         }),
         Request::EnqueueUpload {
             account,
@@ -306,6 +305,9 @@ fn handle_request(daemon: &Daemon, req: Request) -> Response {
         }
         Request::ForceReconnect { account } => with_account(daemon, &account, |rt| {
             rt.control.force_reconnect.store(true, Ordering::Relaxed);
+        }),
+        Request::SyncNow { account } => with_account(daemon, &account, |rt| {
+            rt.control.force_sync.store(true, Ordering::Relaxed);
         }),
         Request::Shutdown => {
             daemon.trigger_graceful_shutdown();
@@ -497,6 +499,39 @@ pub fn run_with_notifier(notifier: Notifier) -> Result<()> {
         .and_then(|d| d.caldav_server_listen.clone());
     let accounts: Vec<(String, JamailAccount)> = config.accounts.into_iter().collect();
     let daemon = Daemon::start(&accounts, notifier);
+
+    // Calendar alarms are this daemon's job, like mail notifications: one
+    // clock thread over every caldav-configured account's cached events,
+    // so a reminder fires whether or not `jacal` is open. Failures are
+    // logged, never swallowed (see `calnotify`'s module docs).
+    let alarm_accounts: Vec<calnotify::AlarmAccount> = accounts
+        .iter()
+        .filter_map(|(name, account)| {
+            account.caldav.as_ref().map(|c| calnotify::AlarmAccount {
+                name: name.clone(),
+                default_lead_minutes: c.default_alarm_minutes_before.clone().unwrap_or_default(),
+            })
+        })
+        .collect();
+    if !alarm_accounts.is_empty() {
+        match db::db_path() {
+            Ok(db_path) => {
+                let daemon = Arc::clone(&daemon);
+                let count = alarm_accounts.len();
+                thread::spawn(move || {
+                    calnotify::run_alarm_loop(
+                        &alarm_accounts,
+                        &db_path,
+                        &calnotify::DesktopAlarmSink,
+                        &|| SIGNAL_RECEIVED.load(Ordering::SeqCst) || daemon.shutdown_requested(),
+                        &|msg| eprintln!("jamaild: {}", msg),
+                    );
+                });
+                eprintln!("jamaild: calendar alarms armed for {} account(s)", count);
+            }
+            Err(e) => eprintln!("jamaild: calendar alarms disabled: {}", e),
+        }
+    }
 
     // Optional, opt-in: an inbound CalDAV HTTP server exposing every
     // caldav-configured account's local calendar cache. Unset (the

@@ -12,14 +12,243 @@ pub struct JamailConfig {
     /// Optional `jacal` (calendar TUI) settings. Unset (default): every
     /// `JacalConfig` field falls back to its own default.
     pub jacal: Option<JacalConfig>,
+    /// Optional `jadav` (standalone CalDAV server daemon) settings. Only
+    /// `jadav` reads this; the other binaries ignore it. Unset (default):
+    /// nothing to run. See `jadav::config::JadavConfig`.
+    pub jadav: Option<crate::jadav::config::JadavConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct JacalConfig {
     /// Which day a week starts on in `jacal`'s week/month/year grids.
     /// Unset (default): Monday.
     #[serde(default)]
     pub week_start: WeekStart,
+    /// Per-calendar display settings, keyed by calendar URL. `jacal`
+    /// writes this list back itself (see [`save_jacal_settings`])
+    /// whenever a calendar is hidden/shown or given a colour; a calendar
+    /// without an entry is shown with its server or palette colour.
+    #[serde(default)]
+    pub calendars: Vec<JacalCalendarPref>,
+    /// Whether events we declined are shown (default) or hidden. Toggled
+    /// with `D` in `jacal`'s calendar panel and written back like
+    /// `calendars`.
+    #[serde(default = "default_true")]
+    pub show_declined: bool,
+}
+
+impl Default for JacalConfig {
+    fn default() -> Self {
+        Self {
+            week_start: WeekStart::default(),
+            calendars: Vec::new(),
+            show_declined: true,
+        }
+    }
+}
+
+/// One calendar's display settings in `jacal.calendars`.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct JacalCalendarPref {
+    pub url: String,
+    #[serde(default = "default_true")]
+    pub visible: bool,
+    /// `#rrggbb`; unset means "server colour, else palette".
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+/// Quote a scalar for the YAML `jacal.calendars` block: double quotes,
+/// backslash and quote escaped — the only forms a URL or `#rrggbb` needs
+/// (the `#` would otherwise start a comment).
+fn yaml_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start_matches(' ').len()
+}
+
+fn is_blank_or_comment(line: &str) -> bool {
+    let t = line.trim_start();
+    t.is_empty() || t.starts_with('#')
+}
+
+/// Render the `calendars:` list of a `jacal:` block, `indent` spaces deep.
+fn render_jacal_calendars(prefs: &[JacalCalendarPref], indent: usize) -> Vec<String> {
+    let pad = " ".repeat(indent);
+    if prefs.is_empty() {
+        return vec![format!("{pad}calendars: []")];
+    }
+    let mut out = vec![format!("{pad}calendars:")];
+    for p in prefs {
+        out.push(format!("{pad}  - url: {}", yaml_quote(&p.url)));
+        out.push(format!("{pad}    visible: {}", p.visible));
+        if let Some(c) = &p.color {
+            out.push(format!("{pad}    color: {}", yaml_quote(c)));
+        }
+    }
+    out
+}
+
+fn is_top_level_key(l: &str) -> bool {
+    !l.is_empty() && !l.starts_with(' ') && !l.starts_with('\t')
+}
+
+/// `(jacal line index, end of block, child indent)` of the `jacal:` block
+/// in `lines`, if there is one. The block runs to the next line starting
+/// in column 0; the child indent is that of its first real line (2 when
+/// the block is empty).
+fn jacal_block(lines: &[String]) -> Option<(usize, usize, usize)> {
+    let j = lines.iter().position(|l| {
+        is_top_level_key(l) && {
+            let rest = l.trim_end();
+            rest == "jacal:" || rest.starts_with("jacal: #") || rest.starts_with("jacal:\t")
+        }
+    })?;
+    let block_end = (j + 1..lines.len())
+        .find(|&i| is_top_level_key(&lines[i]) || lines[i].starts_with('#'))
+        .unwrap_or(lines.len());
+    let child_indent = (j + 1..block_end)
+        .find(|&i| !is_blank_or_comment(&lines[i]))
+        .map(|i| indent_of(&lines[i]))
+        .filter(|&n| n > 0)
+        .unwrap_or(2);
+    Some((j, block_end, child_indent))
+}
+
+/// Replace the lines of key `key` (a scalar or a list at the child indent
+/// of the `jacal:` block) with `replacement`, or append `replacement` at
+/// the end of the block when the key is absent — after the block's last
+/// non-blank line, so a blank separator before the next top-level key
+/// survives.
+fn upsert_jacal_key(lines: &mut Vec<String>, key: &str, replacement: Vec<String>) {
+    let Some((j, block_end, child_indent)) = jacal_block(lines) else {
+        return;
+    };
+    let key_idx = (j + 1..block_end).find(|&i| {
+        let l = &lines[i];
+        indent_of(l) == child_indent && {
+            let t = l.trim_start().trim_end();
+            t == format!("{key}:")
+                || t.starts_with(&format!("{key}: "))
+                || t.starts_with(&format!("{key}:\t"))
+        }
+    });
+    match key_idx {
+        Some(k) => {
+            // The key's lines end at the next thing at the same or a
+            // shallower indent, comments included.
+            let key_end = (k + 1..block_end)
+                .find(|&i| !lines[i].trim().is_empty() && indent_of(&lines[i]) <= child_indent)
+                .unwrap_or(block_end);
+            lines.splice(k..key_end, replacement);
+        }
+        None => {
+            let insert_at = (j + 1..block_end)
+                .rev()
+                .find(|&i| !lines[i].trim().is_empty())
+                .map(|i| i + 1)
+                .unwrap_or(j + 1);
+            lines.splice(insert_at..insert_at, replacement);
+        }
+    }
+}
+
+/// [`splice_jacal_settings`] for the calendar list alone.
+pub fn splice_jacal_calendars(text: &str, prefs: &[JacalCalendarPref]) -> String {
+    splice_jacal_settings(text, prefs, None)
+}
+
+/// Return `text` (a whole `config.yaml`) with its `jacal.calendars` list
+/// replaced by `prefs` — and, when given, `jacal.show_declined` set — and
+/// **nothing else changed**: comments, ordering, quoting and every other
+/// key are kept byte for byte. A missing key is added at the end of the
+/// `jacal:` block; a missing `jacal:` block is appended to the file. Pure,
+/// so it is unit-tested on literal documents; [`save_jacal_settings`] does
+/// the I/O.
+pub fn splice_jacal_settings(
+    text: &str,
+    prefs: &[JacalCalendarPref],
+    show_declined: Option<bool>,
+) -> String {
+    let had_trailing_newline = text.is_empty() || text.ends_with('\n');
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    if jacal_block(&lines).is_none() {
+        if lines.last().is_some_and(|l| !l.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push("jacal:".to_string());
+    }
+    let child_indent = jacal_block(&lines).map(|b| b.2).unwrap_or(2);
+    upsert_jacal_key(
+        &mut lines,
+        "calendars",
+        render_jacal_calendars(prefs, child_indent),
+    );
+    if let Some(flag) = show_declined {
+        upsert_jacal_key(
+            &mut lines,
+            "show_declined",
+            vec![format!(
+                "{}show_declined: {}",
+                " ".repeat(child_indent),
+                flag
+            )],
+        );
+    }
+    let mut out = lines.join("\n");
+    if had_trailing_newline || !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// [`save_jacal_settings`] for the calendar list alone.
+pub fn save_jacal_calendar_prefs(
+    path: &std::path::Path,
+    prefs: &[JacalCalendarPref],
+) -> Result<()> {
+    save_jacal_settings_inner(path, prefs, None)
+}
+
+/// Persist `jacal.calendars` and `jacal.show_declined` into the config
+/// file at `path` (see [`splice_jacal_settings`]). The result is parsed
+/// back as a full [`JamailConfig`] and compared before anything is
+/// written, then written to a temporary file next to the original (same
+/// permissions — the file holds credentials) and renamed into place.
+pub fn save_jacal_settings(
+    path: &std::path::Path,
+    prefs: &[JacalCalendarPref],
+    show_declined: bool,
+) -> Result<()> {
+    save_jacal_settings_inner(path, prefs, Some(show_declined))
+}
+
+fn save_jacal_settings_inner(
+    path: &std::path::Path,
+    prefs: &[JacalCalendarPref],
+    show_declined: Option<bool>,
+) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read config: {}", path.display()))?;
+    let new_text = splice_jacal_settings(&text, prefs, show_declined);
+    let parsed: JamailConfig = serde_yml::from_str(&new_text)
+        .context("the rewritten config no longer parses; nothing was written")?;
+    let jacal = parsed.jacal.unwrap_or_default();
+    if jacal.calendars != prefs || show_declined.is_some_and(|f| jacal.show_declined != f) {
+        anyhow::bail!(
+            "the rewritten config does not round-trip the calendar settings; nothing was written"
+        );
+    }
+    let tmp = path.with_extension("yaml.jacal-tmp");
+    std::fs::write(&tmp, new_text.as_bytes())
+        .with_context(|| format!("Failed to write {}", tmp.display()))?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("Failed to replace {}", path.display()))?;
+    Ok(())
 }
 
 /// Which day of the week `jacal`'s calendar grids start on.
@@ -182,8 +411,13 @@ impl AuthConfig {
 
 impl JamailConfig {
     pub fn load() -> Result<Self> {
-        let config_path = config_path()?;
-        let content = std::fs::read_to_string(&config_path)
+        Self::load_from(&config_path()?)
+    }
+
+    /// Load from an explicit path (what `jadav --config <path>` and tests
+    /// use); [`Self::load`] resolves the default path first.
+    pub fn load_from(config_path: &std::path::Path) -> Result<Self> {
+        let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read config: {}", config_path.display()))?;
         let config: JamailConfig =
             serde_yml::from_str(&content).context("Failed to parse jamail config")?;
@@ -200,7 +434,16 @@ impl JamailConfig {
     }
 }
 
-fn config_path() -> Result<PathBuf> {
+/// Where every binary reads its config from: the `JAMAIL_CONFIG`
+/// environment variable when set and non-blank (an absolute override, the
+/// same convention `JAMAIL_SOCKET` follows for the IPC socket), otherwise
+/// `~/.config/jamail/config.yaml`.
+pub fn config_path() -> Result<PathBuf> {
+    if let Ok(explicit) = std::env::var("JAMAIL_CONFIG")
+        && !explicit.trim().is_empty()
+    {
+        return Ok(PathBuf::from(explicit));
+    }
     let home = std::env::var("HOME").context("HOME not set")?;
     let path = PathBuf::from(home)
         .join(".config")
@@ -516,6 +759,23 @@ mod tests {
         assert!(personal.sent_folder.is_none());
         assert!(personal.notify_folders.is_none());
         assert!(personal.caldav.is_none());
+
+        // The documented `jadav:` section parses through the shared config
+        // and through jadav's own loader alike.
+        let jadav = cfg.jadav.as_ref().expect("jadav section documented");
+        assert_eq!(jadav.listen, "0.0.0.0:5232");
+        assert_eq!(jadav.principal.login, "alice@example.com");
+        assert_eq!(
+            jadav.identities(),
+            vec![
+                "alice@example.com".to_string(),
+                "alice@corp.com".to_string()
+            ]
+        );
+        assert_eq!(jadav.calendars.len(), 2);
+        assert!(jadav.remotes.contains_key("corp"));
+        assert!(jadav.validate().is_ok());
+        assert!(crate::jadav::config::JadavConfig::load_from(&path).is_ok());
     }
 
     #[test]
@@ -585,5 +845,124 @@ mod tests {
         );
         assert_eq!(caldav.poll_interval_secs, 60);
         assert_eq!(caldav.default_alarm_minutes_before, Some(vec![30, 5]));
+    }
+
+    fn prefs() -> Vec<JacalCalendarPref> {
+        vec![
+            JacalCalendarPref {
+                url: "https://cal.example.com/dav/calendars/a@example.com/personal/".to_string(),
+                visible: true,
+                color: Some("#3366FF".to_string()),
+            },
+            JacalCalendarPref {
+                url: "https://cal.example.com/dav/calendars/a@example.com/g-work/".to_string(),
+                visible: false,
+                color: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn splice_appends_a_jacal_block_when_there_is_none() {
+        let text = "accounts:\n  main:\n    email: a@example.com\n    imap:\n      host: h\n      port: 993\n      login: a\n      auth: {type: password, value: \"s3cret\"}\n";
+        let out = splice_jacal_calendars(text, &prefs());
+        assert!(out.starts_with(text), "everything before is untouched");
+        assert!(out.contains("\njacal:\n  calendars:\n    - url: \"https://cal.example.com/dav/calendars/a@example.com/personal/\"\n      visible: true\n      color: \"#3366FF\"\n    - url: \"https://cal.example.com/dav/calendars/a@example.com/g-work/\"\n      visible: false\n"), "{out}");
+        let parsed: JamailConfig = serde_yml::from_str(&out).unwrap();
+        assert_eq!(parsed.jacal.unwrap().calendars, prefs());
+    }
+
+    #[test]
+    fn splice_inserts_into_an_existing_jacal_block_and_keeps_the_rest_verbatim() {
+        let text = "accounts:\n  main:\n    email: a@example.com\n    imap: {host: h, port: 993, login: a, auth: {type: password, value: s}}\n\n# Calendar TUI\njacal:\n  # Monday or Sunday\n  week_start: sunday\n\ndaemon:\n  socket_path: /tmp/x.sock\n";
+        let out = splice_jacal_calendars(text, &prefs());
+        let expected = "accounts:\n  main:\n    email: a@example.com\n    imap: {host: h, port: 993, login: a, auth: {type: password, value: s}}\n\n# Calendar TUI\njacal:\n  # Monday or Sunday\n  week_start: sunday\n  calendars:\n    - url: \"https://cal.example.com/dav/calendars/a@example.com/personal/\"\n      visible: true\n      color: \"#3366FF\"\n    - url: \"https://cal.example.com/dav/calendars/a@example.com/g-work/\"\n      visible: false\n\ndaemon:\n  socket_path: /tmp/x.sock\n";
+        assert_eq!(out, expected);
+        let parsed: JamailConfig = serde_yml::from_str(&out).unwrap();
+        assert_eq!(parsed.jacal.as_ref().unwrap().week_start, WeekStart::Sunday);
+        assert_eq!(parsed.jacal.unwrap().calendars, prefs());
+    }
+
+    #[test]
+    fn splice_replaces_an_existing_calendars_list_including_its_nested_lines() {
+        let text = "jacal:\n  week_start: monday\n  calendars:\n    - url: \"old\"\n      # stale comment\n      visible: false\n  # trailing note stays\nother: 1\n";
+        let one = vec![JacalCalendarPref {
+            url: "new".to_string(),
+            visible: true,
+            color: None,
+        }];
+        let out = splice_jacal_calendars(text, &one);
+        assert_eq!(
+            out,
+            "jacal:\n  week_start: monday\n  calendars:\n    - url: \"new\"\n      visible: true\n  # trailing note stays\nother: 1\n"
+        );
+        let empty = splice_jacal_calendars(&out, &[]);
+        assert_eq!(
+            empty,
+            "jacal:\n  week_start: monday\n  calendars: []\n  # trailing note stays\nother: 1\n"
+        );
+        // Idempotent and stable across repeated saves.
+        assert_eq!(splice_jacal_calendars(&out, &one), out);
+        assert_eq!(splice_jacal_calendars(&empty, &[]), empty);
+        // A four-space child indent is followed.
+        let deep = "jacal:\n    week_start: monday\n";
+        let out = splice_jacal_calendars(deep, &one);
+        assert_eq!(
+            out,
+            "jacal:\n    week_start: monday\n    calendars:\n      - url: \"new\"\n        visible: true\n"
+        );
+    }
+
+    #[test]
+    fn save_round_trips_through_a_file_and_keeps_permissions() {
+        let dir = std::env::temp_dir().join(format!("jamail-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, "accounts:\n  main:\n    email: a@example.com\n    imap: {host: h, port: 993, login: a, auth: {type: password, value: s}}\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        save_jacal_calendar_prefs(&path, &prefs()).unwrap();
+        let cfg = JamailConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.jacal.unwrap().calendars, prefs());
+        assert_eq!(cfg.accounts["main"].email, "a@example.com");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(!dir.join("config.yaml.jacal-tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn show_declined_is_upserted_next_to_the_calendar_list() {
+        let text = "accounts: {}\njacal:\n  week_start: monday\n\nother: 1\n";
+        let out = splice_jacal_settings(text, &[], Some(false));
+        assert_eq!(
+            out,
+            "accounts: {}\njacal:\n  week_start: monday\n  calendars: []\n  show_declined: false\n\nother: 1\n"
+        );
+        let again = splice_jacal_settings(&out, &prefs(), Some(true));
+        assert!(again.contains("  show_declined: true\n"), "{again}");
+        assert_eq!(again.matches("show_declined").count(), 1);
+        assert!(again.contains("  calendars:\n    - url:"), "{again}");
+        let parsed: JamailConfig = serde_yml::from_str(&again).unwrap();
+        let jacal = parsed.jacal.unwrap();
+        assert!(jacal.show_declined);
+        assert_eq!(jacal.calendars, prefs());
+        let bare: JamailConfig =
+            serde_yml::from_str("accounts: {}\njacal:\n  week_start: monday\n").unwrap();
+        assert!(bare.jacal.unwrap().show_declined);
+        let fresh = splice_jacal_settings("accounts: {}\n", &[], Some(false));
+        assert_eq!(
+            fresh,
+            "accounts: {}\n\njacal:\n  calendars: []\n  show_declined: false\n"
+        );
     }
 }

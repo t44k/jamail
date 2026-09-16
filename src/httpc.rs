@@ -168,6 +168,17 @@ impl HttpResponse {
     pub fn body_str(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
+
+    /// Deserialize the body as JSON.
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_slice(&self.body).with_context(|| {
+            format!(
+                "decoding JSON response (HTTP {}): {}",
+                self.status,
+                self.body_str().chars().take(200).collect::<String>()
+            )
+        })
+    }
 }
 
 /// Send `method` to `url` with `headers` and an optional `body`, following
@@ -363,6 +374,46 @@ pub fn basic_auth_header(login: &str, password: &str) -> String {
     )
 }
 
+/// Percent-encode one URL component (a path segment or a query value):
+/// RFC 3986 unreserved characters (`A-Za-z0-9-._~`) pass through, every
+/// other byte of the UTF-8 encoding becomes `%XX`.
+pub fn percent_encode_component(s: &str) -> String {
+    const SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    percent_encoding::utf8_percent_encode(s, SET).to_string()
+}
+
+/// Percent-decode (lossy UTF-8; `+` is *not* turned into a space).
+pub fn percent_decode(s: &str) -> String {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+/// `k=v&k2=v2` with both sides component-encoded; empty for no pairs.
+pub fn build_query(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}={}",
+                percent_encode_component(k),
+                percent_encode_component(v)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// `application/x-www-form-urlencoded` body (same encoding as
+/// [`build_query`]; spaces become `%20`, which every OAuth endpoint accepts).
+pub fn form_urlencode(pairs: &[(&str, &str)]) -> String {
+    build_query(pairs)
+}
+
 pub fn err_status(context: &str, status: u16, body: &str) -> anyhow::Error {
     let snippet: String = body.chars().take(300).collect();
     anyhow!("{}: HTTP {} — {}", context, status, snippet)
@@ -549,5 +600,51 @@ mod tests {
             basic_auth_header("Aladdin", "open sesame"),
             "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
         );
+    }
+
+    #[test]
+    fn percent_helpers_encode_and_decode_components() {
+        assert_eq!(
+            percent_encode_component("tamas@scraperapi.com"),
+            "tamas%40scraperapi.com"
+        );
+        assert_eq!(
+            percent_encode_component("a b+c/d?e&f=g"),
+            "a%20b%2Bc%2Fd%3Fe%26f%3Dg"
+        );
+        assert_eq!(percent_encode_component("ok-._~"), "ok-._~");
+        assert_eq!(percent_encode_component("ü"), "%C3%BC");
+        assert_eq!(
+            percent_decode("tamas%40scraperapi.com"),
+            "tamas@scraperapi.com"
+        );
+        assert_eq!(percent_decode("a+b%20c"), "a+b c");
+        assert_eq!(
+            build_query(&[("syncToken", "abc==/x"), ("maxResults", "250")]),
+            "syncToken=abc%3D%3D%2Fx&maxResults=250"
+        );
+        assert_eq!(build_query(&[]), "");
+        assert_eq!(
+            form_urlencode(&[("grant_type", "refresh_token")]),
+            "grant_type=refresh_token"
+        );
+    }
+
+    #[test]
+    fn response_json_decodes_and_reports_failures() {
+        let resp = HttpResponse {
+            status: 200,
+            headers: HashMap::new(),
+            body: br#"{"a": 1, "b": "x"}"#.to_vec(),
+        };
+        let v: serde_json::Value = resp.json().unwrap();
+        assert_eq!(v["a"], 1);
+        let bad = HttpResponse {
+            status: 500,
+            headers: HashMap::new(),
+            body: b"not json".to_vec(),
+        };
+        let err = bad.json::<serde_json::Value>().unwrap_err().to_string();
+        assert!(err.contains("HTTP 500"), "{err}");
     }
 }

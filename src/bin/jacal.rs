@@ -12,24 +12,19 @@
 //! binary exits immediately with a clear message rather than opening an
 //! empty calendar UI.
 //!
-//! Calendar alarm notifications are delivered by *this* process while
-//! it's running (see `jamail::calnotify` module docs for why that's a
-//! different ownership model than `jamail::notify`'s daemon-owned mail
-//! notifications, and what that implies: no `jacal` running means no
-//! alarm popups, the same way no terminal-based calendar client's alarms
-//! fire while it's closed unless a separate always-on piece exists for
-//! that, which this task's scope didn't include).
+//! Calendar alarm notifications are *not* this process's job: `jamaild`
+//! runs the alarm clock for every caldav-configured account (see
+//! `jamail::calnotify`), so reminders fire whether or not `jacal` is open.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration as ChronoDuration, Local, TimeZone, Utc};
+use chrono::{Local, TimeZone, Utc};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use jamail::calapp::{CalApp, CalField, CalMode};
-use jamail::calendar::{EventTime, VEvent, expand_occurrences};
-use jamail::calnotify::{AlarmScheduler, DesktopAlarmSink};
+use jamail::calendar::{EventEdits, Rsvp};
 use jamail::calsync::CalMutation;
 use jamail::db::MailDb;
 use jamail::{config, daemon, ipc};
@@ -42,14 +37,6 @@ use std::time::{Duration, Instant};
 /// `jamaild` updated the cache between polls, or `jacal` started before
 /// any sync completed).
 const CALENDAR_RELOAD_INTERVAL: Duration = Duration::from_secs(20);
-/// How often to re-check for due alarms. Alarms only need roughly
-/// minute-level precision (see `calnotify::DEFAULT_GRACE`), so this can be
-/// coarser than the calendar reload interval.
-const ALARM_CHECK_INTERVAL: Duration = Duration::from_secs(20);
-/// How far ahead (and slightly behind, to catch an alarm whose trigger
-/// just passed) to load events for alarm scheduling — independent of
-/// whatever date range is currently displayed.
-const ALARM_LOOKAHEAD: ChronoDuration = ChronoDuration::hours(48);
 
 fn main() -> Result<()> {
     if !io::stdout().is_terminal() {
@@ -63,6 +50,16 @@ fn main() -> Result<()> {
         .as_ref()
         .map(|j| j.week_start)
         .unwrap_or_default();
+    let jacal_prefs = config
+        .jacal
+        .as_ref()
+        .map(|j| j.calendars.clone())
+        .unwrap_or_default();
+    let show_declined = config
+        .jacal
+        .as_ref()
+        .map(|j| j.show_declined)
+        .unwrap_or(true);
     let accounts: Vec<(String, config::JamailAccount)> = config.accounts.into_iter().collect();
 
     let caldav_accounts: Vec<&(String, config::JamailAccount)> = accounts
@@ -76,18 +73,16 @@ fn main() -> Result<()> {
         );
     }
     let current_account = caldav_accounts[0].0.clone();
-    let default_lead_minutes: Vec<i64> = caldav_accounts[0]
-        .1
-        .caldav
-        .as_ref()
-        .and_then(|c| c.default_alarm_minutes_before.clone())
-        .unwrap_or_default();
 
     let db = MailDb::open().context("Failed to open mail database")?;
 
     let mut app = CalApp::new(current_account.clone(), week_start);
+    app.identities = own_identities(&caldav_accounts[0].1);
+    app.show_declined = show_declined;
+    app.set_calendar_prefs(jacal_prefs);
     reload_calendars(&mut app, &db);
     reload_events(&mut app, &db);
+    reload_invitations(&mut app, &db);
 
     let socket_path = ipc::resolve_socket_path(daemon_socket_override.as_deref());
     daemon::try_autostart(&socket_path);
@@ -104,18 +99,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut scheduler = AlarmScheduler::new();
-    let alarm_sink = DesktopAlarmSink;
-
-    let result = run_app(
-        &mut terminal,
-        &mut app,
-        &db,
-        &ipc_client,
-        &mut scheduler,
-        &alarm_sink,
-        &default_lead_minutes,
-    );
+    let result = run_app(&mut terminal, &mut app, &db, &ipc_client);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -146,6 +130,20 @@ fn reload_calendars(app: &mut CalApp, db: &MailDb) {
     }
 }
 
+/// Load the coming year's events (one row per series) for the invitations
+/// list and the header's unanswered count — independent of the displayed
+/// range.
+fn reload_invitations(app: &mut CalApp, db: &MailDb) {
+    let now = Utc::now().timestamp();
+    let rows = db
+        .get_calendar_events_in_range(Some(&app.current_account), now - 3600, now + 365 * 86400)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.dtend_utc > now || r.rrule.is_some())
+        .collect();
+    app.set_invitations(rows);
+}
+
 fn reload_events(app: &mut CalApp, db: &MailDb) {
     // `displayed_range` (not `visible_range`) so Month view's
     // leading/trailing overflow days from adjacent months also get their
@@ -163,54 +161,13 @@ fn reload_events(app: &mut CalApp, db: &MailDb) {
     }
 }
 
-/// Load events across a wide window (independent of whatever range is
-/// currently displayed) for alarm scheduling, reconstructing full
-/// `VEvent`s (with `VALARM`s) from each row's stored raw ICS and expanding
-/// recurring events to every occurrence within the window, each with its
-/// `dtstart`/`dtend` shifted to that occurrence's own instants (so a
-/// relative `VALARM`, or the default-lead-minutes fallback, fires once per
-/// occurrence rather than only ever for the series' master).
-fn load_events_for_alarms(db: &MailDb, account: &str) -> Vec<VEvent> {
-    let now = Utc::now();
-    let start_ts = (now - ChronoDuration::hours(1)).timestamp();
-    let end_ts = (now + ALARM_LOOKAHEAD).timestamp();
-    let rows = db
-        .get_calendar_events_in_range(Some(account), start_ts, end_ts)
-        .unwrap_or_default();
-    let (Some(window_start), Some(window_end)) = (
-        DateTime::<Utc>::from_timestamp(start_ts, 0),
-        DateTime::<Utc>::from_timestamp(end_ts, 0),
-    ) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for row in &rows {
-        let Ok(vevent) = row.to_vevent() else {
-            continue;
-        };
-        for (occ_start, occ_end) in expand_occurrences(&vevent, window_start, window_end) {
-            let mut occurrence = vevent.clone();
-            occurrence.dtstart = EventTime::utc(occ_start);
-            occurrence.dtend = EventTime::utc(occ_end);
-            out.push(occurrence);
-        }
-    }
-    out
-}
-
-#[allow(clippy::too_many_arguments)]
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut CalApp,
     db: &MailDb,
     ipc_client: &ipc::IpcClient,
-    scheduler: &mut AlarmScheduler,
-    alarm_sink: &DesktopAlarmSink,
-    default_lead_minutes: &[i64],
 ) -> Result<()> {
     let mut last_calendar_reload = Instant::now();
-    let mut last_alarm_check = Instant::now() - ALARM_CHECK_INTERVAL; // check once immediately
-    let mut alarm_events = load_events_for_alarms(db, &app.current_account);
 
     loop {
         terminal.draw(|frame| app.render(frame))?;
@@ -248,22 +205,8 @@ fn run_app(
         if last_calendar_reload.elapsed() >= CALENDAR_RELOAD_INTERVAL {
             reload_calendars(app, db);
             reload_events(app, db);
+            reload_invitations(app, db);
             last_calendar_reload = Instant::now();
-        }
-
-        if last_alarm_check.elapsed() >= ALARM_CHECK_INTERVAL {
-            alarm_events = load_events_for_alarms(db, &app.current_account);
-            last_alarm_check = Instant::now();
-        }
-        let fired = scheduler.tick(&alarm_events, default_lead_minutes, Utc::now(), alarm_sink);
-        for (fire, outcome) in fired {
-            match outcome {
-                Ok(()) => {}
-                Err(e) => app.set_status(format!(
-                    "Alarm for \"{}\" failed to deliver: {}",
-                    fire.summary, e
-                )),
-            }
         }
 
         if !event::poll(Duration::from_millis(200))? {
@@ -286,7 +229,16 @@ fn run_app(
                 CalMode::ConfirmDelete => {
                     handle_delete_confirm_key(app, db, ipc_client, key.code);
                 }
+                CalMode::Rsvp => {
+                    handle_rsvp_key(app, db, ipc_client, key.code);
+                }
+                CalMode::Calendars => handle_calendar_panel_key(app, key.code, key.modifiers),
+                CalMode::Attendees => {
+                    handle_attendee_editor_key(app, db, ipc_client, key.code, key.modifiers);
+                }
+                CalMode::Invitations => handle_invitations_key(app, db, ipc_client, key.code),
             }
+            persist_calendar_prefs(app);
         }
     }
 }
@@ -412,6 +364,11 @@ fn handle_browse_key(
             app.goto_today();
             reload_events(app, db);
         }
+        // The calendar panel: `C`, or `v` for terminals whose keyboard
+        // protocol reports Shift+c as a lowercase `c` with the SHIFT
+        // modifier rather than as `C`.
+        KeyCode::Char('C') | KeyCode::Char('v') => app.begin_calendar_panel(),
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::SHIFT) => app.begin_calendar_panel(),
         KeyCode::Char('n') | KeyCode::Char('c') => {
             if app.calendars.is_empty() {
                 app.set_status("No calendars discovered yet — try 's' to sync.");
@@ -429,6 +386,17 @@ fn handle_browse_key(
                 app.set_status(e);
             }
         }
+        KeyCode::Char('r') => {
+            if let Err(e) = app.begin_rsvp() {
+                app.set_status(e);
+            }
+        }
+        KeyCode::Char('a') => {
+            if let Err(e) = app.begin_attendees_for_selected() {
+                app.set_status(e);
+            }
+        }
+        KeyCode::Char('i') => app.begin_invitations(),
         KeyCode::Char(digit @ '1'..='9') => {
             let idx = digit as usize - '1' as usize;
             if let Some(cal) = app.calendars.get(idx).cloned() {
@@ -441,6 +409,13 @@ fn handle_browse_key(
             });
             app.set_status("Requested sync…");
         }
+        // Say so when a key does nothing: it also shows exactly what the
+        // terminal delivered, which is what matters when a Shift+letter
+        // binding seems dead.
+        KeyCode::Char(c) => app.set_status(format!(
+            "No action for {:?} ({:?}) — see the key hints below",
+            c, modifiers
+        )),
         _ => {}
     }
     true
@@ -478,6 +453,35 @@ fn handle_form_key(
             if let Some(draft) = app.draft.as_mut() {
                 draft.prev_field();
             }
+        }
+        // The calendar field picks where a new event lives; the organizer
+        // identity follows the calendar.
+        KeyCode::Left | KeyCode::Right
+            if app
+                .draft
+                .as_ref()
+                .is_some_and(|d| d.field == CalField::Calendar) =>
+        {
+            let step = if code == KeyCode::Right { 1 } else { -1 };
+            let calendars = app.calendars.clone();
+            if let Some(draft) = app.draft.as_mut() {
+                draft.cycle_calendar(&calendars, step);
+            }
+            let organizer = app
+                .draft
+                .as_ref()
+                .and_then(|d| app.calendar_identity(&d.calendar_url));
+            if let Some(draft) = app.draft.as_mut() {
+                draft.organizer = organizer;
+            }
+        }
+        KeyCode::Enter
+            if app
+                .draft
+                .as_ref()
+                .is_some_and(|d| d.field == CalField::Attendees) =>
+        {
+            app.begin_attendees_for_draft();
         }
         KeyCode::Char(' ')
             if app
@@ -545,6 +549,231 @@ fn submit_form(app: &mut CalApp, db: &MailDb, ipc_client: &ipc::IpcClient) {
             }
             Err(e) => app.set_status(e),
         }
+    }
+}
+
+/// Keys in the calendar panel (`C`): move, show/hide, recolour, close.
+fn handle_calendar_panel_key(app: &mut CalApp, code: KeyCode, modifiers: KeyModifiers) {
+    app.clear_status();
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => app.calendar_panel_move(1),
+        KeyCode::Char('k') | KeyCode::Up => app.calendar_panel_move(-1),
+        KeyCode::Char(' ') | KeyCode::Enter => {
+            if let Some(url) = app.panel_calendar_url() {
+                app.toggle_calendar_visible(&url);
+            }
+        }
+        KeyCode::Char('c') | KeyCode::Char('l') | KeyCode::Right => {
+            if let Some(url) = app.panel_calendar_url() {
+                app.cycle_calendar_color(&url, 1);
+            }
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            if let Some(url) = app.panel_calendar_url() {
+                app.cycle_calendar_color(&url, -1);
+            }
+        }
+        KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete => {
+            if let Some(url) = app.panel_calendar_url() {
+                app.clear_calendar_color(&url);
+            }
+        }
+        // `d`/`D` (either case: some terminals report Shift+d as a lowercase
+        // `d` with the SHIFT modifier) shows or hides declined events.
+        KeyCode::Char('d') | KeyCode::Char('D') => app.toggle_show_declined(),
+        KeyCode::Char(digit @ '1'..='9') => {
+            let idx = digit as usize - '1' as usize;
+            if let Some(cal) = app.calendars.get(idx).cloned() {
+                app.toggle_calendar_visible(&cal.url);
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('C') | KeyCode::Char('v') => {
+            app.close_calendar_panel()
+        }
+        KeyCode::Char(c) => app.set_status(format!(
+            "No panel action for {:?} ({:?}); keys: j/k space c ← → x d Esc",
+            c, modifiers
+        )),
+        _ => {}
+    }
+}
+
+/// Write `jacal.calendars` back to the config file when a toggle or a
+/// colour change flagged it (see `CalApp::take_prefs_dirty`). Only that
+/// list is rewritten; the rest of the file stays byte for byte.
+fn persist_calendar_prefs(app: &mut CalApp) {
+    if !app.take_prefs_dirty() {
+        return;
+    }
+    let result = config::config_path().and_then(|path| {
+        config::save_jacal_settings(&path, &app.calendar_prefs, app.show_declined)
+    });
+    if let Err(e) = result {
+        app.set_status(format!("Could not save calendar settings: {:#}", e));
+    }
+}
+
+/// Keys in the participants modal: type an address and Enter to add it,
+/// Up/Down to pick a guest, Delete (or Ctrl+D) to remove, Esc to finish —
+/// which saves the new guest list when the modal was opened on an
+/// existing event and something changed.
+fn handle_attendee_editor_key(
+    app: &mut CalApp,
+    db: &MailDb,
+    ipc_client: &ipc::IpcClient,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) {
+    match code {
+        KeyCode::Esc => {
+            if let Some(commit) = app.finish_attendee_editor() {
+                let account = app.current_account.clone();
+                match db.apply_local_calendar_edit(commit.id, &commit.edits) {
+                    Ok(()) => {
+                        ipc_client.send(ipc::Request::EnqueueCalendarMutation {
+                            account,
+                            mutation: CalMutation::Update {
+                                local_id: commit.id,
+                                edits: commit.edits,
+                            },
+                        });
+                        reload_events(app, db);
+                        app.set_status(format!(
+                            "Guest list of \"{}\" saved, syncing…",
+                            commit.summary
+                        ));
+                    }
+                    Err(e) => app.set_status(format!("Could not save guests: {}", e)),
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if let Err(e) = app.attendee_editor_add() {
+                app.set_status(e);
+            }
+        }
+        KeyCode::Up => app.attendee_editor_move(-1),
+        KeyCode::Down => app.attendee_editor_move(1),
+        KeyCode::Delete => app.attendee_editor_remove(),
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.attendee_editor_remove()
+        }
+        KeyCode::Backspace => app.attendee_editor_backspace(),
+        KeyCode::Char(c) => app.attendee_editor_input(c),
+        _ => {}
+    }
+}
+
+/// Every address the account can answer an invitation as: its `email`,
+/// its `caldav.login` and every `senders` entry (display names stripped),
+/// lower-cased and de-duplicated. Matched against `ATTENDEE` lines by
+/// `CalApp::own_attendee`.
+fn own_identities(account: &config::JamailAccount) -> Vec<String> {
+    let mut raw: Vec<String> = vec![account.email.clone()];
+    if let Some(c) = &account.caldav {
+        raw.push(c.login.clone());
+    }
+    if let Some(senders) = &account.senders {
+        raw.extend(senders.iter().cloned());
+    }
+    let mut out: Vec<String> = Vec::new();
+    for entry in raw {
+        let addr = jamail::jadav::config::mailbox_address(&entry);
+        if addr.contains('@') && !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    out
+}
+
+/// Answer the invitation the RSVP prompt was opened for: rewrite our
+/// `ATTENDEE` line locally (no `SEQUENCE` bump) and queue the same
+/// `Update` mutation an edit uses; the CalDAV server turns the stored
+/// `PARTSTAT` change into the iTIP `REPLY` mail.
+fn handle_rsvp_key(app: &mut CalApp, db: &MailDb, ipc_client: &ipc::IpcClient, code: KeyCode) {
+    let (partstat, verb) = match code {
+        KeyCode::Char('a') | KeyCode::Enter => ("ACCEPTED", "Accepted"),
+        KeyCode::Char('t') => ("TENTATIVE", "Tentatively accepted"),
+        KeyCode::Char('d') => ("DECLINED", "Declined"),
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+            app.cancel_rsvp();
+            return;
+        }
+        _ => return,
+    };
+    let Some(target) = app.take_pending_rsvp() else {
+        return;
+    };
+    apply_rsvp(app, db, ipc_client, &target, partstat, verb);
+}
+
+/// Answer `target`'s invitation with `partstat`: rewrite our ATTENDEE line
+/// locally and queue the Update the server turns into the iTIP REPLY.
+fn apply_rsvp(
+    app: &mut CalApp,
+    db: &MailDb,
+    ipc_client: &ipc::IpcClient,
+    target: &jamail::calapp::PendingRsvp,
+    partstat: &str,
+    verb: &str,
+) {
+    let account = app.current_account.clone();
+    let edits = EventEdits {
+        rsvp: Some(Rsvp {
+            attendee: target.attendee.clone(),
+            partstat: partstat.to_string(),
+        }),
+        ..Default::default()
+    };
+    match db.apply_local_calendar_edit(target.id, &edits) {
+        Ok(()) => {
+            ipc_client.send(ipc::Request::EnqueueCalendarMutation {
+                account,
+                mutation: CalMutation::Update {
+                    local_id: target.id,
+                    edits,
+                },
+            });
+            reload_events(app, db);
+            reload_invitations(app, db);
+            app.set_status(format!("{} \"{}\", syncing…", verb, target.summary));
+        }
+        Err(e) => app.set_status(format!("Could not respond: {}", e)),
+    }
+}
+
+/// Keys in the invitations panel: `a`/`t`/`d` answer the highlighted
+/// invitation (the list re-sorts, so the cursor lands on the next new
+/// one), Enter opens it, j/k move, Esc closes.
+fn handle_invitations_key(
+    app: &mut CalApp,
+    db: &MailDb,
+    ipc_client: &ipc::IpcClient,
+    code: KeyCode,
+) {
+    let answer = match code {
+        KeyCode::Char('a') => Some(("ACCEPTED", "Accepted")),
+        KeyCode::Char('t') => Some(("TENTATIVE", "Tentatively accepted")),
+        KeyCode::Char('d') => Some(("DECLINED", "Declined")),
+        _ => None,
+    };
+    if let Some((partstat, verb)) = answer {
+        match app.invitation_rsvp_target() {
+            Ok(target) => apply_rsvp(app, db, ipc_client, &target, partstat, verb),
+            Err(e) => app.set_status(e),
+        }
+        return;
+    }
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => app.invitations_move(1),
+        KeyCode::Char('k') | KeyCode::Up => app.invitations_move(-1),
+        KeyCode::Enter => {
+            if app.jump_to_selected_invitation() {
+                reload_events(app, db);
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => app.close_invitations(),
+        _ => {}
     }
 }
 

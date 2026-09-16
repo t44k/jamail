@@ -7,7 +7,7 @@ use crate::calendar::{EventStatus, EventTime, VEvent};
 use crate::mail::{AttachmentData, Email, EmailContent, FolderInfo};
 use chrono::{DateTime, Local, TimeZone, Utc};
 
-const CURRENT_SCHEMA_VERSION: i32 = 6;
+const CURRENT_SCHEMA_VERSION: i32 = 8;
 
 pub struct AttachmentMeta {
     pub id: i64,
@@ -24,6 +24,9 @@ pub struct CalendarRow {
     pub ctag: Option<String>,
     pub sync_token: Option<String>,
     pub color: Option<String>,
+    /// The address the server attached to this calendar (jadav's
+    /// `owner-identity`), if it told us.
+    pub identity: Option<String>,
 }
 
 /// A row from the `calendar_events` table. `raw_ics` is the decompressed
@@ -107,6 +110,7 @@ impl CalendarEventRow {
             alarms: Vec::new(),
             sequence: self.sequence,
             dtstamp: None,
+            recurrence_id: None,
             raw: None,
         })
     }
@@ -185,7 +189,7 @@ const MAIL_SCHEMA_SQL: &str = "DROP TABLE IF EXISTS emails_fts;
          DROP TABLE IF EXISTS schema_version;
 
          CREATE TABLE schema_version (version INTEGER NOT NULL);
-         INSERT INTO schema_version VALUES (6);
+         INSERT INTO schema_version VALUES (8);
 
          CREATE TABLE folders (
              account   TEXT NOT NULL,
@@ -219,6 +223,8 @@ const MAIL_SCHEMA_SQL: &str = "DROP TABLE IF EXISTS emails_fts;
 
          CREATE INDEX idx_emails_acct_folder_date ON emails(account, folder, date_ts DESC);
          CREATE INDEX idx_emails_message_id ON emails(message_id);
+         CREATE INDEX idx_emails_list ON emails(account, folder, date_ts DESC, id, uid, from_addr,
+             subject, is_unread, preview, message_id, in_reply_to, refs, has_attachments);
 
          CREATE TABLE sync_state (
              account     TEXT NOT NULL,
@@ -276,6 +282,7 @@ const CALENDAR_SCHEMA_SQL: &str = "
              ctag         TEXT,
              sync_token   TEXT,
              color        TEXT,
+             identity     TEXT,
              PRIMARY KEY (account, url)
          );
 
@@ -338,6 +345,39 @@ fn migrate_v5_to_v6_add_sync_log(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v6 -> v7: `calendars.identity`, the address the CalDAV server says a
+/// calendar belongs to (jadav's `owner-identity`), which `jacal` uses as
+/// the `ORGANIZER` of events created there. Additive, like v5 and v6.
+/// v7 -> v8: a covering index for the folder list. `emails` rows carry the
+/// compressed bodies, so listing a 20k-message folder used to touch every
+/// row's page (over half a second on a multi-GB cache, felt as jamail's
+/// start-up stutter); with every listed column in the index the list is an
+/// index-only scan.
+fn migrate_v7_to_v8_add_list_index(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_emails_list ON emails(account, folder, date_ts DESC, id,
+             uid, from_addr, subject, is_unread, preview, message_id, in_reply_to, refs,
+             has_attachments);
+         UPDATE schema_version SET version = 8;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v6_to_v7_add_calendar_identity(conn: &Connection) -> Result<()> {
+    // The shared calendar DDL already carries the column on a database
+    // created (or brought to v5) by this build; only add it when missing.
+    let has_identity = conn
+        .prepare("PRAGMA table_info(calendars)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == "identity");
+    if !has_identity {
+        conn.execute("ALTER TABLE calendars ADD COLUMN identity TEXT", [])?;
+    }
+    conn.execute("UPDATE schema_version SET version = 7", [])?;
+    Ok(())
+}
+
 /// Status values for `calendar_events.local_status`: `SYNCED` reflects the
 /// last-known server state exactly; the `PENDING_*` values are a local
 /// write queued for the daemon's calendar sync thread to apply (mirroring
@@ -393,6 +433,14 @@ fn upgrade_schema(conn: &Connection) -> Result<()> {
     if version == 5 {
         migrate_v5_to_v6_add_sync_log(conn)?;
         version = 6;
+    }
+    if version == 6 {
+        migrate_v6_to_v7_add_calendar_identity(conn)?;
+        version = 7;
+    }
+    if version == 7 {
+        migrate_v7_to_v8_add_list_index(conn)?;
+        version = 8;
     }
     debug_assert_eq!(
         version, CURRENT_SCHEMA_VERSION,
@@ -463,7 +511,7 @@ impl MailDb {
     #[cfg(test)]
     pub(crate) fn open_in_memory_legacy_v4() -> Result<Self> {
         let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
-        let sql = MAIL_SCHEMA_SQL.replacen("VALUES (6)", "VALUES (4)", 1);
+        let sql = MAIL_SCHEMA_SQL.replacen("VALUES (8)", "VALUES (4)", 1);
         conn.execute_batch(&sql)?;
         Ok(Self { conn })
     }
@@ -476,7 +524,7 @@ impl MailDb {
     pub(crate) fn open_in_memory_legacy_v5() -> Result<Self> {
         let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
         let sql = format!("{}\n{}", MAIL_SCHEMA_SQL, CALENDAR_SCHEMA_SQL).replacen(
-            "VALUES (6)",
+            "VALUES (8)",
             "VALUES (5)",
             1,
         );
@@ -678,7 +726,7 @@ impl MailDb {
 
     pub fn get_email_list(&self, account: &str, folder: &str) -> Result<Vec<Email>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, uid, from_addr, subject, date_ts, date_rfc3339, is_unread, preview,
+            "SELECT id, uid, from_addr, subject, date_ts, is_unread, preview,
                     message_id, in_reply_to, refs, has_attachments, account
              FROM emails WHERE account = ?1 AND folder = ?2
              ORDER BY date_ts DESC",
@@ -690,14 +738,13 @@ impl MailDb {
             let from: String = row.get(2)?;
             let subject: String = row.get(3)?;
             let date_ts: i64 = row.get(4)?;
-            let _date_rfc3339: String = row.get(5)?;
-            let is_unread: bool = row.get::<_, i32>(6)? != 0;
-            let preview: String = row.get(7)?;
-            let message_id: String = row.get(8)?;
-            let in_reply_to: String = row.get(9)?;
-            let references: String = row.get(10)?;
-            let has_attachments: bool = row.get::<_, i32>(11)? != 0;
-            let acct: String = row.get(12)?;
+            let is_unread: bool = row.get::<_, i32>(5)? != 0;
+            let preview: String = row.get(6)?;
+            let message_id: String = row.get(7)?;
+            let in_reply_to: String = row.get(8)?;
+            let references: String = row.get(9)?;
+            let has_attachments: bool = row.get::<_, i32>(10)? != 0;
+            let acct: String = row.get(11)?;
 
             let date = Local
                 .timestamp_opt(date_ts, 0)
@@ -777,7 +824,7 @@ impl MailDb {
 
     pub fn get_global_inbox(&self) -> Result<Vec<Email>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, uid, from_addr, subject, date_ts, date_rfc3339, is_unread, preview,
+            "SELECT id, uid, from_addr, subject, date_ts, is_unread, preview,
                     message_id, in_reply_to, refs, has_attachments, account
              FROM emails WHERE folder = 'INBOX'
              ORDER BY date_ts DESC",
@@ -789,14 +836,13 @@ impl MailDb {
             let from: String = row.get(2)?;
             let subject: String = row.get(3)?;
             let date_ts: i64 = row.get(4)?;
-            let _date_rfc3339: String = row.get(5)?;
-            let is_unread: bool = row.get::<_, i32>(6)? != 0;
-            let preview: String = row.get(7)?;
-            let message_id: String = row.get(8)?;
-            let in_reply_to: String = row.get(9)?;
-            let references: String = row.get(10)?;
-            let has_attachments: bool = row.get::<_, i32>(11)? != 0;
-            let acct: String = row.get(12)?;
+            let is_unread: bool = row.get::<_, i32>(5)? != 0;
+            let preview: String = row.get(6)?;
+            let message_id: String = row.get(7)?;
+            let in_reply_to: String = row.get(8)?;
+            let references: String = row.get(9)?;
+            let has_attachments: bool = row.get::<_, i32>(10)? != 0;
+            let acct: String = row.get(11)?;
 
             let date = Local
                 .timestamp_opt(date_ts, 0)
@@ -1022,6 +1068,35 @@ impl MailDb {
         let mut result: Vec<String> = addrs.into_iter().collect();
         result.sort_by_key(|a| a.to_lowercase());
         Ok(result)
+    }
+
+    /// Remove the cached copies of `uids` in `(account, folder)` — messages
+    /// the server no longer has there (moved or expunged by another
+    /// client) — with their FTS rows and attachments. Returns how many
+    /// rows went.
+    pub fn delete_emails_by_uid(&self, account: &str, folder: &str, uids: &[u32]) -> Result<usize> {
+        if uids.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut removed = 0usize;
+        for &uid in uids {
+            let id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM emails WHERE account = ?1 AND folder = ?2 AND uid = ?3",
+                    params![account, folder, uid],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(id) = id else {
+                continue;
+            };
+            tx.execute("DELETE FROM emails_fts WHERE rowid = ?1", params![id])?;
+            tx.execute("DELETE FROM attachments WHERE email_id = ?1", params![id])?;
+            removed += tx.execute("DELETE FROM emails WHERE id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 
     pub fn get_all_uids(&self, account: &str, folder: &str) -> Result<Vec<u32>> {
@@ -1258,17 +1333,34 @@ impl MailDb {
     /// those, so a rediscovery pass (which only learns the display name
     /// again) can't accidentally reset sync progress.
     pub fn upsert_calendar(&self, account: &str, url: &str, display_name: &str) -> Result<()> {
+        self.upsert_calendar_with_color(account, url, display_name, None, None)
+    }
+
+    /// [`Self::upsert_calendar`] that also records the server's
+    /// `calendar-color` and owner identity; a `None` leaves a previously
+    /// stored value alone.
+    pub fn upsert_calendar_with_color(
+        &self,
+        account: &str,
+        url: &str,
+        display_name: &str,
+        color: Option<&str>,
+        identity: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO calendars (account, url, display_name) VALUES (?1, ?2, ?3)
-             ON CONFLICT(account, url) DO UPDATE SET display_name = excluded.display_name",
-            params![account, url, display_name],
+            "INSERT INTO calendars (account, url, display_name, color, identity)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(account, url) DO UPDATE SET display_name = excluded.display_name,
+                 color = COALESCE(excluded.color, calendars.color),
+                 identity = COALESCE(excluded.identity, calendars.identity)",
+            params![account, url, display_name, color, identity],
         )?;
         Ok(())
     }
 
     pub fn get_calendars(&self, account: &str) -> Result<Vec<CalendarRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT url, display_name, ctag, sync_token, color FROM calendars
+            "SELECT url, display_name, ctag, sync_token, color, identity FROM calendars
              WHERE account = ?1 ORDER BY display_name",
         )?;
         let rows = stmt.query_map(params![account], |row| {
@@ -1278,6 +1370,7 @@ impl MailDb {
                 ctag: row.get(2)?,
                 sync_token: row.get(3)?,
                 color: row.get(4)?,
+                identity: row.get(5)?,
             })
         })?;
         let mut out = Vec::new();
@@ -1297,6 +1390,33 @@ impl MailDb {
             )
             .optional()?
             .flatten())
+    }
+
+    /// Whether any synced event in this calendar still carries an ETag
+    /// stored without its surrounding quotes. Builds before the CalDAV
+    /// client learned to decode XML entity references stored
+    /// `&quot;abc&quot;` as `abc`, which every `If-Match` then failed
+    /// against. A `true` here tells `calsync` to run one initial
+    /// (token-less) sync so the server re-lists every member and the
+    /// stored ETags (and any `&`/`<`/`>`-stripped text) are rewritten;
+    /// the condition clears itself on that pass. Never-uploaded rows
+    /// (`local:` hrefs) and weak ETags (`W/"..."`) are not legacy.
+    pub fn calendar_has_unquoted_etags(&self, account: &str, url: &str) -> Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM calendar_events
+                 WHERE account = ?1 AND calendar_url = ?2
+                   AND etag IS NOT NULL
+                   AND etag NOT LIKE '\"%'
+                   AND etag NOT LIKE 'W/\"%'
+                   AND href NOT LIKE ?3
+                 LIMIT 1",
+                params![account, url, format!("{}%", LOCAL_HREF_PREFIX)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     pub fn set_calendar_sync_state(
@@ -1471,7 +1591,9 @@ impl MailDb {
     /// and mark it `pending_update` (unless it's still `pending_create`,
     /// in which case it stays `pending_create` — there's nothing to
     /// "update" server-side yet). Rebuilds the stored raw ICS via
-    /// [`VEvent::to_ics`] so unmodeled properties survive the edit.
+    /// [`crate::calendar::patch_document`] so the `VCALENDAR` wrapper,
+    /// `VTIMEZONE` blocks and every unmodeled property survive the edit
+    /// and the result is a complete document a strict server accepts.
     pub fn apply_local_calendar_edit(
         &self,
         id: i64,
@@ -1481,13 +1603,23 @@ impl MailDb {
             .get_calendar_event_by_id(id)?
             .context("calendar event not found")?;
         let event = row.to_vevent()?;
-        let new_ics = event
-            .to_ics(edits, Utc::now())
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        let updated = crate::calendar::parse_vevents(&new_ics)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?
-            .into_iter()
-            .next()
+        let now = Utc::now();
+        let new_ics = match &row.raw_ics {
+            Some(document) => crate::calendar::patch_document(document, &event, edits, now),
+            None => event.to_ics(edits, now),
+        }
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // Re-derive the indexed columns from the series master (the
+        // component with this UID and no RECURRENCE-ID), not from
+        // whichever component happens to come first in the document.
+        let reparsed =
+            crate::calendar::parse_vevents(&new_ics).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let updated = reparsed
+            .iter()
+            .find(|e| e.uid == row.uid && !crate::calendar::is_recurrence_override(e))
+            .or_else(|| reparsed.iter().find(|e| e.uid == row.uid))
+            .or_else(|| reparsed.first())
+            .cloned()
             .context("re-parsing edited event produced no VEVENT")?;
         let next_status = if row.local_status == CAL_STATUS_PENDING_CREATE {
             CAL_STATUS_PENDING_CREATE
@@ -2288,7 +2420,7 @@ mod calendar_migration_tests {
 
         db.upgrade_for_test().unwrap();
 
-        assert_eq!(db.schema_version_for_test(), 6);
+        assert_eq!(db.schema_version_for_test(), CURRENT_SCHEMA_VERSION);
 
         // Existing mail survived the upgrade untouched.
         let emails = db.get_email_list("personal", "INBOX").unwrap();
@@ -2318,15 +2450,15 @@ mod calendar_migration_tests {
         // Idempotency matters: jamaild and jamail both call MailDb::open()
         // independently and could race on first-run upgrade.
         db.upgrade_for_test().unwrap();
-        assert_eq!(db.schema_version_for_test(), 6);
+        assert_eq!(db.schema_version_for_test(), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
     fn a_fresh_database_is_unaffected_by_upgrade() {
         let db = MailDb::open_in_memory().unwrap();
-        assert_eq!(db.schema_version_for_test(), 6);
+        assert_eq!(db.schema_version_for_test(), CURRENT_SCHEMA_VERSION);
         db.upgrade_for_test().unwrap();
-        assert_eq!(db.schema_version_for_test(), 6);
+        assert_eq!(db.schema_version_for_test(), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -2358,7 +2490,7 @@ mod calendar_migration_tests {
             .unwrap();
 
         db.upgrade_for_test().unwrap();
-        assert_eq!(db.schema_version_for_test(), 6);
+        assert_eq!(db.schema_version_for_test(), CURRENT_SCHEMA_VERSION);
 
         // Existing calendar data survived the upgrade untouched.
         let calendars = db.get_calendars("personal").unwrap();
@@ -2720,6 +2852,87 @@ mod calendar_event_tests {
         .unwrap();
         let row = db.get_calendar_event_by_id(id).unwrap().unwrap();
         assert_eq!(row.local_status, CAL_STATUS_PENDING_CREATE);
+    }
+
+    #[test]
+    fn apply_local_edit_keeps_the_full_vcalendar_document() {
+        let db = MailDb::open_in_memory().unwrap();
+        let document = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//EN\r\n\
+BEGIN:VTIMEZONE\r\nTZID:Europe/Budapest\r\nBEGIN:STANDARD\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nDTSTART:19701025T030000\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\nUID:doc-1\r\nDTSTART;TZID=Europe/Budapest:20240115T090000\r\nDTEND;TZID=Europe/Budapest:20240115T100000\r\nSUMMARY:Old\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:doc-1\r\nRECURRENCE-ID;TZID=Europe/Budapest:20240122T090000\r\nDTSTART;TZID=Europe/Budapest:20240122T110000\r\nDTEND;TZID=Europe/Budapest:20240122T120000\r\nSUMMARY:Old (moved)\r\nEND:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let master = parse_vevents(document).unwrap().remove(0);
+        let id = db
+            .upsert_calendar_event(
+                ACCOUNT,
+                CAL_URL,
+                "/dav/personal/doc-1.ics",
+                Some("\"v1\""),
+                &master,
+                document,
+            )
+            .unwrap();
+
+        db.apply_local_calendar_edit(
+            id,
+            &EventEdits {
+                summary: Some("New".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let row = db.get_calendar_event_by_id(id).unwrap().unwrap();
+        let raw = row.raw_ics.as_deref().unwrap();
+        assert!(raw.starts_with("BEGIN:VCALENDAR"), "{raw}");
+        assert!(raw.contains("BEGIN:VTIMEZONE"));
+        assert!(raw.contains("PRODID:-//Example//EN"));
+        assert_eq!(raw.matches("BEGIN:VEVENT").count(), 2);
+        assert!(raw.contains("SUMMARY:New"));
+        assert!(raw.contains("SUMMARY:Old (moved)"));
+        // Indexed columns come from the master, not the override.
+        assert_eq!(row.summary, "New");
+        assert_eq!(row.local_status, CAL_STATUS_PENDING_UPDATE);
+    }
+
+    #[test]
+    fn calendar_has_unquoted_etags_detects_only_legacy_synced_rows() {
+        let db = MailDb::open_in_memory().unwrap();
+        let put = |uid: &str, href: &str, etag: Option<&str>| {
+            let event = sample_event(uid);
+            db.upsert_calendar_event(
+                ACCOUNT,
+                CAL_URL,
+                href,
+                etag,
+                &event,
+                event.raw.as_ref().unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(!db.calendar_has_unquoted_etags(ACCOUNT, CAL_URL).unwrap());
+
+        put("q", "/dav/personal/q.ics", Some("\"quoted\""));
+        put("w", "/dav/personal/w.ics", Some("W/\"weak\""));
+        put("n", "/dav/personal/n.ics", None);
+        assert!(!db.calendar_has_unquoted_etags(ACCOUNT, CAL_URL).unwrap());
+
+        // A never-uploaded local row with a bare etag is not "legacy".
+        put("l", &format!("{}l", LOCAL_HREF_PREFIX), Some("bare"));
+        assert!(!db.calendar_has_unquoted_etags(ACCOUNT, CAL_URL).unwrap());
+
+        put(
+            "u",
+            "/dav/personal/u.ics",
+            Some("0eb3f81ec60ce0758d8d394aab3f1f03"),
+        );
+        assert!(db.calendar_has_unquoted_etags(ACCOUNT, CAL_URL).unwrap());
+        // Other calendars are unaffected.
+        assert!(
+            !db.calendar_has_unquoted_etags(ACCOUNT, "https://cal.example.com/dav/other/")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -3154,5 +3367,69 @@ mod caldav_server_db_tests {
         let a_again = compute_etag(&ics("x", "A"));
         assert_ne!(a, b);
         assert_eq!(a, a_again);
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    fn seed(db: &MailDb, folder: &str, uid: u32, subject: &str) -> i64 {
+        db.store_email(
+            "personal",
+            folder,
+            uid,
+            "alice@example.com",
+            "bob@example.com",
+            subject,
+            &Local::now(),
+            true,
+            "preview",
+            &format!("body of {subject}"),
+            None,
+            "",
+            &format!("msg-{uid}"),
+            "",
+            "",
+            false,
+            &[],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn deleting_vanished_uids_removes_rows_fts_and_nothing_else() {
+        let db = MailDb::open_in_memory().unwrap();
+        let kept = seed(&db, "FRESHBOX", 1, "stays");
+        let moved = seed(&db, "FRESHBOX", 2, "moved elsewhere");
+        let other_folder = seed(&db, "INBOX", 2, "same uid, other folder");
+        let removed = db
+            .delete_emails_by_uid("personal", "FRESHBOX", &[2, 99])
+            .unwrap();
+        assert_eq!(removed, 1, "unknown uids are ignored");
+        let mut uids = db.get_all_uids("personal", "FRESHBOX").unwrap();
+        uids.sort();
+        assert_eq!(uids, vec![1]);
+        assert!(
+            db.has_email("personal", "INBOX", 2),
+            "other folders untouched"
+        );
+        let fts_rows = |id: i64| -> i64 {
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM emails_fts WHERE rowid = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(fts_rows(moved), 0);
+        assert_eq!(fts_rows(kept), 1);
+        assert_eq!(fts_rows(other_folder), 1);
+        assert_eq!(
+            db.delete_emails_by_uid("personal", "FRESHBOX", &[])
+                .unwrap(),
+            0
+        );
     }
 }
