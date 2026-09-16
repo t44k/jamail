@@ -3759,6 +3759,7 @@ impl App {
                     ("n", "Compose new email"),
                     ("/", "Search"),
                     ("F", "Folder selector"),
+                    ("u", "Sync now (all folders)"),
                     ("q", "Quit"),
                     ("?", "Toggle this help"),
                 ]);

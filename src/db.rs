@@ -7,7 +7,7 @@ use crate::calendar::{EventStatus, EventTime, VEvent};
 use crate::mail::{AttachmentData, Email, EmailContent, FolderInfo};
 use chrono::{DateTime, Local, TimeZone, Utc};
 
-const CURRENT_SCHEMA_VERSION: i32 = 7;
+const CURRENT_SCHEMA_VERSION: i32 = 8;
 
 pub struct AttachmentMeta {
     pub id: i64,
@@ -189,7 +189,7 @@ const MAIL_SCHEMA_SQL: &str = "DROP TABLE IF EXISTS emails_fts;
          DROP TABLE IF EXISTS schema_version;
 
          CREATE TABLE schema_version (version INTEGER NOT NULL);
-         INSERT INTO schema_version VALUES (7);
+         INSERT INTO schema_version VALUES (8);
 
          CREATE TABLE folders (
              account   TEXT NOT NULL,
@@ -223,6 +223,8 @@ const MAIL_SCHEMA_SQL: &str = "DROP TABLE IF EXISTS emails_fts;
 
          CREATE INDEX idx_emails_acct_folder_date ON emails(account, folder, date_ts DESC);
          CREATE INDEX idx_emails_message_id ON emails(message_id);
+         CREATE INDEX idx_emails_list ON emails(account, folder, date_ts DESC, id, uid, from_addr,
+             subject, is_unread, preview, message_id, in_reply_to, refs, has_attachments);
 
          CREATE TABLE sync_state (
              account     TEXT NOT NULL,
@@ -346,6 +348,21 @@ fn migrate_v5_to_v6_add_sync_log(conn: &Connection) -> Result<()> {
 /// v6 -> v7: `calendars.identity`, the address the CalDAV server says a
 /// calendar belongs to (jadav's `owner-identity`), which `jacal` uses as
 /// the `ORGANIZER` of events created there. Additive, like v5 and v6.
+/// v7 -> v8: a covering index for the folder list. `emails` rows carry the
+/// compressed bodies, so listing a 20k-message folder used to touch every
+/// row's page (over half a second on a multi-GB cache, felt as jamail's
+/// start-up stutter); with every listed column in the index the list is an
+/// index-only scan.
+fn migrate_v7_to_v8_add_list_index(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_emails_list ON emails(account, folder, date_ts DESC, id,
+             uid, from_addr, subject, is_unread, preview, message_id, in_reply_to, refs,
+             has_attachments);
+         UPDATE schema_version SET version = 8;",
+    )?;
+    Ok(())
+}
+
 fn migrate_v6_to_v7_add_calendar_identity(conn: &Connection) -> Result<()> {
     // The shared calendar DDL already carries the column on a database
     // created (or brought to v5) by this build; only add it when missing.
@@ -421,6 +438,10 @@ fn upgrade_schema(conn: &Connection) -> Result<()> {
         migrate_v6_to_v7_add_calendar_identity(conn)?;
         version = 7;
     }
+    if version == 7 {
+        migrate_v7_to_v8_add_list_index(conn)?;
+        version = 8;
+    }
     debug_assert_eq!(
         version, CURRENT_SCHEMA_VERSION,
         "upgrade_schema must always land exactly on CURRENT_SCHEMA_VERSION"
@@ -490,7 +511,7 @@ impl MailDb {
     #[cfg(test)]
     pub(crate) fn open_in_memory_legacy_v4() -> Result<Self> {
         let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
-        let sql = MAIL_SCHEMA_SQL.replacen("VALUES (7)", "VALUES (4)", 1);
+        let sql = MAIL_SCHEMA_SQL.replacen("VALUES (8)", "VALUES (4)", 1);
         conn.execute_batch(&sql)?;
         Ok(Self { conn })
     }
@@ -503,7 +524,7 @@ impl MailDb {
     pub(crate) fn open_in_memory_legacy_v5() -> Result<Self> {
         let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
         let sql = format!("{}\n{}", MAIL_SCHEMA_SQL, CALENDAR_SCHEMA_SQL).replacen(
-            "VALUES (7)",
+            "VALUES (8)",
             "VALUES (5)",
             1,
         );
@@ -705,7 +726,7 @@ impl MailDb {
 
     pub fn get_email_list(&self, account: &str, folder: &str) -> Result<Vec<Email>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, uid, from_addr, subject, date_ts, date_rfc3339, is_unread, preview,
+            "SELECT id, uid, from_addr, subject, date_ts, is_unread, preview,
                     message_id, in_reply_to, refs, has_attachments, account
              FROM emails WHERE account = ?1 AND folder = ?2
              ORDER BY date_ts DESC",
@@ -717,14 +738,13 @@ impl MailDb {
             let from: String = row.get(2)?;
             let subject: String = row.get(3)?;
             let date_ts: i64 = row.get(4)?;
-            let _date_rfc3339: String = row.get(5)?;
-            let is_unread: bool = row.get::<_, i32>(6)? != 0;
-            let preview: String = row.get(7)?;
-            let message_id: String = row.get(8)?;
-            let in_reply_to: String = row.get(9)?;
-            let references: String = row.get(10)?;
-            let has_attachments: bool = row.get::<_, i32>(11)? != 0;
-            let acct: String = row.get(12)?;
+            let is_unread: bool = row.get::<_, i32>(5)? != 0;
+            let preview: String = row.get(6)?;
+            let message_id: String = row.get(7)?;
+            let in_reply_to: String = row.get(8)?;
+            let references: String = row.get(9)?;
+            let has_attachments: bool = row.get::<_, i32>(10)? != 0;
+            let acct: String = row.get(11)?;
 
             let date = Local
                 .timestamp_opt(date_ts, 0)
@@ -804,7 +824,7 @@ impl MailDb {
 
     pub fn get_global_inbox(&self) -> Result<Vec<Email>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, uid, from_addr, subject, date_ts, date_rfc3339, is_unread, preview,
+            "SELECT id, uid, from_addr, subject, date_ts, is_unread, preview,
                     message_id, in_reply_to, refs, has_attachments, account
              FROM emails WHERE folder = 'INBOX'
              ORDER BY date_ts DESC",
@@ -816,14 +836,13 @@ impl MailDb {
             let from: String = row.get(2)?;
             let subject: String = row.get(3)?;
             let date_ts: i64 = row.get(4)?;
-            let _date_rfc3339: String = row.get(5)?;
-            let is_unread: bool = row.get::<_, i32>(6)? != 0;
-            let preview: String = row.get(7)?;
-            let message_id: String = row.get(8)?;
-            let in_reply_to: String = row.get(9)?;
-            let references: String = row.get(10)?;
-            let has_attachments: bool = row.get::<_, i32>(11)? != 0;
-            let acct: String = row.get(12)?;
+            let is_unread: bool = row.get::<_, i32>(5)? != 0;
+            let preview: String = row.get(6)?;
+            let message_id: String = row.get(7)?;
+            let in_reply_to: String = row.get(8)?;
+            let references: String = row.get(9)?;
+            let has_attachments: bool = row.get::<_, i32>(10)? != 0;
+            let acct: String = row.get(11)?;
 
             let date = Local
                 .timestamp_opt(date_ts, 0)

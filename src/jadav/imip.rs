@@ -1058,7 +1058,9 @@ pub fn run_inbound_watcher(
                 if client.select_folder(first).is_err() {
                     break 'session;
                 }
-                client.wait_for_changes(cfg.poll_interval);
+                if client.wait_for_changes(cfg.poll_interval).is_err() {
+                    break 'session;
+                }
             } else {
                 sleep_unless_shutdown(&shutdown, cfg.poll_interval);
             }

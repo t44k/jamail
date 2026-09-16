@@ -12,6 +12,8 @@ use std::time::Duration;
 pub struct MarkSeenRequest {
     pub folder: String,
     pub uid: u32,
+    /// How many times the server rejected this one; dropped after a few.
+    pub attempts: u32,
 }
 
 /// Which local-message flow an `UploadRequest` belongs to. Both share the
@@ -59,7 +61,29 @@ pub struct SyncControl {
     pub folder_filter: RwLock<Vec<String>>,
     pub mark_seen_queue: Mutex<Vec<MarkSeenRequest>>,
     pub upload_queue: Mutex<Vec<UploadRequest>>,
+    /// Run a full pass now (jamail's `u`), cutting the IDLE period short.
+    pub force_sync: AtomicBool,
+    /// `(folder, uid)` the user read in jamail recently, with when: the flag
+    /// sync must not flip these back to unread on a stale server answer
+    /// while the `\Seen` store is still in flight (see
+    /// `MailClient::sync_flags`). Entries expire after
+    /// [`RECENTLY_SEEN_TTL`].
+    recently_seen: Mutex<HashMap<(String, u32), std::time::Instant>>,
 }
+
+/// How long a locally read message is shielded from a stale "unseen".
+pub const RECENTLY_SEEN_TTL: Duration = Duration::from_secs(600);
+/// One IDLE round: short enough that a queued mark-seen, upload or `u`
+/// request is acted on within seconds, long enough not to spam the server.
+pub const IDLE_CHUNK: Duration = Duration::from_secs(10);
+/// How long the daemon idles on the current folder before it polls every
+/// other folder for new mail again.
+pub const IDLE_PHASE: Duration = Duration::from_secs(60);
+/// How often the flags (and pruning) of *every* folder are refreshed; the
+/// current folder's are refreshed on every pass.
+pub const FULL_FLAG_SYNC_INTERVAL: Duration = Duration::from_secs(300);
+/// Give up on a mark-seen the server keeps rejecting after this many tries.
+pub const MARK_SEEN_MAX_ATTEMPTS: u32 = 3;
 
 impl SyncControl {
     pub fn new(initial_folder: &str) -> Self {
@@ -70,8 +94,128 @@ impl SyncControl {
             folder_filter: RwLock::new(vec![initial_folder.to_string()]),
             mark_seen_queue: Mutex::new(Vec::new()),
             upload_queue: Mutex::new(Vec::new()),
+            force_sync: AtomicBool::new(false),
+            recently_seen: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Queue a `\Seen` store for `(folder, uid)` and shield it from a
+    /// stale server answer meanwhile.
+    pub fn enqueue_mark_seen(&self, folder: String, uid: u32) {
+        if let Ok(mut seen) = self.recently_seen.lock() {
+            let now = std::time::Instant::now();
+            seen.retain(|_, at| now.duration_since(*at) < RECENTLY_SEEN_TTL);
+            seen.insert((folder.clone(), uid), now);
+        }
+        if let Ok(mut q) = self.mark_seen_queue.lock() {
+            q.push(MarkSeenRequest {
+                folder,
+                uid,
+                attempts: 0,
+            });
+        }
+    }
+
+    /// Whether the user read `(folder, uid)` in jamail within
+    /// [`RECENTLY_SEEN_TTL`].
+    pub fn recently_seen(&self, folder: &str, uid: u32) -> bool {
+        self.recently_seen
+            .lock()
+            .map(|seen| {
+                seen.get(&(folder.to_string(), uid))
+                    .is_some_and(|at| at.elapsed() < RECENTLY_SEEN_TTL)
+            })
+            .unwrap_or(false)
+    }
+
+    fn has_pending_actions(&self) -> bool {
+        self.mark_seen_queue
+            .lock()
+            .map(|q| !q.is_empty())
+            .unwrap_or(false)
+            || self
+                .upload_queue
+                .lock()
+                .map(|q| !q.is_empty())
+                .unwrap_or(false)
+    }
+}
+
+/// Apply everything jamail queued — `\Seen` stores and Sent/Draft
+/// uploads — on the live connection. A mark-seen the server rejects goes
+/// back on the queue for another try (up to [`MARK_SEEN_MAX_ATTEMPTS`]);
+/// an upload's outcome is reported once. `Err` means the connection itself
+/// failed and the caller should reconnect (the queues keep their items).
+fn apply_pending_actions(
+    client: &mut MailClient,
+    control: &SyncControl,
+    tx: &Sender<SyncEvent>,
+) -> Result<(), ()> {
+    let requests: Vec<MarkSeenRequest> = control
+        .mark_seen_queue
+        .lock()
+        .map(|mut q| q.drain(..).collect())
+        .unwrap_or_default();
+    if !requests.is_empty() {
+        let mut by_folder: HashMap<String, Vec<MarkSeenRequest>> = HashMap::new();
+        for req in requests {
+            by_folder.entry(req.folder.clone()).or_default().push(req);
+        }
+        for (folder, reqs) in by_folder {
+            let uids: Vec<u32> = reqs.iter().map(|r| r.uid).collect();
+            if let Err(e) = client
+                .select_folder(&folder)
+                .and_then(|_| client.mark_seen(&uids))
+            {
+                let _ = tx.send(SyncEvent::Error(format!("Mark seen {}: {}", folder, e)));
+                let mut gave_up = false;
+                if let Ok(mut q) = control.mark_seen_queue.lock() {
+                    for mut r in reqs {
+                        r.attempts += 1;
+                        if r.attempts < MARK_SEEN_MAX_ATTEMPTS {
+                            q.push(r);
+                        } else {
+                            gave_up = true;
+                        }
+                    }
+                }
+                if gave_up {
+                    let _ = tx.send(SyncEvent::Error(format!(
+                        "Mark seen {}: giving up after {} attempts",
+                        folder, MARK_SEEN_MAX_ATTEMPTS
+                    )));
+                }
+                // A rejected STORE usually means the connection is gone;
+                // let the caller reconnect and retry the rest.
+                return Err(());
+            }
+        }
+    }
+
+    let uploads: Vec<UploadRequest> = control
+        .upload_queue
+        .lock()
+        .map(|mut q| q.drain(..).collect())
+        .unwrap_or_default();
+    for req in uploads {
+        let flags: &[imap::types::Flag<'_>] = match req.kind {
+            UploadKind::Sent => &[imap::types::Flag::Seen],
+            UploadKind::Draft => &[imap::types::Flag::Draft, imap::types::Flag::Seen],
+        };
+        match client.append_message(&req.folder, &req.raw_message, flags) {
+            Ok(()) => {
+                let _ = tx.send(SyncEvent::UploadComplete(req.kind, req.local_id));
+            }
+            Err(e) => {
+                let _ = tx.send(SyncEvent::UploadError(
+                    req.kind,
+                    req.local_id,
+                    e.to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn spawn_sync_thread(
@@ -90,6 +234,9 @@ fn sync_loop(
     tx: Sender<SyncEvent>,
 ) {
     let mut quick_reconnect = false;
+    // Consecutive failed connection attempts: back off 5 s → 60 s so an
+    // outage is not hammered, reset by any successful connection.
+    let mut connect_failures: u32 = 0;
 
     loop {
         if control.shutdown.load(Ordering::Relaxed) {
@@ -115,12 +262,17 @@ fn sync_loop(
         }
 
         let mut client = match MailClient::connect(&account) {
-            Ok(c) => c,
+            Ok(c) => {
+                connect_failures = 0;
+                c
+            }
             Err(e) => {
                 if tx.send(SyncEvent::Error(format!("{}", e))).is_err() {
                     return;
                 }
-                thread::sleep(Duration::from_secs(5));
+                let delay = 5u64.saturating_mul(1u64 << connect_failures.min(4)).min(60);
+                connect_failures = connect_failures.saturating_add(1);
+                thread::sleep(Duration::from_secs(delay));
                 continue;
             }
         };
@@ -164,10 +316,22 @@ fn sync_loop(
             }
         }
 
-        // Inner loop: sync all folders → IDLE on current → repeat
-        loop {
+        // Inner loop: apply queued actions → sync folders → IDLE on the
+        // current folder in short rounds → repeat. Every round of IDLE ends
+        // within IDLE_CHUNK, so a mark-seen, an upload or a `u` request is
+        // acted on within seconds; new mail in the current folder ends the
+        // round at once; every IDLE_PHASE the other folders are polled too.
+        let mut last_full_flags = std::time::Instant::now() - FULL_FLAG_SYNC_INTERVAL;
+        'connected: loop {
             if control.shutdown.load(Ordering::Relaxed) {
                 return;
+            }
+
+            // Pending user actions first: a message read in jamail must be
+            // \Seen on the server before this pass reads the flags back.
+            if apply_pending_actions(&mut client, &control, &tx).is_err() {
+                quick_reconnect = true;
+                break 'connected;
             }
 
             let folders_to_sync: Vec<String> = control
@@ -175,6 +339,12 @@ fn sync_loop(
                 .read()
                 .map(|f| f.clone())
                 .unwrap_or_default();
+            let current = control
+                .current_folder
+                .read()
+                .map(|f| f.clone())
+                .unwrap_or_else(|_| "INBOX".to_string());
+            let full_flags = last_full_flags.elapsed() >= FULL_FLAG_SYNC_INTERVAL;
 
             let mut had_error = false;
             for folder in &folders_to_sync {
@@ -190,15 +360,22 @@ fn sync_loop(
                     Ok(count) => {
                         let _ = tx.send(SyncEvent::FolderComplete(folder.clone(), count));
 
-                        // Sync flags from server for this folder
-                        match client.sync_flags(&db, &account_name, folder) {
-                            Ok(true) => {
-                                let _ = tx.send(SyncEvent::FlagsChanged(folder.clone()));
-                            }
-                            Ok(false) => {}
-                            Err(e) => {
-                                let _ = tx
-                                    .send(SyncEvent::Error(format!("Flag sync {}: {}", folder, e)));
+                        // Flags (and pruning of moved-away mail): the folder
+                        // on screen every pass, every folder every
+                        // FULL_FLAG_SYNC_INTERVAL.
+                        if full_flags || *folder == current {
+                            let shield = |uid: u32| control.recently_seen(folder, uid);
+                            match client.sync_flags(&db, &account_name, folder, &shield) {
+                                Ok(true) => {
+                                    let _ = tx.send(SyncEvent::FlagsChanged(folder.clone()));
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    let _ = tx.send(SyncEvent::Error(format!(
+                                        "Flag sync {}: {}",
+                                        folder, e
+                                    )));
+                                }
                             }
                         }
                     }
@@ -209,95 +386,70 @@ fn sync_loop(
                     }
                 }
             }
+            if full_flags {
+                last_full_flags = std::time::Instant::now();
+            }
 
             if had_error {
-                break; // Reconnect
+                break 'connected; // Reconnect
             }
 
             let _ = tx.send(SyncEvent::AllComplete);
 
-            // Drain mark-seen queue and apply on server
-            if let Ok(mut queue) = control.mark_seen_queue.lock() {
-                let requests: Vec<MarkSeenRequest> = queue.drain(..).collect();
-                drop(queue);
-
-                if !requests.is_empty() {
-                    let mut by_folder: HashMap<String, Vec<u32>> = HashMap::new();
-                    for req in requests {
-                        by_folder.entry(req.folder).or_default().push(req.uid);
-                    }
-                    for (folder, uids) in &by_folder {
-                        if let Err(e) = client
-                            .select_folder(folder)
-                            .and_then(|_| client.mark_seen(uids))
-                        {
-                            let _ =
-                                tx.send(SyncEvent::Error(format!("Mark seen {}: {}", folder, e)));
-                        }
-                    }
-                }
-            }
-
-            // Drain pending Sent/Draft uploads and APPEND them on the server.
-            if let Ok(mut queue) = control.upload_queue.lock() {
-                let requests: Vec<UploadRequest> = queue.drain(..).collect();
-                drop(queue);
-
-                for req in requests {
-                    let flags: &[imap::types::Flag<'_>] = match req.kind {
-                        UploadKind::Sent => &[imap::types::Flag::Seen],
-                        UploadKind::Draft => &[imap::types::Flag::Draft, imap::types::Flag::Seen],
-                    };
-                    match client.append_message(&req.folder, &req.raw_message, flags) {
-                        Ok(()) => {
-                            let _ = tx.send(SyncEvent::UploadComplete(req.kind, req.local_id));
-                        }
-                        Err(e) => {
-                            let _ = tx.send(SyncEvent::UploadError(
-                                req.kind,
-                                req.local_id,
-                                e.to_string(),
-                            ));
-                        }
-                    }
-                }
-            }
-
-            // Check force_reconnect before IDLE
             if control.force_reconnect.swap(false, Ordering::Relaxed) {
                 let _ = tx.send(SyncEvent::Error("Reconnecting after wake".to_string()));
                 quick_reconnect = true;
-                break;
+                break 'connected;
             }
 
-            // SELECT the current folder for IDLE
-            let current = control
-                .current_folder
-                .read()
-                .map(|f| f.clone())
-                .unwrap_or_else(|_| "INBOX".to_string());
-
-            // Need to SELECT the folder before IDLE
+            // IDLE phase on the current folder, in short rounds.
             if client.select_folder(&current).is_err() {
-                break; // Connection issue
+                break 'connected; // Connection issue
             }
+            let phase_start = std::time::Instant::now();
+            loop {
+                if control.shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                if control.force_sync.swap(false, Ordering::Relaxed) {
+                    break; // full pass now
+                }
+                if control.force_reconnect.swap(false, Ordering::Relaxed) {
+                    let _ = tx.send(SyncEvent::Error("Reconnecting after wake".to_string()));
+                    quick_reconnect = true;
+                    break 'connected;
+                }
+                if control.has_pending_actions()
+                    && (apply_pending_actions(&mut client, &control, &tx).is_err()
+                        || client.select_folder(&current).is_err())
+                {
+                    quick_reconnect = true;
+                    break 'connected;
+                }
 
-            // IDLE waits for new mail or 60s timeout
-            let before_idle = std::time::Instant::now();
-            client.wait_for_changes(Duration::from_secs(60));
-
-            // If IDLE returned after much longer than the timeout, sleep/wake likely occurred
-            if before_idle.elapsed() > Duration::from_secs(90) {
-                let _ = tx.send(SyncEvent::Error("Reconnecting after sleep".to_string()));
-                quick_reconnect = true;
-                break;
-            }
-
-            // Check force_reconnect after IDLE
-            if control.force_reconnect.swap(false, Ordering::Relaxed) {
-                let _ = tx.send(SyncEvent::Error("Reconnecting after wake".to_string()));
-                quick_reconnect = true;
-                break;
+                let before_idle = std::time::Instant::now();
+                let outcome = client.wait_for_changes(IDLE_CHUNK);
+                // Far longer than asked: the machine slept; the socket is
+                // probably stale even if it looks alive.
+                if before_idle.elapsed() > IDLE_CHUNK + Duration::from_secs(30) {
+                    let _ = tx.send(SyncEvent::Error("Reconnecting after sleep".to_string()));
+                    quick_reconnect = true;
+                    break 'connected;
+                }
+                match outcome {
+                    Err(e) => {
+                        let _ = tx.send(SyncEvent::Error(format!("IDLE: {}; reconnecting", e)));
+                        quick_reconnect = true;
+                        break 'connected;
+                    }
+                    // New mail (or a change) in the folder on screen: fetch
+                    // it now, along with everything else that is due.
+                    Ok(imap::extensions::idle::WaitOutcome::MailboxChanged) => break,
+                    Ok(imap::extensions::idle::WaitOutcome::TimedOut) => {}
+                }
+                if phase_start.elapsed() >= IDLE_PHASE {
+                    break; // periodic poll of every folder
+                }
             }
         }
 

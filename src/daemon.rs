@@ -48,7 +48,7 @@ use crate::config::{JamailAccount, JamailConfig};
 use crate::db;
 use crate::ipc::{self, ClientHello, Request, Response, ServerHello, ServerMessage};
 use crate::notify;
-use crate::sync::{self, MarkSeenRequest, SyncControl, SyncEvent, UploadRequest};
+use crate::sync::{self, SyncControl, SyncEvent, UploadRequest};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io;
@@ -273,9 +273,7 @@ fn handle_request(daemon: &Daemon, req: Request) -> Response {
             folder,
             uid,
         } => with_account(daemon, &account, |rt| {
-            if let Ok(mut q) = rt.control.mark_seen_queue.lock() {
-                q.push(MarkSeenRequest { folder, uid });
-            }
+            rt.control.enqueue_mark_seen(folder, uid);
         }),
         Request::EnqueueUpload {
             account,
@@ -307,6 +305,9 @@ fn handle_request(daemon: &Daemon, req: Request) -> Response {
         }
         Request::ForceReconnect { account } => with_account(daemon, &account, |rt| {
             rt.control.force_reconnect.store(true, Ordering::Relaxed);
+        }),
+        Request::SyncNow { account } => with_account(daemon, &account, |rt| {
+            rt.control.force_sync.store(true, Ordering::Relaxed);
         }),
         Request::Shutdown => {
             daemon.trigger_graceful_shutdown();

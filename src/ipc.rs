@@ -269,6 +269,9 @@ pub enum Request {
     /// each account's loop also detects this independently via its own IDLE
     /// timing, so this is a latency optimization, not the only path).
     ForceReconnect { account: String },
+    /// Run a full sync pass for the account now instead of at the end of
+    /// the current IDLE period (jamail's `u` key).
+    SyncNow { account: String },
     /// Ask the daemon to shut down gracefully (see module docs). Answered
     /// with [`Response::Ok`] before the daemon begins tearing down.
     Shutdown,
