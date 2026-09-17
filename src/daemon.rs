@@ -214,6 +214,11 @@ fn spawn_pump(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         while let Ok(ev) = rx.recv() {
+            // Sync trouble must be visible without a client attached: the
+            // journal is where an unattended daemon's problems are read.
+            if let SyncEvent::Error(msg) = &ev {
+                eprintln!("jamaild: {}: {}", account, msg);
+            }
             dispatch_sync_event(&account, &cfg, &ev, notifier.as_ref());
             daemon.broadcast(ServerMessage::Event(ipc::wire_event(&account, &ev)));
         }
@@ -222,10 +227,8 @@ fn spawn_pump(
 
 /// Calendar-sync counterpart to [`spawn_pump`]: drains one account's
 /// `CalSyncEvent`s and broadcasts each, tagged, to every connected client.
-/// Unlike mail sync, calendar events currently carry no notification
-/// decision of their own here — calendar alarm notifications are
-/// delivered by `jacal` itself (see `calnotify` module docs for why that's
-/// a different ownership model than mail's daemon-owned notifications).
+/// Calendar events carry no notification decision here — calendar alarms
+/// come from `calnotify::run_alarm_loop`, on its own thread.
 fn spawn_cal_pump(
     daemon: Arc<Daemon>,
     account: String,
@@ -305,6 +308,9 @@ fn handle_request(daemon: &Daemon, req: Request) -> Response {
         }
         Request::ForceReconnect { account } => with_account(daemon, &account, |rt| {
             rt.control.force_reconnect.store(true, Ordering::Relaxed);
+            // A wake from suspend usually leaves the socket dead: cut it so
+            // a read the sync thread is blocked in fails right away.
+            rt.control.abort_connection();
         }),
         Request::SyncNow { account } => with_account(daemon, &account, |rt| {
             rt.control.force_sync.store(true, Ordering::Relaxed);
@@ -568,10 +574,27 @@ pub fn run_with_notifier(notifier: Notifier) -> Result<()> {
         let daemon = Arc::clone(&daemon);
         let socket_path = socket_path.clone();
         thread::spawn(move || {
+            let mut last_watchdog = std::time::Instant::now();
             loop {
                 if SIGNAL_RECEIVED.load(Ordering::SeqCst) || daemon.shutdown_requested() {
                     let _ = std::fs::remove_file(&socket_path);
                     std::process::exit(0);
+                }
+                // Stall watchdog: a sync loop with no sign of life for
+                // `sync::STALL_TIMEOUT` is blocked on a dead connection; cut
+                // it so the read fails and the loop reconnects.
+                if last_watchdog.elapsed() >= Duration::from_secs(10) {
+                    last_watchdog = std::time::Instant::now();
+                    for (name, rt) in &daemon.accounts {
+                        let silent = rt.control.seconds_since_progress();
+                        if silent > sync::STALL_TIMEOUT.as_secs() && rt.control.abort_connection() {
+                            eprintln!(
+                                "jamaild: {}: no sync progress for {}s; cutting the IMAP connection to force a reconnect",
+                                name, silent
+                            );
+                            rt.control.touch_progress();
+                        }
+                    }
                 }
                 thread::sleep(Duration::from_millis(100));
             }
