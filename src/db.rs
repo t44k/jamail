@@ -357,24 +357,48 @@ fn migrate_v5_to_v6_add_sync_log(conn: &Connection) -> Result<()> {
 /// v8 -> v9: `emails.is_flagged` (IMAP `\\Flagged`, the star), and the
 /// covering list index rebuilt to include it. Additive.
 fn migrate_v8_to_v9_add_flagged(conn: &Connection) -> Result<()> {
-    let has_flagged = conn
-        .prepare("PRAGMA table_info(emails)")?
-        .query_map([], |r| r.get::<_, String>(1))?
-        .filter_map(|r| r.ok())
-        .any(|name| name == "is_flagged");
-    if !has_flagged {
-        conn.execute(
-            "ALTER TABLE emails ADD COLUMN is_flagged INTEGER NOT NULL DEFAULT 0",
-            [],
+    // Several connections (the sync thread, the alarm clock, a client) may
+    // open the cache at the same moment and all read "version 8": take the
+    // write lock first and re-check, so exactly one of them migrates and
+    // the others find the work done instead of tripping over half of it.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        let version: i32 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if version >= 9 {
+            return Ok(());
+        }
+        let has_flagged = conn
+            .prepare("PRAGMA table_info(emails)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "is_flagged");
+        if !has_flagged {
+            conn.execute(
+                "ALTER TABLE emails ADD COLUMN is_flagged INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_emails_list;
+             CREATE INDEX IF NOT EXISTS idx_emails_list ON emails(account, folder, date_ts DESC,
+                 id, uid, from_addr, subject, is_unread, preview, message_id, in_reply_to, refs,
+                 has_attachments, is_flagged);
+             UPDATE schema_version SET version = 9;",
         )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
     }
-    conn.execute_batch(
-        "DROP INDEX IF EXISTS idx_emails_list;
-         CREATE INDEX idx_emails_list ON emails(account, folder, date_ts DESC, id, uid, from_addr,
-             subject, is_unread, preview, message_id, in_reply_to, refs, has_attachments, is_flagged);
-         UPDATE schema_version SET version = 9;",
-    )?;
-    Ok(())
 }
 
 fn migrate_v7_to_v8_add_list_index(conn: &Connection) -> Result<()> {
@@ -3556,5 +3580,29 @@ mod flag_tests {
                 .is_flagged
         );
         assert_eq!(db.schema_version_for_test(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn the_v9_migration_is_harmless_when_another_connection_already_ran_it() {
+        let db = MailDb::open_in_memory().unwrap();
+        // A connection that read "version 8" before another one finished
+        // migrating: the column and index already exist.
+        db.conn
+            .execute("UPDATE schema_version SET version = 8", [])
+            .unwrap();
+        migrate_v8_to_v9_add_flagged(&db.conn).unwrap();
+        assert_eq!(db.schema_version_for_test(), 9);
+        // And once at 9, a stale caller does nothing at all.
+        migrate_v8_to_v9_add_flagged(&db.conn).unwrap();
+        assert_eq!(db.schema_version_for_test(), 9);
+        assert!(
+            db.conn
+                .prepare("PRAGMA index_info(idx_emails_list)")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(2))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .any(|c| c == "is_flagged")
+        );
     }
 }
