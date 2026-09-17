@@ -5,6 +5,7 @@ use imap::extensions::idle;
 use mailparse::{DispositionType, MailHeaderMap, parse_mail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::net::TcpStream;
 use std::time::Duration;
 
 use crate::config::JamailAccount;
@@ -81,6 +82,79 @@ const PROCESS_PARALLELISM: usize = 8;
 
 pub struct MailClient {
     session: imap::Session<Connection>,
+    /// A second handle on the TCP socket under the TLS session (implicit-TLS
+    /// connections only): lets us bound reads the `imap` crate performs
+    /// without a timeout and lets another thread cut a dead connection —
+    /// see [`Self::abort_handle`].
+    raw: Option<TcpStream>,
+}
+
+/// How long any single read on the session may block before the
+/// connection is declared dead and rebuilt. Generous enough for a large
+/// message batch on a slow link; the point is that *forever* is off the
+/// table — a laptop that suspends or changes networks leaves the socket
+/// locally "established" while the peer is long gone.
+pub const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(300);
+/// Bound on the `DONE` reply read that ends every IDLE round (the `imap`
+/// crate clears the socket's read timeout right before it).
+const IDLE_DONE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Establishing the TCP connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// TCP keepalive: probe after 30 s of silence, every 10 s, give up after
+/// 3 misses — the kernel then fails the blocked read within about a minute
+/// of the peer disappearing, IDLE round or not.
+const KEEPALIVE: (Duration, Duration, u32) = (Duration::from_secs(30), Duration::from_secs(10), 3);
+
+/// A handle that can cut a [`MailClient`]'s connection from another
+/// thread: `shutdown` on the shared socket makes any read the client is
+/// blocked in return an error, so its loop reconnects instead of hanging.
+#[derive(Debug)]
+pub struct ConnectionAbort(pub(crate) TcpStream);
+
+impl ConnectionAbort {
+    pub fn abort(&self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// Keepalive and timeouts on the raw socket, before TLS wraps it.
+fn configure_socket(tcp: &TcpStream) -> Result<()> {
+    let sock = socket2::SockRef::from(tcp);
+    let (time, interval, retries) = KEEPALIVE;
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(time)
+        .with_interval(interval)
+        .with_retries(retries);
+    sock.set_tcp_keepalive(&keepalive)
+        .context("setting TCP keepalive")?;
+    tcp.set_read_timeout(Some(SESSION_READ_TIMEOUT))?;
+    tcp.set_write_timeout(Some(SESSION_READ_TIMEOUT))?;
+    tcp.set_nodelay(true)?;
+    Ok(())
+}
+
+/// Connect to `host:port`, trying each resolved address with a bounded
+/// connect, so an unreachable network fails fast instead of hanging.
+fn connect_tcp(host: &str, port: u16) -> Result<TcpStream> {
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<std::net::SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolving {}:{}", host, port))?
+        .collect();
+    let mut last: Option<std::io::Error> = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(tcp) => return Ok(tcp),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "Failed to connect to IMAP server {}:{}: {}",
+        host,
+        port,
+        last.map(|e| e.to_string())
+            .unwrap_or_else(|| "no addresses".to_string())
+    ))
 }
 
 /// One message fetched by [`MailClient::fetch_new_bodies`].
@@ -104,15 +178,45 @@ impl MailClient {
     pub fn connect_imap(imap_cfg: &crate::config::ImapConfig) -> Result<Self> {
         let password = imap_cfg.auth.resolve_password()?;
 
-        let client = imap::ClientBuilder::new(imap_cfg.host.as_str(), imap_cfg.port)
-            .connect()
-            .context("Failed to connect to IMAP server")?;
+        // Implicit TLS (993): build the connection ourselves so the socket
+        // gets keepalive and read timeouts, and keep a handle on it. Other
+        // ports go through the crate's STARTTLS negotiation as before.
+        let (client, raw) = if imap_cfg.port == 993 {
+            let tcp = connect_tcp(&imap_cfg.host, imap_cfg.port)?;
+            configure_socket(&tcp)?;
+            let raw = tcp.try_clone().ok();
+            let tls = native_tls::TlsConnector::new()
+                .context("building the TLS connector")?
+                .connect(&imap_cfg.host, tcp)
+                .map_err(|e| {
+                    anyhow::anyhow!("TLS handshake with {} failed: {}", imap_cfg.host, e)
+                })?;
+            let mut client = imap::Client::new(Box::new(tls) as Connection);
+            client.read_greeting().map_err(|e| {
+                anyhow::anyhow!("IMAP greeting from {} failed: {}", imap_cfg.host, e)
+            })?;
+            (client, raw)
+        } else {
+            let client = imap::ClientBuilder::new(imap_cfg.host.as_str(), imap_cfg.port)
+                .connect()
+                .context("Failed to connect to IMAP server")?;
+            (client, None)
+        };
 
         let session = client
             .login(&imap_cfg.login, &password)
             .map_err(|e| anyhow::anyhow!("IMAP login failed: {}", e.0))?;
 
-        Ok(Self { session })
+        Ok(Self { session, raw })
+    }
+
+    /// A handle another thread can use to cut this connection (a stalled
+    /// sync loop, a wake from suspend). `None` for STARTTLS connections.
+    pub fn abort_handle(&self) -> Option<ConnectionAbort> {
+        self.raw
+            .as_ref()
+            .and_then(|r| r.try_clone().ok())
+            .map(ConnectionAbort)
     }
 
     /// SELECT a folder and report its `UIDVALIDITY` and `UIDNEXT`.
@@ -414,9 +518,23 @@ impl MailClient {
     /// (the `DONE` that ends the IDLE could not be exchanged) — the caller
     /// should reconnect rather than keep waiting on a dead socket.
     pub fn wait_for_changes(&mut self, timeout: Duration) -> Result<idle::WaitOutcome> {
-        let mut handle = self.session.idle();
-        handle.timeout(timeout).keepalive(false);
-        handle.wait_while(idle::stop_on_any).context("IDLE failed")
+        let raw = self.raw.as_ref().and_then(|r| r.try_clone().ok());
+        let outcome = {
+            let mut handle = self.session.idle();
+            handle.timeout(timeout).keepalive(false);
+            let res = handle.wait_while(idle::stop_on_any);
+            // The crate has just cleared the socket's read timeout and is
+            // about to send DONE and wait for the reply when `handle`
+            // drops; bound that wait, or a dead peer holds us forever.
+            if let Some(r) = &raw {
+                let _ = r.set_read_timeout(Some(IDLE_DONE_TIMEOUT));
+            }
+            res
+        };
+        if let Some(r) = &raw {
+            let _ = r.set_read_timeout(Some(SESSION_READ_TIMEOUT));
+        }
+        outcome.context("IDLE failed")
     }
 
     /// Mark the given UIDs as \Seen on the server.

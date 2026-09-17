@@ -1,9 +1,9 @@
 use crate::config::JamailAccount;
 use crate::db::MailDb;
-use crate::mail::{FolderInfo, MailClient};
+use crate::mail::{ConnectionAbort, FolderInfo, MailClient};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -69,6 +69,12 @@ pub struct SyncControl {
     /// `MailClient::sync_flags`). Entries expire after
     /// [`RECENTLY_SEEN_TTL`].
     recently_seen: Mutex<HashMap<(String, u32), std::time::Instant>>,
+    /// Cuts the live IMAP connection from another thread — the daemon's
+    /// stall watchdog and `ForceReconnect` use it (see `MailClient::abort_handle`).
+    abort: Mutex<Option<ConnectionAbort>>,
+    /// Unix seconds of the sync loop's last sign of life (every IDLE round,
+    /// every fetch batch). The watchdog compares it with [`STALL_TIMEOUT`].
+    last_progress: AtomicU64,
 }
 
 /// How long a locally read message is shielded from a stale "unseen".
@@ -84,6 +90,11 @@ pub const IDLE_PHASE: Duration = Duration::from_secs(60);
 pub const FULL_FLAG_SYNC_INTERVAL: Duration = Duration::from_secs(300);
 /// Give up on a mark-seen the server keeps rejecting after this many tries.
 pub const MARK_SEEN_MAX_ATTEMPTS: u32 = 3;
+/// A sync loop silent for this long is stuck on a dead connection (its
+/// IDLE rounds are 10 s and every fetch batch reports); the daemon's
+/// watchdog then cuts the socket so the blocked read fails and the loop
+/// reconnects. Matches `mail::SESSION_READ_TIMEOUT`.
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 impl SyncControl {
     pub fn new(initial_folder: &str) -> Self {
@@ -96,6 +107,40 @@ impl SyncControl {
             upload_queue: Mutex::new(Vec::new()),
             force_sync: AtomicBool::new(false),
             recently_seen: Mutex::new(HashMap::new()),
+            abort: Mutex::new(None),
+            last_progress: AtomicU64::new(now_secs()),
+        }
+    }
+
+    /// Note that the sync loop is alive.
+    pub fn touch_progress(&self) {
+        self.last_progress.store(now_secs(), Ordering::Relaxed);
+    }
+
+    /// Seconds since the sync loop last reported progress.
+    pub fn seconds_since_progress(&self) -> u64 {
+        now_secs().saturating_sub(self.last_progress.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn set_abort(&self, handle: Option<ConnectionAbort>) {
+        if let Ok(mut slot) = self.abort.lock() {
+            *slot = handle;
+        }
+    }
+
+    /// Cut the live IMAP connection so a read the sync thread is blocked in
+    /// fails and the loop reconnects. `false` when there is no connection
+    /// (or no handle on it) to cut.
+    pub fn abort_connection(&self) -> bool {
+        match self.abort.lock() {
+            Ok(slot) => match slot.as_ref() {
+                Some(h) => {
+                    h.abort();
+                    true
+                }
+                None => false,
+            },
+            Err(_) => false,
         }
     }
 
@@ -227,6 +272,13 @@ pub fn spawn_sync_thread(
     thread::spawn(move || sync_loop(account, account_name, control, tx))
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn sync_loop(
     account: JamailAccount,
     account_name: String,
@@ -242,6 +294,8 @@ fn sync_loop(
         if control.shutdown.load(Ordering::Relaxed) {
             return;
         }
+        control.set_abort(None);
+        control.touch_progress();
 
         let db = match MailDb::open() {
             Ok(db) => db,
@@ -264,6 +318,8 @@ fn sync_loop(
         let mut client = match MailClient::connect(&account) {
             Ok(c) => {
                 connect_failures = 0;
+                control.set_abort(c.abort_handle());
+                control.touch_progress();
                 c
             }
             Err(e) => {
@@ -326,6 +382,7 @@ fn sync_loop(
             if control.shutdown.load(Ordering::Relaxed) {
                 return;
             }
+            control.touch_progress();
 
             // Pending user actions first: a message read in jamail must be
             // \Seen on the server before this pass reads the flags back.
@@ -355,6 +412,7 @@ fn sync_loop(
                 let _ = tx.send(SyncEvent::Syncing(folder.clone()));
 
                 match client.sync_folder(&db, &account_name, folder, &|done, total| {
+                    control.touch_progress();
                     let _ = tx.send(SyncEvent::Progress(folder.clone(), done, total));
                 }) {
                     Ok(count) => {
@@ -427,6 +485,7 @@ fn sync_loop(
                     break 'connected;
                 }
 
+                control.touch_progress();
                 let before_idle = std::time::Instant::now();
                 let outcome = client.wait_for_changes(IDLE_CHUNK);
                 // Far longer than asked: the machine slept; the socket is
@@ -453,6 +512,7 @@ fn sync_loop(
             }
         }
 
+        control.set_abort(None);
         // Connection lost — wait before reconnecting (skip delay after wake detection)
         if !quick_reconnect {
             thread::sleep(Duration::from_secs(5));
@@ -503,5 +563,50 @@ mod pending_action_tests {
                 .unwrap()
                 .contains_key(&("INBOX".to_string(), 8))
         );
+    }
+}
+
+#[cfg(test)]
+mod abort_tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn abort_connection_unblocks_a_read_and_progress_is_tracked() {
+        let control = SyncControl::new("INBOX");
+        assert!(!control.abort_connection(), "nothing to cut yet");
+        assert!(control.seconds_since_progress() < 5);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (_server_side, _) = listener.accept().unwrap();
+        control.set_abort(Some(ConnectionAbort(client.try_clone().unwrap())));
+
+        // A reader blocked on the socket, like the sync thread inside IDLE
+        // on a dead connection…
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 1];
+            let mut c = client;
+            c.read(&mut buf)
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        // …returns as soon as the watchdog cuts the connection.
+        assert!(control.abort_connection());
+        let outcome = reader.join().unwrap();
+        assert!(
+            matches!(outcome, Ok(0)) || outcome.is_err(),
+            "read should end: {outcome:?}"
+        );
+
+        control
+            .last_progress
+            .store(now_secs() - STALL_TIMEOUT.as_secs() - 1, Ordering::Relaxed);
+        assert!(control.seconds_since_progress() > STALL_TIMEOUT.as_secs());
+        control.touch_progress();
+        assert!(control.seconds_since_progress() < 5);
+        control.set_abort(None);
+        assert!(!control.abort_connection());
     }
 }
