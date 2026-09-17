@@ -30,6 +30,8 @@ pub const THREAD_BRANCH: Color = Color::Rgb(60, 60, 80);
 pub const ATTACHMENT_COLOR: Color = Color::Rgb(180, 140, 60);
 pub const ATTACHMENT_SELECTED: Color = Color::Rgb(255, 200, 80);
 pub const ATTACHMENT_SELECTED_BG: Color = Color::Rgb(50, 45, 30);
+/// The star of a flagged (`\\Flagged`) message, in lists and the detail header.
+pub const STAR_COLOR: Color = Color::Rgb(255, 200, 80);
 
 // Links
 pub const LINK_COLOR: Color = Color::Rgb(100, 180, 240);

@@ -278,6 +278,14 @@ fn handle_request(daemon: &Daemon, req: Request) -> Response {
         } => with_account(daemon, &account, |rt| {
             rt.control.enqueue_mark_seen(folder, uid);
         }),
+        Request::SetFlagged {
+            account,
+            folder,
+            uid,
+            flagged,
+        } => with_account(daemon, &account, |rt| {
+            rt.control.enqueue_set_flagged(folder, uid, flagged);
+        }),
         Request::EnqueueUpload {
             account,
             kind,

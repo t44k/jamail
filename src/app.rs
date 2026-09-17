@@ -318,6 +318,52 @@ impl App {
     }
 
     /// Resolve the current selection to an Email reference.
+    /// Whether the message open in the detail view is starred.
+    pub fn detail_is_flagged(&self) -> bool {
+        let Some(id) = self.detail_id else {
+            return false;
+        };
+        self.emails
+            .iter()
+            .chain(self.search_results.iter())
+            .find(|e| e.id == id)
+            .is_some_and(|e| e.is_flagged)
+    }
+
+    /// Star or unstar the message in the detail view (when open) or under
+    /// the list cursor: flips the cached copy and every loaded row for it,
+    /// and returns `(id, now_flagged)` for the caller to send to the server.
+    /// Local Drafts/Sent rows (negative ids) cannot be starred.
+    pub fn toggle_star(&mut self, db: &MailDb) -> Option<(i64, bool)> {
+        let id = match self.view {
+            ViewMode::Detail => self.detail_id?,
+            _ => self.selected_email()?.id,
+        };
+        if id < 0 {
+            return None;
+        }
+        let current = self
+            .emails
+            .iter()
+            .chain(self.search_results.iter())
+            .find(|e| e.id == id)?
+            .is_flagged;
+        let flagged = !current;
+        db.set_flagged(id, flagged).ok()?;
+        for e in self
+            .emails
+            .iter_mut()
+            .chain(self.search_results.iter_mut())
+            .filter(|e| e.id == id)
+        {
+            e.is_flagged = flagged;
+        }
+        for t in &mut self.threaded_view.threads {
+            t.has_flagged = t.email_indices.iter().any(|&i| self.emails[i].is_flagged);
+        }
+        Some((id, flagged))
+    }
+
     pub fn selected_email(&self) -> Option<&Email> {
         if self.thread_mode {
             let row = self.threaded_view.rows.get(self.selected)?;
@@ -574,6 +620,7 @@ impl App {
                             },
                             date,
                             is_unread: m.status != crate::db::STATUS_SENT,
+                            is_flagged: false,
                             preview: truncate_str(&m.to_addr, 80),
                             message_id: String::new(),
                             in_reply_to: m.in_reply_to.clone(),
@@ -2454,9 +2501,10 @@ impl App {
 
         let has_unread = thread.unread_count > 0;
         let has_attachments = thread.has_attachments;
+        let has_flagged = thread.has_flagged;
         let is_expanded = self.threaded_view.expanded.contains(&thread.id);
 
-        let marker_w = 2usize;
+        let marker_w = 3usize;
         let badge_display_w = 6usize;
         let sender_w = 20usize.min(width / 4);
         let rel_time_w = 14usize;
@@ -2477,6 +2525,7 @@ impl App {
         let subject_w = if width > fixed_w { width - fixed_w } else { 10 };
 
         let unread_marker = if has_unread { "●" } else { " " };
+        let star_marker = if has_flagged { "★" } else { " " };
         let attach_marker = if has_attachments { "@" } else { " " };
         let subject = truncate_str(&thread.subject, subject_w);
         let sender = truncate_str(&thread.newest_from, sender_w);
@@ -2494,6 +2543,7 @@ impl App {
                     Style::default().fg(theme::FG_DIM).bg(bg)
                 },
             ),
+            Span::styled(star_marker, Style::default().fg(theme::STAR_COLOR).bg(bg)),
             Span::styled(
                 attach_marker,
                 if has_attachments {
@@ -2578,7 +2628,7 @@ impl App {
         let branch_w = 5usize;
         let rel_time_w = 14usize;
         let exact_time_w = 18usize;
-        let marker_w = 2usize;
+        let marker_w = 3usize;
         let fixed_w = marker_w + branch_w + rel_time_w + exact_time_w + 2;
         let sender_w = if width > fixed_w {
             (width - fixed_w).min(40)
@@ -2587,6 +2637,7 @@ impl App {
         };
 
         let unread_marker = if email.is_unread { "●" } else { " " };
+        let star_marker = if email.is_flagged { "★" } else { " " };
         let attach_marker = if email.has_attachments { "@" } else { " " };
         let sender = truncate_str(&email.from, sender_w);
         let rel_time = relative_time(&email.date);
@@ -2603,6 +2654,7 @@ impl App {
                     Style::default().fg(theme::FG_DIM).bg(bg)
                 },
             ),
+            Span::styled(star_marker, Style::default().fg(theme::STAR_COLOR).bg(bg)),
             Span::styled(
                 attach_marker,
                 if email.has_attachments {
@@ -2655,7 +2707,7 @@ impl App {
         }
 
         let acct_pip_w = if self.is_global_inbox { 2usize } else { 0 };
-        let marker_w = 2usize;
+        let marker_w = 3usize;
         let sender_w = 20usize.min(width / 4);
         let rel_time_w = 14usize;
         let exact_time_w = 18usize;
@@ -2663,6 +2715,7 @@ impl App {
         let subject_w = if width > fixed_w { width - fixed_w } else { 10 };
 
         let unread_marker = if email.is_unread { "●" } else { " " };
+        let star_marker = if email.is_flagged { "★" } else { " " };
         let attach_marker = if email.has_attachments { "@" } else { " " };
         let sender = truncate_str(&email.from, sender_w);
         let subject = truncate_str(&email.subject, subject_w);
@@ -2690,6 +2743,7 @@ impl App {
                     Style::default().fg(theme::FG_DIM).bg(bg)
                 },
             ),
+            Span::styled(star_marker, Style::default().fg(theme::STAR_COLOR).bg(bg)),
             Span::styled(
                 attach_marker,
                 if email.has_attachments {
@@ -2915,10 +2969,18 @@ impl App {
                     Span::styled("To:      ", theme::style_detail_header_label()),
                     Span::styled(&content.to, theme::style_detail_header_value()),
                 ]));
-                lines.push(Line::from(vec![
-                    Span::styled("Subject: ", theme::style_detail_header_label()),
-                    Span::styled(&content.subject, theme::style_detail_subject()),
-                ]));
+                let mut subject_line = vec![Span::styled(
+                    "Subject: ",
+                    theme::style_detail_header_label(),
+                )];
+                if self.detail_is_flagged() {
+                    subject_line.push(Span::styled("★ ", Style::default().fg(theme::STAR_COLOR)));
+                }
+                subject_line.push(Span::styled(
+                    &content.subject,
+                    theme::style_detail_subject(),
+                ));
+                lines.push(Line::from(subject_line));
                 lines.push(Line::from(vec![
                     Span::styled("Date:    ", theme::style_detail_header_label()),
                     Span::styled(
@@ -3757,6 +3819,7 @@ impl App {
                 }
                 keys.extend_from_slice(&[
                     ("n", "Compose new email"),
+                    ("*", "Star / unstar"),
                     ("/", "Search"),
                     ("F", "Folder selector"),
                     ("u", "Sync now (all folders)"),
@@ -3806,6 +3869,7 @@ impl App {
                     ("n", "Compose new email"),
                     ("r", "Reply"),
                     ("f", "Forward"),
+                    ("*", "Star / unstar"),
                     ("h", "Toggle raw headers"),
                     ("v", "Open HTML in browser"),
                     ("q", "Quit"),

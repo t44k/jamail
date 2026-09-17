@@ -1496,6 +1496,7 @@ mod tests {
             subject: "Invitation".into(),
             date: chrono::Local::now(),
             is_unread: true,
+            is_flagged: false,
             preview: String::new(),
             text_body: String::new(),
             html_body: None,

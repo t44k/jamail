@@ -329,6 +329,9 @@ fn run_app(
                                 KeyCode::Char('/') => app.enter_search(),
                                 KeyCode::Char('F') => app.enter_folder_select(),
                                 KeyCode::Char('n') => app.enter_compose_new(db),
+                                KeyCode::Char('*') | KeyCode::Char('S') => {
+                                    toggle_star(app, db, ipc_client);
+                                }
                                 KeyCode::Char('u') => {
                                     ipc_client.send(ipc::Request::SyncNow {
                                         account: app.current_account.clone(),
@@ -457,6 +460,9 @@ fn run_app(
                             KeyCode::Char('r') => app.enter_reply(db),
                             KeyCode::Char('f') => app.enter_forward(db),
                             KeyCode::Char('h') => app.toggle_raw_headers(),
+                            KeyCode::Char('*') | KeyCode::Char('S') => {
+                                toggle_star(app, db, ipc_client);
+                            }
                             KeyCode::Char('v') => app.open_in_browser(),
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 if let Some(target) = app.ctrl_c_copy_target() {
@@ -969,6 +975,31 @@ fn handle_compose_send(
     app.status_msg = "Queued for sending".to_string();
     app.status_sticky = true;
     app.view = app.compose_previous_view.clone();
+}
+
+/// Star or unstar the message in view: the cache and every loaded row flip
+/// at once, and the daemon stores `\\Flagged` on the server.
+fn toggle_star(app: &mut App, db: &db::MailDb, ipc_client: &ipc::IpcClient) {
+    match app.toggle_star(db) {
+        Some((id, flagged)) => {
+            if let Ok(Some((account, uid, folder))) = db.get_email_account_uid_and_folder(id) {
+                ipc_client.send(ipc::Request::SetFlagged {
+                    account,
+                    folder,
+                    uid,
+                    flagged,
+                });
+            }
+            if !app.status_sticky {
+                app.status_msg = if flagged { "Starred" } else { "Unstarred" }.to_string();
+            }
+        }
+        None => {
+            if !app.status_sticky {
+                app.status_msg = "Nothing to star here".to_string();
+            }
+        }
+    }
 }
 
 fn enqueue_mark_seen(app: &App, db: &db::MailDb, ipc_client: &ipc::IpcClient) {

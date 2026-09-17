@@ -20,6 +20,8 @@ pub struct Email {
     pub subject: String,
     pub date: DateTime<Local>,
     pub is_unread: bool,
+    /// IMAP `\\Flagged` — the star.
+    pub is_flagged: bool,
     #[allow(dead_code)]
     pub preview: String,
     pub message_id: String,
@@ -65,6 +67,8 @@ pub struct ProcessedEmail {
     pub subject: String,
     pub date: DateTime<Local>,
     pub is_unread: bool,
+    /// IMAP `\\Flagged`, set by the caller from the FETCH's flags.
+    pub is_flagged: bool,
     pub preview: String,
     pub text_body: String,
     pub html_body: Option<String>,
@@ -79,6 +83,9 @@ pub struct ProcessedEmail {
 const FETCH_BATCH_SIZE: usize = 50;
 /// Max concurrent process_raw_email threads per batch (limits w3m subprocess count).
 const PROCESS_PARALLELISM: usize = 8;
+
+/// One message as fetched: `(uid, is_unread, is_flagged, raw body)`.
+type RawFetched = (u32, bool, bool, Vec<u8>);
 
 pub struct MailClient {
     session: imap::Session<Connection>,
@@ -395,11 +402,15 @@ impl MailClient {
                     let sub_processed: Vec<(u32, ProcessedEmail)> = std::thread::scope(|s| {
                         let handles: Vec<_> = sub_chunk
                             .iter()
-                            .map(|(uid, is_unread, body)| {
+                            .map(|(uid, is_unread, is_flagged, body)| {
                                 let uid = *uid;
                                 let is_unread = *is_unread;
+                                let is_flagged = *is_flagged;
                                 s.spawn(move || -> Option<(u32, ProcessedEmail)> {
-                                    process_raw_email(body, is_unread).ok().map(|p| (uid, p))
+                                    process_raw_email(body, is_unread).ok().map(|mut p| {
+                                        p.is_flagged = is_flagged;
+                                        (uid, p)
+                                    })
                                 })
                             })
                             .collect();
@@ -418,6 +429,7 @@ impl MailClient {
                             &processed.subject,
                             &processed.date,
                             processed.is_unread,
+                            processed.is_flagged,
                             &processed.preview,
                             &processed.text_body,
                             processed.html_body.as_deref(),
@@ -469,8 +481,7 @@ impl MailClient {
     }
 
     /// Fetch a batch of emails by UID in a single IMAP command.
-    /// Returns Vec<(uid, is_unread, raw_body)>.
-    fn fetch_raw_batch(&mut self, uids: &[u32]) -> Result<Vec<(u32, bool, Vec<u8>)>> {
+    fn fetch_raw_batch(&mut self, uids: &[u32]) -> Result<Vec<RawFetched>> {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
@@ -494,11 +505,15 @@ impl MailClient {
                 .flags()
                 .iter()
                 .any(|f| matches!(f, imap::types::Flag::Seen));
+            let is_flagged = msg
+                .flags()
+                .iter()
+                .any(|f| matches!(f, imap::types::Flag::Flagged));
             let body = match msg.body() {
                 Some(b) => b.to_vec(),
                 None => continue,
             };
-            results.push((uid, is_unread, body));
+            results.push((uid, is_unread, is_flagged, body));
         }
         Ok(results)
     }
@@ -554,9 +569,31 @@ impl MailClient {
         Ok(())
     }
 
-    /// Fetch FLAGS for the given UIDs. Returns Vec<(uid, is_unread)>.
+    /// Set or clear `\\Flagged` (the star) on the given UIDs.
     /// Caller must have already SELECTed the folder.
-    pub fn fetch_flags(&mut self, uids: &[u32]) -> Result<Vec<(u32, bool)>> {
+    pub fn set_flagged(&mut self, uids: &[u32], flagged: bool) -> Result<()> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+        let uid_list: String = uids
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let op = if flagged {
+            "+FLAGS.SILENT (\\Flagged)"
+        } else {
+            "-FLAGS.SILENT (\\Flagged)"
+        };
+        self.session
+            .uid_store(&uid_list, op)
+            .context("Failed to store \\Flagged flag")?;
+        Ok(())
+    }
+
+    /// Fetch FLAGS for the given UIDs. Returns Vec<(uid, is_unread, is_flagged)>.
+    /// Caller must have already SELECTed the folder.
+    pub fn fetch_flags(&mut self, uids: &[u32]) -> Result<Vec<(u32, bool, bool)>> {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
@@ -577,7 +614,11 @@ impl MailClient {
                         .flags()
                         .iter()
                         .any(|f| matches!(f, imap::types::Flag::Seen));
-                    results.push((uid, is_unread));
+                    let is_flagged = msg
+                        .flags()
+                        .iter()
+                        .any(|f| matches!(f, imap::types::Flag::Flagged));
+                    results.push((uid, is_unread, is_flagged));
                 }
             }
         }
@@ -597,13 +638,16 @@ impl MailClient {
     /// `just_read_locally(uid)` names messages the user opened in jamail
     /// moments ago whose `\\Seen` may not have reached the server yet: the
     /// server's stale "unseen" for those is ignored instead of flipping the
-    /// local copy back to unread.
+    /// local copy back to unread. `local_star(uid)` likewise names a star
+    /// the user set or cleared moments ago: `Some(flagged)` wins over the
+    /// server's answer until the store has gone out.
     pub fn sync_flags(
         &mut self,
         db: &MailDb,
         account: &str,
         folder: &str,
         just_read_locally: &dyn Fn(u32) -> bool,
+        local_star: &dyn Fn(u32) -> Option<bool>,
     ) -> Result<bool> {
         let known_uids = db.get_all_uids(account, folder)?;
         if known_uids.is_empty() {
@@ -614,10 +658,16 @@ impl MailClient {
             .with_context(|| format!("Failed to select folder for flag sync: {}", folder))?;
         let server_flags = self.fetch_flags(&known_uids)?;
         let present: std::collections::HashSet<u32> =
-            server_flags.iter().map(|(uid, _)| *uid).collect();
-        let server_flags: Vec<(u32, bool)> = server_flags
+            server_flags.iter().map(|(uid, ..)| *uid).collect();
+        let server_flags: Vec<(u32, bool, bool)> = server_flags
             .into_iter()
-            .filter(|(uid, is_unread)| !(*is_unread && just_read_locally(*uid)))
+            .map(|(uid, is_unread, is_flagged)| {
+                (
+                    uid,
+                    is_unread && !just_read_locally(uid),
+                    local_star(uid).unwrap_or(is_flagged),
+                )
+            })
             .collect();
         let vanished: Vec<u32> = known_uids
             .iter()
@@ -782,6 +832,7 @@ pub fn process_raw_email(body: &[u8], is_unread: bool) -> Result<ProcessedEmail>
         subject,
         date,
         is_unread,
+        is_flagged: false,
         preview,
         text_body,
         html_body,

@@ -16,6 +16,15 @@ pub struct MarkSeenRequest {
     pub attempts: u32,
 }
 
+/// A queued star/unstar (`\\Flagged`) for one message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlagRequest {
+    pub folder: String,
+    pub uid: u32,
+    pub flagged: bool,
+    pub attempts: u32,
+}
+
 /// Which local-message flow an `UploadRequest` belongs to. Both share the
 /// same upload machinery (APPEND to a configured IMAP folder); the kind is
 /// only used to route the completion event back to the right UI state.
@@ -75,6 +84,12 @@ pub struct SyncControl {
     /// Unix seconds of the sync loop's last sign of life (every IDLE round,
     /// every fetch batch). The watchdog compares it with [`STALL_TIMEOUT`].
     last_progress: AtomicU64,
+    /// Stars and unstars waiting to be stored on the server.
+    pub flag_queue: Mutex<Vec<FlagRequest>>,
+    /// `(folder, uid)` → the star the user set locally, with when: shields
+    /// the local choice from a stale server answer the way `recently_seen`
+    /// does for reads.
+    recently_flagged: Mutex<HashMap<(String, u32), (bool, std::time::Instant)>>,
 }
 
 /// How long a locally read message is shielded from a stale "unseen".
@@ -109,6 +124,8 @@ impl SyncControl {
             recently_seen: Mutex::new(HashMap::new()),
             abort: Mutex::new(None),
             last_progress: AtomicU64::new(now_secs()),
+            flag_queue: Mutex::new(Vec::new()),
+            recently_flagged: Mutex::new(HashMap::new()),
         }
     }
 
@@ -161,6 +178,37 @@ impl SyncControl {
         }
     }
 
+    /// Queue a star/unstar for `(folder, uid)` and remember the choice so a
+    /// stale server answer cannot undo it meanwhile.
+    pub fn enqueue_set_flagged(&self, folder: String, uid: u32, flagged: bool) {
+        if let Ok(mut recent) = self.recently_flagged.lock() {
+            let now = std::time::Instant::now();
+            recent.retain(|_, (_, at)| now.duration_since(*at) < RECENTLY_SEEN_TTL);
+            recent.insert((folder.clone(), uid), (flagged, now));
+        }
+        if let Ok(mut q) = self.flag_queue.lock() {
+            // A newer choice for the same message replaces an older queued one.
+            q.retain(|r| !(r.folder == folder && r.uid == uid));
+            q.push(FlagRequest {
+                folder,
+                uid,
+                flagged,
+                attempts: 0,
+            });
+        }
+    }
+
+    /// The star the user set on `(folder, uid)` within [`RECENTLY_SEEN_TTL`],
+    /// if any — it overrides the server's answer in the flag sync.
+    pub fn recent_flag_override(&self, folder: &str, uid: u32) -> Option<bool> {
+        self.recently_flagged.lock().ok().and_then(|recent| {
+            recent
+                .get(&(folder.to_string(), uid))
+                .filter(|(_, at)| at.elapsed() < RECENTLY_SEEN_TTL)
+                .map(|(flagged, _)| *flagged)
+        })
+    }
+
     /// Whether the user read `(folder, uid)` in jamail within
     /// [`RECENTLY_SEEN_TTL`].
     pub fn recently_seen(&self, folder: &str, uid: u32) -> bool {
@@ -174,10 +222,14 @@ impl SyncControl {
     }
 
     fn has_pending_actions(&self) -> bool {
-        self.mark_seen_queue
-            .lock()
-            .map(|q| !q.is_empty())
-            .unwrap_or(false)
+        let non_empty =
+            |q: &Mutex<Vec<MarkSeenRequest>>| q.lock().map(|q| !q.is_empty()).unwrap_or(false);
+        non_empty(&self.mark_seen_queue)
+            || self
+                .flag_queue
+                .lock()
+                .map(|q| !q.is_empty())
+                .unwrap_or(false)
             || self
                 .upload_queue
                 .lock()
@@ -232,6 +284,39 @@ fn apply_pending_actions(
                 }
                 // A rejected STORE usually means the connection is gone;
                 // let the caller reconnect and retry the rest.
+                return Err(());
+            }
+        }
+    }
+
+    let stars: Vec<FlagRequest> = control
+        .flag_queue
+        .lock()
+        .map(|mut q| q.drain(..).collect())
+        .unwrap_or_default();
+    if !stars.is_empty() {
+        let mut groups: HashMap<(String, bool), Vec<FlagRequest>> = HashMap::new();
+        for req in stars {
+            groups
+                .entry((req.folder.clone(), req.flagged))
+                .or_default()
+                .push(req);
+        }
+        for ((folder, flagged), reqs) in groups {
+            let uids: Vec<u32> = reqs.iter().map(|r| r.uid).collect();
+            if let Err(e) = client
+                .select_folder(&folder)
+                .and_then(|_| client.set_flagged(&uids, flagged))
+            {
+                let _ = tx.send(SyncEvent::Error(format!("Star {}: {}", folder, e)));
+                if let Ok(mut q) = control.flag_queue.lock() {
+                    for mut r in reqs {
+                        r.attempts += 1;
+                        if r.attempts < MARK_SEEN_MAX_ATTEMPTS {
+                            q.push(r);
+                        }
+                    }
+                }
                 return Err(());
             }
         }
@@ -423,7 +508,8 @@ fn sync_loop(
                         // FULL_FLAG_SYNC_INTERVAL.
                         if full_flags || *folder == current {
                             let shield = |uid: u32| control.recently_seen(folder, uid);
-                            match client.sync_flags(&db, &account_name, folder, &shield) {
+                            let star = |uid: u32| control.recent_flag_override(folder, uid);
+                            match client.sync_flags(&db, &account_name, folder, &shield, &star) {
                                 Ok(true) => {
                                     let _ = tx.send(SyncEvent::FlagsChanged(folder.clone()));
                                 }
@@ -608,5 +694,34 @@ mod abort_tests {
         assert!(control.seconds_since_progress() < 5);
         control.set_abort(None);
         assert!(!control.abort_connection());
+    }
+}
+
+#[cfg(test)]
+mod star_queue_tests {
+    use super::*;
+
+    #[test]
+    fn stars_are_queued_once_per_message_and_shield_the_local_choice() {
+        let control = SyncControl::new("INBOX");
+        assert_eq!(control.recent_flag_override("INBOX", 5), None);
+        control.enqueue_set_flagged("INBOX".to_string(), 5, true);
+        control.enqueue_set_flagged("INBOX".to_string(), 5, false);
+        control.enqueue_set_flagged("INBOX".to_string(), 6, true);
+        assert_eq!(control.recent_flag_override("INBOX", 5), Some(false));
+        assert_eq!(control.recent_flag_override("INBOX", 6), Some(true));
+        assert_eq!(control.recent_flag_override("Archive", 6), None);
+        assert!(control.has_pending_actions());
+        let queued: Vec<FlagRequest> = control
+            .flag_queue
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap();
+        assert_eq!(queued.len(), 2, "the newer choice replaced the older one");
+        assert_eq!(
+            queued.iter().find(|r| r.uid == 5).map(|r| r.flagged),
+            Some(false)
+        );
+        assert!(!control.has_pending_actions());
     }
 }
