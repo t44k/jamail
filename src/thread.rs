@@ -16,6 +16,8 @@ pub struct Thread {
     pub newest_from: String,
     /// Whether any email in this thread has attachments.
     pub has_attachments: bool,
+    /// Whether any email in this thread is starred (`\\Flagged`).
+    pub has_flagged: bool,
     /// Cached from the newest email's `status_label` (Drafts/Sent in-flight
     /// state); `None` for real IMAP-synced threads.
     pub newest_status_label: Option<String>,
@@ -199,6 +201,7 @@ pub fn build_threads(emails: &[Email]) -> Vec<Thread> {
         let newest_status_label = newest.status_label.clone();
         let unread_count = indices.iter().filter(|&&i| emails[i].is_unread).count();
         let has_attachments = indices.iter().any(|&i| emails[i].has_attachments);
+        let has_flagged = indices.iter().any(|&i| emails[i].is_flagged);
         let subject = normalize_subject(&oldest.subject);
         let id = if !oldest.message_id.is_empty() {
             oldest.message_id.clone()
@@ -216,6 +219,7 @@ pub fn build_threads(emails: &[Email]) -> Vec<Thread> {
             email_indices: indices,
             newest_from,
             has_attachments,
+            has_flagged,
             newest_status_label,
         });
     }

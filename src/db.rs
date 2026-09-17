@@ -7,7 +7,7 @@ use crate::calendar::{EventStatus, EventTime, VEvent};
 use crate::mail::{AttachmentData, Email, EmailContent, FolderInfo};
 use chrono::{DateTime, Local, TimeZone, Utc};
 
-const CURRENT_SCHEMA_VERSION: i32 = 8;
+const CURRENT_SCHEMA_VERSION: i32 = 9;
 
 pub struct AttachmentMeta {
     pub id: i64,
@@ -189,7 +189,7 @@ const MAIL_SCHEMA_SQL: &str = "DROP TABLE IF EXISTS emails_fts;
          DROP TABLE IF EXISTS schema_version;
 
          CREATE TABLE schema_version (version INTEGER NOT NULL);
-         INSERT INTO schema_version VALUES (8);
+         INSERT INTO schema_version VALUES (9);
 
          CREATE TABLE folders (
              account   TEXT NOT NULL,
@@ -210,6 +210,7 @@ const MAIL_SCHEMA_SQL: &str = "DROP TABLE IF EXISTS emails_fts;
              date_ts         INTEGER NOT NULL,
              date_rfc3339    TEXT NOT NULL,
              is_unread       INTEGER NOT NULL DEFAULT 1,
+             is_flagged      INTEGER NOT NULL DEFAULT 0,
              preview         TEXT NOT NULL DEFAULT '',
              text_body_zstd  BLOB,
              html_body_zstd  BLOB,
@@ -224,7 +225,7 @@ const MAIL_SCHEMA_SQL: &str = "DROP TABLE IF EXISTS emails_fts;
          CREATE INDEX idx_emails_acct_folder_date ON emails(account, folder, date_ts DESC);
          CREATE INDEX idx_emails_message_id ON emails(message_id);
          CREATE INDEX idx_emails_list ON emails(account, folder, date_ts DESC, id, uid, from_addr,
-             subject, is_unread, preview, message_id, in_reply_to, refs, has_attachments);
+             subject, is_unread, preview, message_id, in_reply_to, refs, has_attachments, is_flagged);
 
          CREATE TABLE sync_state (
              account     TEXT NOT NULL,
@@ -353,6 +354,53 @@ fn migrate_v5_to_v6_add_sync_log(conn: &Connection) -> Result<()> {
 /// row's page (over half a second on a multi-GB cache, felt as jamail's
 /// start-up stutter); with every listed column in the index the list is an
 /// index-only scan.
+/// v8 -> v9: `emails.is_flagged` (IMAP `\\Flagged`, the star), and the
+/// covering list index rebuilt to include it. Additive.
+fn migrate_v8_to_v9_add_flagged(conn: &Connection) -> Result<()> {
+    // Several connections (the sync thread, the alarm clock, a client) may
+    // open the cache at the same moment and all read "version 8": take the
+    // write lock first and re-check, so exactly one of them migrates and
+    // the others find the work done instead of tripping over half of it.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        let version: i32 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if version >= 9 {
+            return Ok(());
+        }
+        let has_flagged = conn
+            .prepare("PRAGMA table_info(emails)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "is_flagged");
+        if !has_flagged {
+            conn.execute(
+                "ALTER TABLE emails ADD COLUMN is_flagged INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_emails_list;
+             CREATE INDEX IF NOT EXISTS idx_emails_list ON emails(account, folder, date_ts DESC,
+                 id, uid, from_addr, subject, is_unread, preview, message_id, in_reply_to, refs,
+                 has_attachments, is_flagged);
+             UPDATE schema_version SET version = 9;",
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 fn migrate_v7_to_v8_add_list_index(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_emails_list ON emails(account, folder, date_ts DESC, id,
@@ -442,6 +490,10 @@ fn upgrade_schema(conn: &Connection) -> Result<()> {
         migrate_v7_to_v8_add_list_index(conn)?;
         version = 8;
     }
+    if version == 8 {
+        migrate_v8_to_v9_add_flagged(conn)?;
+        version = 9;
+    }
     debug_assert_eq!(
         version, CURRENT_SCHEMA_VERSION,
         "upgrade_schema must always land exactly on CURRENT_SCHEMA_VERSION"
@@ -511,7 +563,7 @@ impl MailDb {
     #[cfg(test)]
     pub(crate) fn open_in_memory_legacy_v4() -> Result<Self> {
         let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
-        let sql = MAIL_SCHEMA_SQL.replacen("VALUES (8)", "VALUES (4)", 1);
+        let sql = MAIL_SCHEMA_SQL.replacen("VALUES (9)", "VALUES (4)", 1);
         conn.execute_batch(&sql)?;
         Ok(Self { conn })
     }
@@ -524,7 +576,7 @@ impl MailDb {
     pub(crate) fn open_in_memory_legacy_v5() -> Result<Self> {
         let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
         let sql = format!("{}\n{}", MAIL_SCHEMA_SQL, CALENDAR_SCHEMA_SQL).replacen(
-            "VALUES (8)",
+            "VALUES (9)",
             "VALUES (5)",
             1,
         );
@@ -571,6 +623,7 @@ impl MailDb {
         subject: &str,
         date: &DateTime<Local>,
         is_unread: bool,
+        is_flagged: bool,
         preview: &str,
         text_body: &str,
         html_body: Option<&str>,
@@ -620,8 +673,8 @@ impl MailDb {
             "INSERT INTO emails
                 (account, folder, uid, from_addr, to_addr, subject, date_ts, date_rfc3339,
                  is_unread, preview, text_body_zstd, html_body_zstd, raw_headers_zstd,
-                 message_id, in_reply_to, refs, has_attachments)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                 message_id, in_reply_to, refs, has_attachments, is_flagged)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 account,
                 folder,
@@ -640,6 +693,7 @@ impl MailDb {
                 in_reply_to,
                 refs,
                 has_attachments as i32,
+                is_flagged as i32,
             ],
         )?;
 
@@ -682,6 +736,7 @@ impl MailDb {
         subject: &str,
         date: &DateTime<Local>,
         is_unread: bool,
+        is_flagged: bool,
         preview: &str,
         text_body: &str,
         html_body: Option<&str>,
@@ -702,6 +757,7 @@ impl MailDb {
             subject,
             date,
             is_unread,
+            is_flagged,
             preview,
             text_body,
             html_body,
@@ -727,7 +783,7 @@ impl MailDb {
     pub fn get_email_list(&self, account: &str, folder: &str) -> Result<Vec<Email>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, uid, from_addr, subject, date_ts, is_unread, preview,
-                    message_id, in_reply_to, refs, has_attachments, account
+                    message_id, in_reply_to, refs, has_attachments, account, is_flagged
              FROM emails WHERE account = ?1 AND folder = ?2
              ORDER BY date_ts DESC",
         )?;
@@ -745,6 +801,7 @@ impl MailDb {
             let references: String = row.get(9)?;
             let has_attachments: bool = row.get::<_, i32>(10)? != 0;
             let acct: String = row.get(11)?;
+            let is_flagged: bool = row.get::<_, i32>(12)? != 0;
 
             let date = Local
                 .timestamp_opt(date_ts, 0)
@@ -759,6 +816,7 @@ impl MailDb {
                 subject,
                 date,
                 is_unread,
+                is_flagged,
                 preview,
                 message_id,
                 in_reply_to,
@@ -825,7 +883,7 @@ impl MailDb {
     pub fn get_global_inbox(&self) -> Result<Vec<Email>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, uid, from_addr, subject, date_ts, is_unread, preview,
-                    message_id, in_reply_to, refs, has_attachments, account
+                    message_id, in_reply_to, refs, has_attachments, account, is_flagged
              FROM emails WHERE folder = 'INBOX'
              ORDER BY date_ts DESC",
         )?;
@@ -843,6 +901,7 @@ impl MailDb {
             let references: String = row.get(9)?;
             let has_attachments: bool = row.get::<_, i32>(10)? != 0;
             let acct: String = row.get(11)?;
+            let is_flagged: bool = row.get::<_, i32>(12)? != 0;
 
             let date = Local
                 .timestamp_opt(date_ts, 0)
@@ -857,6 +916,7 @@ impl MailDb {
                 subject,
                 date,
                 is_unread,
+                is_flagged,
                 preview,
                 message_id,
                 in_reply_to,
@@ -882,7 +942,7 @@ impl MailDb {
     pub fn search_emails(&self, account: &str, folder: &str, query: &str) -> Result<Vec<Email>> {
         let mut stmt = self.conn.prepare(
             "SELECT e.id, e.uid, e.from_addr, e.subject, e.date_ts, e.is_unread, e.preview,
-                    e.message_id, e.in_reply_to, e.refs, e.has_attachments, e.account
+                    e.message_id, e.in_reply_to, e.refs, e.has_attachments, e.account, e.is_flagged
              FROM emails_fts f
              JOIN emails e ON e.id = f.rowid
              WHERE emails_fts MATCH ?1
@@ -903,6 +963,7 @@ impl MailDb {
             let references: String = row.get(9)?;
             let has_attachments: bool = row.get::<_, i32>(10)? != 0;
             let acct: String = row.get(11)?;
+            let is_flagged: bool = row.get::<_, i32>(12)? != 0;
 
             let date = Local
                 .timestamp_opt(date_ts, 0)
@@ -917,6 +978,7 @@ impl MailDb {
                 subject,
                 date,
                 is_unread,
+                is_flagged,
                 preview,
                 message_id,
                 in_reply_to,
@@ -1111,18 +1173,37 @@ impl MailDb {
         Ok(uids)
     }
 
-    pub fn update_flags(&self, account: &str, folder: &str, flags: &[(u32, bool)]) -> Result<bool> {
+    /// Bring `is_unread`/`is_flagged` of the given UIDs in line with the
+    /// server (`(uid, is_unread, is_flagged)`); `true` when any row changed.
+    pub fn update_flags(
+        &self,
+        account: &str,
+        folder: &str,
+        flags: &[(u32, bool, bool)],
+    ) -> Result<bool> {
         let mut changed = false;
-        for &(uid, is_unread) in flags {
+        for &(uid, is_unread, is_flagged) in flags {
             let rows = self.conn.execute(
-                "UPDATE emails SET is_unread = ?1 WHERE account = ?2 AND folder = ?3 AND uid = ?4 AND is_unread != ?1",
-                params![is_unread as i32, account, folder, uid],
+                "UPDATE emails SET is_unread = ?1, is_flagged = ?2
+                 WHERE account = ?3 AND folder = ?4 AND uid = ?5
+                   AND (is_unread != ?1 OR is_flagged != ?2)",
+                params![is_unread as i32, is_flagged as i32, account, folder, uid],
             )?;
             if rows > 0 {
                 changed = true;
             }
         }
         Ok(changed)
+    }
+
+    /// Star or unstar one cached message (the server follows through
+    /// `ipc::Request::SetFlagged`).
+    pub fn set_flagged(&self, id: i64, flagged: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE emails SET is_flagged = ?1 WHERE id = ?2",
+            params![flagged as i32, id],
+        )?;
+        Ok(())
     }
 
     /// Look up the (account, uid, folder) an email belongs to by its local
@@ -2393,6 +2474,7 @@ mod calendar_migration_tests {
                 "Hello",
                 &Local::now(),
                 true,
+                false,
                 "preview",
                 "body text",
                 None,
@@ -3384,6 +3466,7 @@ mod prune_tests {
             subject,
             &Local::now(),
             true,
+            false,
             "preview",
             &format!("body of {subject}"),
             None,
@@ -3430,6 +3513,96 @@ mod prune_tests {
             db.delete_emails_by_uid("personal", "FRESHBOX", &[])
                 .unwrap(),
             0
+        );
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::*;
+
+    fn seed(db: &MailDb, uid: u32, flagged: bool) -> i64 {
+        db.store_email(
+            "personal",
+            "INBOX",
+            uid,
+            "alice@example.com",
+            "bob@example.com",
+            &format!("m{uid}"),
+            &Local::now(),
+            true,
+            flagged,
+            "preview",
+            "body",
+            None,
+            "",
+            &format!("msg-{uid}"),
+            "",
+            "",
+            false,
+            &[],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stars_are_stored_listed_updated_from_the_server_and_toggled_locally() {
+        let db = MailDb::open_in_memory().unwrap();
+        let a = seed(&db, 1, false);
+        let b = seed(&db, 2, true);
+        let list = db.get_email_list("personal", "INBOX").unwrap();
+        let flagged_of = |id: i64| list.iter().find(|e| e.id == id).unwrap().is_flagged;
+        assert!(!flagged_of(a));
+        assert!(flagged_of(b));
+
+        // The server says: 1 starred and read, 2 unstarred.
+        assert!(
+            db.update_flags("personal", "INBOX", &[(1, false, true), (2, true, false)])
+                .unwrap()
+        );
+        assert!(
+            !db.update_flags("personal", "INBOX", &[(1, false, true), (2, true, false)])
+                .unwrap(),
+            "no change reported the second time"
+        );
+        let list = db.get_email_list("personal", "INBOX").unwrap();
+        let one = list.iter().find(|e| e.id == a).unwrap();
+        assert!(one.is_flagged && !one.is_unread);
+        assert!(!list.iter().find(|e| e.id == b).unwrap().is_flagged);
+
+        db.set_flagged(b, true).unwrap();
+        assert!(
+            db.get_global_inbox()
+                .unwrap()
+                .iter()
+                .find(|e| e.id == b)
+                .unwrap()
+                .is_flagged
+        );
+        assert_eq!(db.schema_version_for_test(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn the_v9_migration_is_harmless_when_another_connection_already_ran_it() {
+        let db = MailDb::open_in_memory().unwrap();
+        // A connection that read "version 8" before another one finished
+        // migrating: the column and index already exist.
+        db.conn
+            .execute("UPDATE schema_version SET version = 8", [])
+            .unwrap();
+        migrate_v8_to_v9_add_flagged(&db.conn).unwrap();
+        assert_eq!(db.schema_version_for_test(), 9);
+        // And once at 9, a stale caller does nothing at all.
+        migrate_v8_to_v9_add_flagged(&db.conn).unwrap();
+        assert_eq!(db.schema_version_for_test(), 9);
+        assert!(
+            db.conn
+                .prepare("PRAGMA index_info(idx_emails_list)")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(2))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .any(|c| c == "is_flagged")
         );
     }
 }

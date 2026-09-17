@@ -251,6 +251,14 @@ pub enum Request {
         folder: String,
         uid: u32,
     },
+    /// Star (`flagged: true`) or unstar one message on the server
+    /// (`\\Flagged`); the client has already updated its cached copy.
+    SetFlagged {
+        account: String,
+        folder: String,
+        uid: u32,
+        flagged: bool,
+    },
     /// Queue an APPEND of a raw outgoing message (a sent copy or a saved
     /// draft) to `folder`. `raw_message_b64` is standard base64 (RFC 4648)
     /// of the raw RFC 2822 bytes. The result arrives later as
