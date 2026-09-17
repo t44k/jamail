@@ -333,7 +333,19 @@ pub struct CalDavConfig {
     /// supported by the server.
     pub url: String,
     pub login: String,
-    pub auth: AuthConfig,
+    /// HTTP Basic credentials for the CalDAV server. Optional *only*
+    /// because [`Self::oauth`] is the alternative: exactly one of the two
+    /// must be present (see [`Self::check`]). When both are, `oauth` is
+    /// what `jamaild` authenticates the remote server with and `auth`
+    /// stays in use for the inbound CalDAV server's own Basic auth
+    /// (`daemon.caldav_server_listen`), which has no other credential to
+    /// check a client against.
+    pub auth: Option<AuthConfig>,
+    /// OAuth 2.0 bearer-token authentication instead of Basic — what
+    /// Google Calendar requires. See [`CalDavOauthConfig`] and
+    /// `goauth`'s module docs for how the refresh token is obtained
+    /// (`jamaild google-auth <account>`).
+    pub oauth: Option<CalDavOauthConfig>,
     /// Restrict sync to calendars whose *display name* is in this list
     /// (case-sensitive, matched against the server's `DAV:displayname`).
     /// Unset (default): sync every discovered calendar collection.
@@ -350,6 +362,52 @@ pub struct CalDavConfig {
     /// notification. Each entry fires its own notification (e.g. `[30,
     /// 5]` notifies both 30 and 5 minutes before).
     pub default_alarm_minutes_before: Option<Vec<i64>>,
+}
+
+impl CalDavConfig {
+    /// Reject a `caldav:` block that names no way to authenticate. Called
+    /// wherever a CalDAV client is built (`calsync::resolve_auth`) and at
+    /// `jamaild` startup, so a typo is a clear message rather than a
+    /// silent 401 loop in the journal.
+    pub fn check(&self) -> Result<()> {
+        if self.auth.is_none() && self.oauth.is_none() {
+            anyhow::bail!(
+                "caldav for {} has neither `auth` (HTTP Basic) nor `oauth` \
+                 (bearer token) configured",
+                self.url
+            );
+        }
+        Ok(())
+    }
+}
+
+/// OAuth 2.0 credentials for a `caldav:` block. Only Google is
+/// implemented, and the refresh token is the long-lived credential: it is
+/// obtained once with `jamaild google-auth <account>` and then read from
+/// here like any other secret in this file — inline, or out of a password
+/// manager with `type: command`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CalDavOauthConfig {
+    /// Which provider's token endpoint to use. Unset (default): `google`.
+    #[serde(default)]
+    pub provider: OauthProvider,
+    /// The OAuth client ID (`...apps.googleusercontent.com`) of a
+    /// **Desktop app** client created in the Google Cloud console.
+    pub client_id: String,
+    pub client_secret: AuthConfig,
+    /// The long-lived credential, from `jamaild google-auth <account>`.
+    /// Optional so the bootstrap works in the documented order: you
+    /// configure `client_id`/`client_secret`, run `google-auth` (which
+    /// reads them from here), and only then have a token to name. Sync
+    /// fails with that instruction until it is set.
+    pub refresh_token: Option<AuthConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OauthProvider {
+    #[default]
+    Google,
 }
 
 fn default_caldav_poll_interval_secs() -> u64 {
@@ -587,6 +645,105 @@ mod tests {
             acc.notify_folders,
             Some(vec!["INBOX".to_string(), "Important".to_string()])
         );
+    }
+
+    #[test]
+    fn caldav_with_basic_auth_still_parses_and_reports_no_oauth() {
+        let cfg = parse(
+            "accounts:\n\
+             \x20 work:\n\
+             \x20   email: alice@corp.com\n\
+             \x20   imap:\n\
+             \x20     host: imap.corp.com\n\
+             \x20     port: 993\n\
+             \x20     login: alice@corp.com\n\
+             \x20     auth: {type: password, value: secret}\n\
+             \x20   caldav:\n\
+             \x20     url: https://cal.corp.com/dav/\n\
+             \x20     login: alice@corp.com\n\
+             \x20     auth: {type: command, value: pass show cal/work}\n",
+        );
+        let (_, acc) = cfg.default_account().unwrap();
+        let caldav = acc.caldav.as_ref().unwrap();
+        assert!(caldav.oauth.is_none());
+        assert_eq!(caldav.auth.as_ref().unwrap().auth_type, "command");
+        assert_eq!(caldav.poll_interval_secs, 300);
+        caldav.check().expect("basic auth alone is a valid block");
+    }
+
+    #[test]
+    fn caldav_oauth_parses_without_any_basic_auth_and_defaults_to_google() {
+        let cfg = parse(
+            "accounts:\n\
+             \x20 gmail:\n\
+             \x20   email: alice@gmail.com\n\
+             \x20   imap:\n\
+             \x20     host: imap.gmail.com\n\
+             \x20     port: 993\n\
+             \x20     login: alice@gmail.com\n\
+             \x20     auth: {type: password, value: app-password}\n\
+             \x20   caldav:\n\
+             \x20     url: https://apidata.googleusercontent.com/caldav/v2/alice@gmail.com/user\n\
+             \x20     login: alice@gmail.com\n\
+             \x20     oauth:\n\
+             \x20       client_id: cid.apps.googleusercontent.com\n\
+             \x20       client_secret: {type: command, value: pass show google/secret}\n\
+             \x20       refresh_token: {type: command, value: cat /home/alice/.local/share/jamail/oauth/gmail.token}\n",
+        );
+        let (_, acc) = cfg.default_account().unwrap();
+        let caldav = acc.caldav.as_ref().unwrap();
+        assert!(caldav.auth.is_none());
+        let oauth = caldav.oauth.as_ref().unwrap();
+        assert_eq!(oauth.provider, OauthProvider::Google);
+        assert_eq!(oauth.client_id, "cid.apps.googleusercontent.com");
+        assert_eq!(oauth.refresh_token.as_ref().unwrap().auth_type, "command");
+        caldav.check().expect("oauth alone is a valid block");
+    }
+
+    #[test]
+    fn caldav_oauth_parses_before_the_refresh_token_exists() {
+        // The documented bootstrap order: client_id/client_secret are
+        // configured first, `jamaild google-auth` is run against them, and
+        // only then is there a token to name.
+        let cfg = parse(
+            "accounts:\n\
+             \x20 gmail:\n\
+             \x20   email: alice@gmail.com\n\
+             \x20   imap:\n\
+             \x20     host: imap.gmail.com\n\
+             \x20     port: 993\n\
+             \x20     login: alice@gmail.com\n\
+             \x20     auth: {type: password, value: app-password}\n\
+             \x20   caldav:\n\
+             \x20     url: https://apidata.googleusercontent.com/caldav/v2/alice@gmail.com/user\n\
+             \x20     login: alice@gmail.com\n\
+             \x20     oauth:\n\
+             \x20       client_id: cid.apps.googleusercontent.com\n\
+             \x20       client_secret: {type: password, value: s}\n",
+        );
+        let (_, acc) = cfg.default_account().unwrap();
+        let oauth = acc.caldav.as_ref().unwrap().oauth.as_ref().unwrap();
+        assert!(oauth.refresh_token.is_none());
+    }
+
+    #[test]
+    fn a_caldav_block_naming_no_credentials_fails_its_check() {
+        let cfg = parse(
+            "accounts:\n\
+             \x20 work:\n\
+             \x20   email: alice@corp.com\n\
+             \x20   imap:\n\
+             \x20     host: imap.corp.com\n\
+             \x20     port: 993\n\
+             \x20     login: alice@corp.com\n\
+             \x20     auth: {type: password, value: secret}\n\
+             \x20   caldav:\n\
+             \x20     url: https://cal.corp.com/dav/\n\
+             \x20     login: alice@corp.com\n",
+        );
+        let (_, acc) = cfg.default_account().unwrap();
+        let err = acc.caldav.as_ref().unwrap().check().unwrap_err();
+        assert!(format!("{}", err).contains("neither"));
     }
 
     #[test]

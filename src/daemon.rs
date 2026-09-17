@@ -236,6 +236,13 @@ fn spawn_cal_pump(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         while let Ok(ev) = rx.recv() {
+            // Same reason as [`spawn_pump`]: calendar trouble — a rejected
+            // password, an expired OAuth refresh token, an unreachable
+            // server — must be readable in the journal of a daemon nobody
+            // has a client attached to.
+            if let CalSyncEvent::Error(msg) = &ev {
+                eprintln!("jamaild: {}: calendar: {}", account, msg);
+            }
             daemon.broadcast(ServerMessage::Event(ipc::wire_calsync_event(&account, &ev)));
         }
     })

@@ -28,6 +28,7 @@ pub mod calsync;
 pub mod config;
 pub mod daemon;
 pub mod db;
+pub mod goauth;
 pub mod httpc;
 pub mod ipc;
 pub mod jadav;

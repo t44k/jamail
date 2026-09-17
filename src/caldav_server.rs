@@ -337,10 +337,16 @@ fn check_auth(req: &HttpRequest, caldav_cfg: &crate::config::CalDavConfig) -> Re
     let Some(auth_header) = req.headers.get("authorization") else {
         return Err(unauthorized());
     };
-    let password = caldav_cfg
-        .auth
-        .resolve_password()
-        .map_err(|_| internal_error())?;
+    // Basic is the only scheme this server offers, so an account that
+    // authenticates to *its* CalDAV server with OAuth alone
+    // (`caldav.oauth` and no `caldav.auth`) has no shared secret a client
+    // could present here: it stays unreachable rather than being served
+    // unauthenticated. Setting `caldav.auth` as well makes it reachable —
+    // the two keys are independent (see `config::CalDavConfig::auth`).
+    let Some(auth) = &caldav_cfg.auth else {
+        return Err(unauthorized());
+    };
+    let password = auth.resolve_password().map_err(|_| internal_error())?;
     let expected = httpc::basic_auth_header(&caldav_cfg.login, &password);
     if auth_header == &expected {
         Ok(())
@@ -646,10 +652,11 @@ mod tests {
                 // *server* role's Basic-auth check, not this URL).
                 url: "http://unused.invalid/".to_string(),
                 login: login.to_string(),
-                auth: AuthConfig {
+                auth: Some(AuthConfig {
                     auth_type: "password".to_string(),
                     value: password.to_string(),
-                },
+                }),
+                oauth: None,
                 calendars: None,
                 poll_interval_secs: 300,
                 default_alarm_minutes_before: None,

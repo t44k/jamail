@@ -115,6 +115,11 @@ accounts:
       # set if the server doesn't support that chain. Point this directly
       # at a calendar collection URL if you already know it.
       url: https://cal.example.com/dav/
+      # Exactly one of `auth:` (HTTP Basic, below) or `oauth:` (bearer
+      # tokens — see the gmail account further down) is required. Setting
+      # both means: OAuth to reach the server, Basic for the optional
+      # inbound CalDAV server (daemon.caldav_server_listen) to check
+      # clients against.
       login: alice@corp.com
       auth:
         type: command
@@ -159,6 +164,37 @@ accounts:
       - "[Gmail]/Sent Mail"
       - "[Gmail]/Drafts"
       - "[Gmail]/Starred"
+    # Google Calendar, synced by jamaild directly (no jadav in between).
+    # Google's CalDAV endpoint accepts OAuth 2.0 bearer tokens only — no
+    # password, no App Password — so this block uses `oauth:` instead of
+    # `auth:`. Full walkthrough (Google Cloud console -> jamaild
+    # google-auth -> caldav-check) in the README, "Google Calendar in
+    # jamaild".
+    caldav:
+      # The documented Google CalDAV principal URL for this address;
+      # discovery finds every calendar of the account from here.
+      url: https://apidata.googleusercontent.com/caldav/v2/alice@gmail.com/user
+      login: alice@gmail.com
+      oauth:
+        # provider: google        # the default and only value today
+        # The OAuth client you created in the Google Cloud console; its
+        # type must be "Desktop app".
+        client_id: 1234567890-abcdefg.apps.googleusercontent.com
+        client_secret:
+          type: command
+          value: pass show google/jamail/client_secret
+        # Written by `jamaild google-auth gmail` — that command prints
+        # the exact two lines to paste here. Use `pass` instead if you
+        # keep secrets there (`jamaild google-auth gmail --print`).
+        refresh_token:
+          type: command
+          value: cat /home/alice/.local/share/jamail/oauth/gmail.token
+      # Optional, same as for any other CalDAV account: only sync these
+      # calendars (by display name), how often to poll, and default alarm
+      # lead times for events without a VALARM.
+      # calendars: [alice@gmail.com, Family]
+      poll_interval_secs: 300
+      default_alarm_minutes_before: [30, 5]
 
 # Optional: settings for jacal, the calendar TUI.
 jacal:
