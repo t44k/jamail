@@ -26,6 +26,14 @@
 //! 3. Upsert changed events and delete removed ones in the local cache,
 //!    then persist the new sync-token/ctag.
 //!
+//! ## Authentication
+//!
+//! Basic (`caldav.auth`) or OAuth 2.0 bearer (`caldav.oauth`, which is
+//! what Google Calendar requires) — [`resolve_auth`] turns one `caldav:`
+//! block into a [`crate::caldav::AuthScheme`] and explains why the bearer
+//! token source is built once per thread while a Basic password is
+//! re-resolved every cycle.
+//!
 //! ## Conflict handling
 //!
 //! A write that hits [`crate::caldav::CalDavError::Conflict`] (stale
@@ -38,10 +46,11 @@
 //! think about, but calendar writes very much do (two people editing the
 //! same event, `jacal` open in two places, etc).
 
-use crate::caldav::{CalDavClient, CalDavError, SyncOutcome};
+use crate::caldav::{AuthScheme, CalDavClient, CalDavError, SyncOutcome};
 use crate::calendar::EventEdits;
-use crate::config::JamailAccount;
+use crate::config::{CalDavConfig, JamailAccount, OauthProvider};
 use crate::db::{self, MailDb};
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -138,12 +147,77 @@ pub fn spawn_calsync_thread(
     }))
 }
 
+/// Build the [`AuthScheme`] for a `caldav:` block, reusing `bearer` when
+/// this config authenticates with OAuth.
+///
+/// The two arms differ in what "resolve" means over time, which is why
+/// the caller owns the cache rather than this function:
+///
+/// - **Basic**: the password is re-resolved every cycle, so a rotated
+///   `type: command` secret is picked up without restarting `jamaild`
+///   (the behaviour before OAuth existed, unchanged).
+/// - **Bearer**: the [`crate::goauth::GoogleTokenSource`] is built once
+///   and then handed back on every cycle, because it *is* the access-token
+///   cache — rebuilding it per cycle would spend a refresh call every poll
+///   interval instead of one an hour.
+///
+/// When both `auth` and `oauth` are configured, `oauth` wins: `auth` is
+/// then only the inbound CalDAV server's Basic credential (see
+/// [`CalDavConfig::auth`]).
+pub fn resolve_auth(
+    cfg: &CalDavConfig,
+    bearer: &mut Option<AuthScheme>,
+) -> anyhow::Result<AuthScheme> {
+    cfg.check()?;
+    if let Some(oauth) = &cfg.oauth {
+        if let Some(scheme) = bearer {
+            return Ok(scheme.clone());
+        }
+        let OauthProvider::Google = oauth.provider;
+        let client_secret = oauth
+            .client_secret
+            .resolve_password()
+            .context("resolving caldav.oauth.client_secret")?;
+        let refresh_token = oauth
+            .refresh_token
+            .as_ref()
+            .context(
+                "caldav.oauth.refresh_token is not set — run `jamaild google-auth <account>` \
+                 once and point it at the token that prints",
+            )?
+            .resolve_password()
+            .context("resolving caldav.oauth.refresh_token")?;
+        let source =
+            crate::goauth::GoogleTokenSource::new(&oauth.client_id, &client_secret, &refresh_token);
+        let scheme = AuthScheme::Bearer(Arc::new(Mutex::new(source)));
+        *bearer = Some(scheme.clone());
+        return Ok(scheme);
+    }
+    let auth = cfg.auth.as_ref().expect("check() proved one is set");
+    Ok(AuthScheme::Basic {
+        login: cfg.login.clone(),
+        password: auth.resolve_password().context("resolving caldav.auth")?,
+    })
+}
+
+/// One CalDAV client for `cfg`, ready to talk to the server. Used by the
+/// sync loop and by `jamaild caldav-check`.
+pub fn connect(
+    cfg: &CalDavConfig,
+    bearer: &mut Option<AuthScheme>,
+) -> anyhow::Result<CalDavClient> {
+    let auth = resolve_auth(cfg, bearer)?;
+    CalDavClient::new_with_auth(&cfg.url, auth)
+}
+
 fn calsync_loop(
     account_name: String,
     cfg: crate::config::CalDavConfig,
     control: Arc<CalSyncControl>,
     tx: Sender<CalSyncEvent>,
 ) {
+    // Outlives the loop on purpose — see [`resolve_auth`].
+    let mut bearer: Option<AuthScheme> = None;
     loop {
         if control.shutdown.load(Ordering::Relaxed) {
             return;
@@ -160,18 +234,10 @@ fn calsync_loop(
             }
         };
 
-        let password = match cfg.auth.resolve_password() {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = tx.send(CalSyncEvent::Error(format!("auth: {}", e)));
-                sleep_or_shutdown(&control, Duration::from_secs(60));
-                continue;
-            }
-        };
-        let client = match CalDavClient::new(&cfg.url, &cfg.login, &password) {
+        let client = match connect(&cfg, &mut bearer) {
             Ok(c) => c,
             Err(e) => {
-                let _ = tx.send(CalSyncEvent::Error(format!("{}", e)));
+                let _ = tx.send(CalSyncEvent::Error(format!("auth: {:#}", e)));
                 sleep_or_shutdown(&control, Duration::from_secs(60));
                 continue;
             }
@@ -576,6 +642,97 @@ mod tests {
     use super::*;
     use crate::caldav::ChangedEvent;
     use crate::calendar::parse_vevents;
+    use crate::config::{AuthConfig, CalDavOauthConfig};
+
+    fn password(value: &str) -> AuthConfig {
+        AuthConfig {
+            auth_type: "password".to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    fn caldav_cfg(auth: Option<AuthConfig>, oauth: Option<CalDavOauthConfig>) -> CalDavConfig {
+        CalDavConfig {
+            url: "https://cal.example.com/dav/".to_string(),
+            login: "alice@example.com".to_string(),
+            auth,
+            oauth,
+            calendars: None,
+            poll_interval_secs: 300,
+            default_alarm_minutes_before: None,
+        }
+    }
+
+    fn oauth_cfg(refresh_token: Option<AuthConfig>) -> CalDavOauthConfig {
+        CalDavOauthConfig {
+            provider: OauthProvider::Google,
+            client_id: "cid.apps.googleusercontent.com".to_string(),
+            client_secret: password("csecret"),
+            refresh_token,
+        }
+    }
+
+    #[test]
+    fn basic_auth_is_resolved_fresh_on_every_call_so_a_rotated_secret_is_picked_up() {
+        let cfg = caldav_cfg(Some(password("pw")), None);
+        let mut bearer = None;
+        match resolve_auth(&cfg, &mut bearer).unwrap() {
+            AuthScheme::Basic { login, password } => {
+                assert_eq!(login, "alice@example.com");
+                assert_eq!(password, "pw");
+            }
+            _ => panic!("expected Basic"),
+        }
+        // Nothing is cached for Basic: the next cycle re-runs the auth
+        // command rather than replaying a stale password.
+        assert!(bearer.is_none());
+    }
+
+    #[test]
+    fn oauth_yields_one_bearer_token_source_reused_across_cycles() {
+        let cfg = caldav_cfg(None, Some(oauth_cfg(Some(password("1//rt")))));
+        let mut bearer = None;
+        let first = resolve_auth(&cfg, &mut bearer).unwrap();
+        let second = resolve_auth(&cfg, &mut bearer).unwrap();
+        match (first, second) {
+            (AuthScheme::Bearer(a), AuthScheme::Bearer(b)) => {
+                // The same token source, so the access token cached inside
+                // it survives the poll interval — one refresh an hour, not
+                // one per cycle.
+                assert!(Arc::ptr_eq(&a, &b));
+            }
+            _ => panic!("expected Bearer"),
+        }
+    }
+
+    #[test]
+    fn oauth_wins_when_both_auth_kinds_are_configured() {
+        // `auth` stays meaningful for the inbound CalDAV server's Basic
+        // check; the *outbound* client must still use the bearer token.
+        let cfg = caldav_cfg(
+            Some(password("pw")),
+            Some(oauth_cfg(Some(password("1//rt")))),
+        );
+        let mut bearer = None;
+        assert!(matches!(
+            resolve_auth(&cfg, &mut bearer).unwrap(),
+            AuthScheme::Bearer(_)
+        ));
+    }
+
+    #[test]
+    fn oauth_without_a_refresh_token_names_the_command_that_creates_one() {
+        let cfg = caldav_cfg(None, Some(oauth_cfg(None)));
+        let err = format!("{:#}", resolve_auth(&cfg, &mut None).unwrap_err());
+        assert!(err.contains("google-auth"), "{}", err);
+    }
+
+    #[test]
+    fn a_caldav_block_with_no_credentials_at_all_is_rejected() {
+        let cfg = caldav_cfg(None, None);
+        let err = format!("{:#}", resolve_auth(&cfg, &mut None).unwrap_err());
+        assert!(err.contains("neither"), "{}", err);
+    }
 
     #[test]
     fn apply_changed_event_upserts_when_calendar_data_is_inline() {

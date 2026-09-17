@@ -29,11 +29,13 @@
 //!
 //! ## Explicit limitations
 //!
-//! - **Authentication is HTTP Basic only.** No Digest, OAuth2, or
-//!   client-certificate support. Basic auth over TLS is what the large
-//!   majority of self-hosted CalDAV servers (Radicale, Baikal, Nextcloud)
-//!   and Fastmail support; this is the same scope decision this crate
-//!   already made for IMAP/SMTP (`password`/`command` auth only).
+//! - **Authentication is HTTP Basic or OAuth 2.0 bearer**
+//!   ([`AuthScheme`]). No Digest and no client certificates. Basic auth
+//!   over TLS is what the large majority of self-hosted CalDAV servers
+//!   (Radicale, Baikal, Nextcloud) and Fastmail support; the bearer arm
+//!   exists for Google, whose CalDAV endpoint accepts nothing else — the
+//!   tokens behind it come from [`crate::goauth`], and a `401` triggers
+//!   exactly one retry with a freshly refreshed token.
 //! - **No `VFREEBUSY`/scheduling (`iTIP`) support** — creating an event
 //!   with `ATTENDEE`s does not send invitations; it only stores the
 //!   `VEVENT` as given.
@@ -143,9 +145,26 @@ pub trait TokenSource: Send {
     fn invalidate(&mut self);
 }
 
+/// How this client proves who it is. `Clone` because a caller keeps one
+/// scheme alive across poll cycles and builds a fresh [`CalDavClient`] per
+/// cycle from it — cloning a `Bearer` clones the `Arc`, so the cached
+/// access token (and any refresh it just did) is shared, not re-fetched.
+#[derive(Clone)]
 pub enum AuthScheme {
     Basic { login: String, password: String },
     Bearer(std::sync::Arc<std::sync::Mutex<dyn TokenSource>>),
+}
+
+impl fmt::Debug for AuthScheme {
+    /// Deliberately credential-free: this type travels into error
+    /// messages and logs, and neither a password nor a bearer token has
+    /// any business there.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AuthScheme::Basic { login, .. } => write!(f, "Basic({})", login),
+            AuthScheme::Bearer(_) => write!(f, "Bearer(<token source>)"),
+        }
+    }
 }
 
 pub struct CalDavClient {
@@ -954,6 +973,66 @@ mod tests {
 
     fn client_for(base: &str) -> CalDavClient {
         CalDavClient::new(base, "alice", "secret").unwrap()
+    }
+
+    /// Hands out `t1`, `t2`, … and counts how often it was invalidated —
+    /// enough to prove the header and the 401 retry without a real
+    /// OAuth endpoint (that side is tested in `goauth`).
+    struct StubTokens {
+        issued: usize,
+        invalidated: usize,
+    }
+
+    impl TokenSource for StubTokens {
+        fn token(&mut self) -> Result<String> {
+            self.issued += 1;
+            Ok(format!("t{}", self.issued))
+        }
+        fn invalidate(&mut self) {
+            self.invalidated += 1;
+        }
+    }
+
+    #[test]
+    fn bearer_auth_sends_the_token_and_retries_once_with_a_fresh_one_after_401() {
+        let ics = "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n";
+        let ok = format!(
+            "HTTP/1.1 200 OK\r\nETag: \"e1\"\r\nContent-Length: {}\r\n\r\n{}",
+            ics.len(),
+            ics
+        );
+        let (base, handle) = mock_server(vec![
+            // The access token expired between poll cycles.
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+            Box::leak(ok.into_boxed_str()),
+        ]);
+        let tokens = std::sync::Arc::new(std::sync::Mutex::new(StubTokens {
+            issued: 0,
+            invalidated: 0,
+        }));
+        let client =
+            CalDavClient::new_with_auth(&base, AuthScheme::Bearer(tokens.clone())).unwrap();
+        let (etag, body) = client.get_event("/cal/x.ics").unwrap();
+        assert_eq!(etag.as_deref(), Some("\"e1\""));
+        assert_eq!(body, ics);
+
+        let requests = handle.join().unwrap();
+        assert!(requests[0].contains("Authorization: Bearer t1"));
+        // Retried with a *fresh* token, not a replay of the rejected one.
+        assert!(requests[1].contains("Authorization: Bearer t2"));
+        let stub = tokens.lock().unwrap();
+        assert_eq!(stub.invalidated, 1, "the rejected token must be dropped");
+    }
+
+    #[test]
+    fn auth_scheme_debug_never_renders_a_credential() {
+        let basic = AuthScheme::Basic {
+            login: "alice@example.com".to_string(),
+            password: "hunter2".to_string(),
+        };
+        let rendered = format!("{:?}", basic);
+        assert!(rendered.contains("alice@example.com"));
+        assert!(!rendered.contains("hunter2"));
     }
 
     #[test]

@@ -3,10 +3,13 @@
 //! - **Auth**: OAuth 2.0 with a long-lived refresh token (obtained once via
 //!   `jadav google auth <remote>` — a Desktop-app PKCE flow whose redirect
 //!   the user pastes back — or imported from the previous bridge's state
-//!   with `jadav google import-token`). Access tokens are cached until a
-//!   minute before expiry and persisted in the store so a restart does not
-//!   spend a refresh. `invalid_grant` marks the remote as needing re-auth;
-//!   the mirror thread then stops touching it until a human acts.
+//!   with `jadav google import-token`). The flow and the token endpoint
+//!   itself live in [`crate::goauth`], shared with `jamaild`'s Google
+//!   CalDAV support; [`GoogleAuth`] is the jadav-side wrapper that adds
+//!   persistence — access tokens are cached until a minute before expiry
+//!   and written to the store so a restart does not spend a refresh.
+//!   `invalid_grant` marks the remote as needing re-auth; the mirror
+//!   thread then stops touching it until a human acts.
 //! - **Listing**: `events.list` with `syncToken` (incremental) or `timeMin`
 //!   (initial/full), `showDeleted=true`, paging via `nextPageToken`; `410
 //!   Gone` means the token expired → full resync. Never `singleEvents=true`:
@@ -28,13 +31,14 @@
 //!   event ids are stamped as `X-GOOGLE-EVENT-ID` for debugging.
 
 use crate::calendar::{self, EventTime, VEvent};
+use crate::goauth;
 use crate::httpc::{self, HttpResponse, HttpUrl};
 use crate::jadav::mirror::{
     Capabilities, Changes, Precondition, RemoteCalendar, RemoteError, RemoteId, RemoteObject,
     RemoteVersion, Semantic, VCalendarDoc, assemble_vcalendar,
 };
 use crate::jadav::store::{OauthTokenRow, Store};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -43,9 +47,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const API: &str = "https://www.googleapis.com/calendar/v3";
-pub const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-pub const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-pub const SCOPE: &str = "https://www.googleapis.com/auth/calendar";
+pub use crate::goauth::{AUTH_URL, SCOPE_CALENDAR as SCOPE, TOKEN_URL};
 pub const PRODID: &str = "-//jadav//google mirror//EN";
 const TIMEOUT: Duration = Duration::from_secs(60);
 const PAGE_SIZE: u32 = 250;
@@ -62,16 +64,6 @@ pub struct GoogleAuth {
     access_token: Option<String>,
     expires_at: i64,
     store_path: Option<PathBuf>,
-}
-
-#[derive(Deserialize)]
-struct TokenResponse {
-    access_token: Option<String>,
-    expires_in: Option<i64>,
-    refresh_token: Option<String>,
-    scope: Option<String>,
-    error: Option<String>,
-    error_description: Option<String>,
 }
 
 impl GoogleAuth {
@@ -155,31 +147,26 @@ impl GoogleAuth {
     }
 
     fn refresh(&mut self) -> Result<(), RemoteError> {
-        let body = httpc::form_urlencode(&[
-            ("client_id", self.client_id.as_str()),
-            ("client_secret", self.client_secret.as_str()),
-            ("refresh_token", self.refresh_token.as_str()),
-            ("grant_type", "refresh_token"),
-        ]);
-        let resp = post_form(TOKEN_URL, &body).map_err(RemoteError::Transient)?;
-        let parsed: TokenResponse = resp
-            .json()
-            .map_err(|e| RemoteError::Other(e.context("decoding token response")))?;
-        if resp.status == 400 && parsed.error.as_deref() == Some("invalid_grant") {
-            self.invalidate();
-            self.persist(true);
-            return Err(RemoteError::NeedsReauth);
-        }
-        if resp.status != 200 {
-            return Err(RemoteError::Other(anyhow!(
-                "token refresh failed: HTTP {} {} {}",
-                resp.status,
-                parsed.error.unwrap_or_default(),
-                parsed.error_description.unwrap_or_default()
-            )));
-        }
-        self.access_token = parsed.access_token;
-        self.expires_at = Utc::now().timestamp() + parsed.expires_in.unwrap_or(3600);
+        let grant = goauth::refresh_access_token(
+            TOKEN_URL,
+            &self.client_id,
+            &self.client_secret,
+            &self.refresh_token,
+        )
+        .map_err(|e| match e {
+            // A revoked/expired refresh token is recorded, not retried:
+            // the mirror thread stops on `NeedsReauth` until a human runs
+            // `jadav google auth` again.
+            goauth::TokenError::InvalidGrant => {
+                self.invalidate();
+                self.persist(true);
+                RemoteError::NeedsReauth
+            }
+            goauth::TokenError::Transport(e) => RemoteError::Transient(e),
+            goauth::TokenError::Other(e) => RemoteError::Other(e),
+        })?;
+        self.access_token = grant.access_token;
+        self.expires_at = Utc::now().timestamp() + grant.expires_in.unwrap_or(3600);
         self.persist(false);
         Ok(())
     }
@@ -192,23 +179,6 @@ impl crate::caldav::TokenSource for GoogleAuth {
     fn invalidate(&mut self) {
         GoogleAuth::invalidate(self)
     }
-}
-
-fn post_form(url: &str, body: &str) -> Result<HttpResponse> {
-    let url = HttpUrl::parse(url)?;
-    httpc::send(
-        "POST",
-        &url,
-        &[
-            (
-                "Content-Type".to_string(),
-                "application/x-www-form-urlencoded".to_string(),
-            ),
-            ("Accept".to_string(), "application/json".to_string()),
-        ],
-        Some(body.as_bytes()),
-        TIMEOUT,
-    )
 }
 
 // ---------------------------------------------------------------------
@@ -1535,74 +1505,8 @@ pub fn import_token(
     Ok(())
 }
 
-fn random_unreserved(n: usize) -> Result<String> {
-    use std::io::Read;
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
-    let mut bytes = vec![0u8; n];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes
-        .iter()
-        .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
-        .collect())
-}
-
-/// The authorization URL and the PKCE verifier/state to keep for the
-/// exchange (Desktop-app flow, S256).
-pub fn build_auth_url(client_id: &str, login_hint: &str) -> Result<(String, String, String)> {
-    use base64::Engine;
-    use sha2::{Digest, Sha256};
-    let verifier = random_unreserved(64)?;
-    let state = random_unreserved(16)?;
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(Sha256::digest(verifier.as_bytes()));
-    let url = format!(
-        "{}?{}",
-        AUTH_URL,
-        httpc::build_query(&[
-            ("client_id", client_id),
-            ("redirect_uri", "http://localhost"),
-            ("response_type", "code"),
-            ("scope", SCOPE),
-            ("access_type", "offline"),
-            ("prompt", "consent"),
-            ("login_hint", login_hint),
-            ("code_challenge", &challenge),
-            ("code_challenge_method", "S256"),
-            ("state", &state),
-        ])
-    );
-    Ok((url, verifier, state))
-}
-
-/// Extract `code` (and check `state`) from a pasted redirect URL, or accept
-/// a bare code.
-pub fn parse_redirect(input: &str, expected_state: &str) -> Result<String> {
-    let input = input.trim();
-    if !input.contains('?') && !input.contains("code=") {
-        return Ok(input.to_string());
-    }
-    let query = input.split_once('?').map(|(_, q)| q).unwrap_or(input);
-    let mut code = None;
-    let mut state = None;
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            match k {
-                "code" => code = Some(httpc::percent_decode(v)),
-                "state" => state = Some(httpc::percent_decode(v)),
-                _ => {}
-            }
-        }
-    }
-    if let Some(s) = state
-        && s != expected_state
-    {
-        bail!("state mismatch: expected {}, got {}", expected_state, s);
-    }
-    code.context("redirect URL has no code= parameter")
-}
-
-/// Interactive: print the URL, read the pasted redirect from stdin,
-/// exchange, store.
+/// Interactive: run [`goauth::authorize_interactive`]'s browser round trip
+/// and store the refresh token it yields against `remote`.
 pub fn auth_interactive(
     store: &Store,
     remote: &str,
@@ -1610,52 +1514,23 @@ pub fn auth_interactive(
     client_secret: &str,
     login_hint: &str,
 ) -> Result<()> {
-    let (url, verifier, state) = build_auth_url(client_id, login_hint)?;
-    println!(
-        "Open this URL in a browser, sign in as {}, and approve:\n\n{}\n",
-        login_hint, url
-    );
-    println!("The browser will end on an http://localhost/?code=... page that fails to load —");
-    println!("copy that whole address (or just the code) and paste it here, then press Enter:");
-    let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .context("reading the pasted redirect")?;
-    let code = parse_redirect(&line, &state)?;
-    let body = httpc::form_urlencode(&[
-        ("client_id", client_id),
-        ("client_secret", client_secret),
-        ("code", code.as_str()),
-        ("code_verifier", verifier.as_str()),
-        ("grant_type", "authorization_code"),
-        ("redirect_uri", "http://localhost"),
-    ]);
-    let resp = post_form(TOKEN_URL, &body)?;
-    let parsed: TokenResponse = resp.json()?;
-    if resp.status != 200 {
-        bail!(
-            "token exchange failed: HTTP {} {} {}",
-            resp.status,
-            parsed.error.unwrap_or_default(),
-            parsed.error_description.unwrap_or_default()
-        );
-    }
-    let refresh = parsed
+    let grant = goauth::authorize_interactive(client_id, client_secret, login_hint)?;
+    let refresh = grant
         .refresh_token
-        .context("Google returned no refresh token (is the OAuth client a Desktop app with access_type=offline?)")?;
+        .context("Google returned no refresh token")?;
     store.put_oauth_token(
         remote,
         &OauthTokenRow {
             refresh_token: refresh,
-            access_token: parsed.access_token,
-            expires_at: parsed.expires_in.map(|s| Utc::now().timestamp() + s),
+            access_token: grant.access_token,
+            expires_at: grant.expires_in.map(|s| Utc::now().timestamp() + s),
             needs_reauth: false,
         },
     )?;
     println!(
         "authorised remote {} (scope: {})",
         remote,
-        parsed.scope.unwrap_or_else(|| SCOPE.to_string())
+        grant.scope.unwrap_or_else(|| SCOPE.to_string())
     );
     Ok(())
 }
@@ -1854,29 +1729,6 @@ mod tests {
         assert_eq!(
             send_updates_for(crate::jadav::config::SendVia::Provider),
             "all"
-        );
-    }
-
-    #[test]
-    fn pkce_url_and_redirect_parsing() {
-        let (url, verifier, state) = build_auth_url("cid", "me@example.com").unwrap();
-        assert!(url.starts_with(AUTH_URL));
-        assert!(url.contains("access_type=offline"));
-        assert!(url.contains("prompt=consent"));
-        assert!(url.contains("code_challenge_method=S256"));
-        assert!(url.contains(&format!("state={}", state)));
-        assert!(url.contains("login_hint=me%40example.com"));
-        assert_eq!(verifier.len(), 64);
-        let code = parse_redirect(
-            &format!("http://localhost/?state={}&code=4%2Fabc&scope=x", state),
-            &state,
-        )
-        .unwrap();
-        assert_eq!(code, "4/abc");
-        assert!(parse_redirect("http://localhost/?state=wrong&code=4%2Fabc", &state).is_err());
-        assert_eq!(
-            parse_redirect("  4/plain-code  ", &state).unwrap(),
-            "4/plain-code"
         );
     }
 

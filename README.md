@@ -188,15 +188,143 @@ create/update/delete requests.
 - Only **IANA-named timezones** are understood (`chrono-tz`); a server-defined
   custom `VTIMEZONE` with a non-IANA identifier is an explicit parse error,
   not silently misinterpreted.
-- **Basic auth only** for CalDAV (no OAuth2/Digest), matching this project's
-  existing IMAP/SMTP auth scope.
-- **Alarms only fire while `jacal` is running** — unlike mail notifications
-  (owned by the always-on `jamaild`), there's no always-on piece for calendar
-  alarms in this first cut.
+- **HTTP Basic or OAuth 2.0 bearer tokens** for CalDAV (no Digest, no client
+  certificates). Basic covers the self-hosted servers and Fastmail; the bearer
+  path exists because Google's CalDAV endpoint accepts nothing else — see
+  [Google Calendar in jamaild](#google-calendar-in-jamaild-oauth) below.
 - No `VFREEBUSY`/scheduling (`iTIP`) support — creating an event with
   attendees stores it as given; it does not send invitations.
 - The optional inbound CalDAV server hosts **one calendar per account**
   ("Default", auto-created) — not arbitrary multi-calendar hosting.
+
+### Google Calendar in jamaild (OAuth)
+
+Google's CalDAV endpoint does not accept passwords — not your account password
+and not an App Password. The only credential it takes is an OAuth 2.0 bearer
+token, so a Google account's `caldav:` block uses `oauth:` instead of `auth:`.
+`jamaild` then refreshes access tokens itself and syncs that calendar like any
+other; `jacal` shows it, alarms fire from the daemon, and edits sync back.
+
+This is independent of mail: Gmail **IMAP** still uses an App Password in the
+`imap:` block. The OAuth credential below is only for the calendar.
+
+#### 1. Create an OAuth client in the Google Cloud console
+
+You do this once, and it is per *you*, not per install — the client you create
+is what identifies "jamail on my machines" to Google.
+
+1. **Project** — <https://console.cloud.google.com/projectcreate> (or pick an
+   existing one). Any name.
+2. **Enable the API** — *APIs & Services → Library* → "Google Calendar API" →
+   **Enable**.
+3. **OAuth consent screen** — *APIs & Services → OAuth consent screen*. User
+   type **External** (personal Google accounts) or **Internal** (a Workspace
+   org, if you only ever sign in with accounts in it). Fill in the app name and
+   your email; you do not need to add scopes here.
+4. **Test users** — *OAuth consent screen → Audience → Test users → + Add
+   users*: add every Google address you will sign in with. An External app in
+   *Testing* publishing status refuses anyone else with "Access blocked: has not
+   completed the Google verification process".
+5. **Credentials** — *APIs & Services → Credentials → + Create credentials →
+   OAuth client ID*, application type **Desktop app**. Copy the **client ID**
+   and **client secret**. The type matters: only an installed-app client gets a
+   refresh token out of this flow.
+
+> **The seven-day catch.** While the app sits in *Testing*, Google expires
+> every refresh token after 7 days, and sync then stops with `invalid_grant`.
+> For a daemon you leave running, click **Publish app** on the consent screen —
+> with only Calendar scopes for your own accounts there is nothing to submit for
+> review, and tokens stop expiring. (*Internal* Workspace apps never have this
+> problem.)
+
+#### 2. Point the account at Google and add the client
+
+```yaml
+accounts:
+  gmail:
+    email: alice@gmail.com
+    imap: { ... }                # unchanged: Gmail IMAP uses an App Password
+    caldav:
+      # Google's CalDAV principal URL for this address. Discovery walks
+      # current-user-principal -> calendar-home-set from here and finds
+      # every calendar the account can see.
+      url: https://apidata.googleusercontent.com/caldav/v2/alice@gmail.com/user
+      login: alice@gmail.com
+      oauth:
+        client_id: 1234567890-abcdefg.apps.googleusercontent.com
+        client_secret:
+          type: command
+          value: pass show google/jamail/client_secret
+```
+
+`client_secret` (and `refresh_token`, below) take the same `type: password` /
+`type: command` shape as every other secret in this file, so a password manager
+works without any special support.
+
+#### 3. Authorize once
+
+```bash
+jamaild google-auth gmail
+```
+
+It prints a URL, you open it in a browser, sign in as that address and approve.
+The browser ends on a `http://localhost/?code=...` page that fails to load —
+that failure is expected; copy the whole address out of the address bar and
+paste it back into the terminal.
+
+The refresh token it gets is written to
+`~/.local/share/jamail/oauth/<account>.token` (mode `0600`, so it never lands in
+your shell history or scrollback), and the command prints the two lines to add:
+
+```yaml
+      refresh_token:
+        type: command
+        value: cat /home/alice/.local/share/jamail/oauth/gmail.token
+```
+
+Prefer to keep it in `pass`? `jamaild google-auth gmail --print` writes nothing
+and prints the token instead, for `pass insert -m google/jamail/refresh_token`.
+
+#### 4. Check it, then restart the daemon
+
+```bash
+jamaild caldav-check gmail
+```
+
+This resolves the credentials exactly the way the sync thread does and lists
+what discovery finds:
+
+```
+gmail — https://apidata.googleusercontent.com/caldav/v2/alice@gmail.com/user
+  auth: OAuth bearer
+  · alice@gmail.com
+      https://apidata.googleusercontent.com/caldav/v2/alice%40gmail.com/events/
+  · Family
+      https://apidata.googleusercontent.com/caldav/v2/...%40group.calendar.google.com/events/
+  2 calendar(s) discovered
+```
+
+Those display names are what `caldav.calendars` filters on if you only want
+some of them (your primary calendar is named after the address). Then restart
+`jamaild` (`systemctl --user restart jamaild`, or just kill it — `jamail`/`jacal`
+respawn one) and open `jacal`.
+
+Both commands read the config and talk to Google directly, so they are safe to
+run while the daemon is up.
+
+#### Troubleshooting
+
+| What you see | What it means |
+| --- | --- |
+| `Access blocked: … has not completed the Google verification process` | The signing-in address isn't in **Test users** (step 1.4). |
+| `invalid_grant` in `jamaild caldav-check` or the journal | The refresh token expired (the 7-day *Testing* limit), was revoked, or belongs to a different client ID. Publish the app, then re-run `jamaild google-auth`. |
+| `invalid_client` / `The OAuth client was not found` | `client_id` or `client_secret` doesn't match the credential in the console. |
+| `Google returned no refresh token` | The OAuth client isn't of type **Desktop app**. |
+| `no calendar collections discovered under …` | The `url` isn't the `/caldav/v2/<address>/user` principal URL, or the Calendar API isn't enabled on the project. |
+| Calendar sync errors nowhere on screen | They go to the daemon's journal: `journalctl --user -u jamaild -f` (or its terminal), tagged `jamaild: <account>: calendar:`. |
+
+Same flow, same commands, for any other OAuth-only CalDAV server; only `google`
+is implemented as a provider today.
 
 ## Configuration
 
@@ -271,6 +399,17 @@ accounts:
 | `accounts.<name>.smtp.auth.type` | No | `password` or `command` (same as IMAP auth) |
 | `accounts.<name>.smtp.auth.value` | No | Literal password, or shell command that outputs it |
 | `accounts.<name>.smtp.starttls` | No | `true` for STARTTLS (default), `false` for implicit TLS |
+| `accounts.<name>.caldav.url` | No | CalDAV server URL — any URL under the account's CalDAV root (discovery walks `current-user-principal` -> `calendar-home-set` from it), or a calendar collection URL directly. Omitted: no calendar sync for this account |
+| `accounts.<name>.caldav.login` | Yes, with `caldav` | CalDAV login username |
+| `accounts.<name>.caldav.auth` | One of the two | HTTP Basic credentials, `type`/`value` as above. Also the credential the optional inbound CalDAV server checks clients against |
+| `accounts.<name>.caldav.oauth` | One of the two | OAuth 2.0 instead of Basic — required for Google, see [Google Calendar in jamaild](#google-calendar-in-jamaild-oauth). Set alongside `auth` to use bearer tokens outbound and keep Basic for the inbound server |
+| `accounts.<name>.caldav.oauth.provider` | No | `google` (the default and only value today) |
+| `accounts.<name>.caldav.oauth.client_id` | Yes, with `oauth` | OAuth client ID of a **Desktop app** client |
+| `accounts.<name>.caldav.oauth.client_secret` | Yes, with `oauth` | That client's secret, `type`/`value` as above |
+| `accounts.<name>.caldav.oauth.refresh_token` | Yes, to sync | The long-lived credential from `jamaild google-auth <account>`. May be absent while you run that command for the first time |
+| `accounts.<name>.caldav.calendars` | No | Only sync calendars whose server display name is in this list. Omitted: every discovered calendar |
+| `accounts.<name>.caldav.poll_interval_secs` | No | How often `jamaild` polls for calendar changes. Omitted (default): 300 |
+| `accounts.<name>.caldav.default_alarm_minutes_before` | No | Fallback alarm lead times (minutes) for events with no `VALARM`. Omitted: no reminder for those |
 | `daemon.socket_path` | No | Override the `jamaild`/`jamail` IPC socket path (see [Socket path](#socket-path)). Omitted (default): `$XDG_RUNTIME_DIR/jamail/jamaild.sock` |
 
 Auth type `command` runs the value as a shell command and reads the password from stdout. Works with `pass`, `gpg`, `secret-tool`, etc.
