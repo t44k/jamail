@@ -7,7 +7,7 @@ use crate::calendar::{EventStatus, EventTime, VEvent};
 use crate::mail::{AttachmentData, Email, EmailContent, FolderInfo};
 use chrono::{DateTime, Local, TimeZone, Utc};
 
-const CURRENT_SCHEMA_VERSION: i32 = 9;
+const CURRENT_SCHEMA_VERSION: i32 = 10;
 
 pub struct AttachmentMeta {
     pub id: i64,
@@ -27,6 +27,22 @@ pub struct CalendarRow {
     /// The address the server attached to this calendar (jadav's
     /// `owner-identity`), if it told us.
     pub identity: Option<String>,
+    /// How the server's own two-way mirror for this calendar is faring
+    /// (jadav's `mirror-state`): `"ok"`, or a short diagnosis such as
+    /// `"needs-reauth; last synced 2026-09-18 14:46Z"`. `None` when the
+    /// server says nothing — no mirror, or not a jadav. Anything but
+    /// `"ok"` means the cached events here may be stale through no fault
+    /// of this client; see [`CalendarRow::mirror_warning`].
+    pub mirror_state: Option<String>,
+}
+
+impl CalendarRow {
+    /// The mirror diagnosis to show the user, or `None` when there is
+    /// nothing wrong (no mirror, or one that is keeping up).
+    pub fn mirror_warning(&self) -> Option<&str> {
+        let s = self.mirror_state.as_deref()?.trim();
+        (!s.is_empty() && !s.eq_ignore_ascii_case("ok")).then_some(s)
+    }
 }
 
 /// A row from the `calendar_events` table. `raw_ics` is the decompressed
@@ -189,7 +205,7 @@ const MAIL_SCHEMA_SQL: &str = "DROP TABLE IF EXISTS emails_fts;
          DROP TABLE IF EXISTS schema_version;
 
          CREATE TABLE schema_version (version INTEGER NOT NULL);
-         INSERT INTO schema_version VALUES (9);
+         INSERT INTO schema_version VALUES (10);
 
          CREATE TABLE folders (
              account   TEXT NOT NULL,
@@ -284,6 +300,7 @@ const CALENDAR_SCHEMA_SQL: &str = "
              sync_token   TEXT,
              color        TEXT,
              identity     TEXT,
+             mirror_state TEXT,
              PRIMARY KEY (account, url)
          );
 
@@ -462,6 +479,40 @@ fn migrate_v4_to_v5_add_calendar_tables(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Test-only: the schema DDL with its version stamp rewritten to
+/// `version`, for building a legacy database to migrate. Keyed off
+/// [`CURRENT_SCHEMA_VERSION`] instead of a literal, and loud when it finds
+/// nothing — as a literal it silently became a no-op the first time the
+/// schema was bumped past it, leaving the "legacy" helpers handing back a
+/// current database and the migration tests asserting nothing.
+#[cfg(test)]
+fn schema_sql_at_version(sql: &str, version: i32) -> String {
+    let stamp = format!("VALUES ({})", CURRENT_SCHEMA_VERSION);
+    assert!(
+        sql.contains(&stamp),
+        "schema DDL no longer stamps {:?} — update schema_sql_at_version",
+        stamp
+    );
+    sql.replacen(&stamp, &format!("VALUES ({})", version), 1)
+}
+
+/// v9 -> v10: `calendars.mirror_state`, so a server that mirrors a remote
+/// calendar (jadav) can tell this client the mirror has stopped and
+/// `jacal` can say the events are stale instead of drawing days-old data
+/// as if it were current. Additive, like every step since v5.
+fn migrate_v9_to_v10_add_mirror_state(conn: &Connection) -> Result<()> {
+    let has_col = conn
+        .prepare("PRAGMA table_info(calendars)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == "mirror_state");
+    if !has_col {
+        conn.execute("ALTER TABLE calendars ADD COLUMN mirror_state TEXT", [])?;
+    }
+    conn.execute("UPDATE schema_version SET version = 10", [])?;
+    Ok(())
+}
+
 /// Bring `conn` up to [`CURRENT_SCHEMA_VERSION`], preserving existing mail
 /// data whenever an additive path is available (currently: exactly the
 /// v4->v5 step). Anything older than v4 still goes through a full
@@ -493,6 +544,10 @@ fn upgrade_schema(conn: &Connection) -> Result<()> {
     if version == 8 {
         migrate_v8_to_v9_add_flagged(conn)?;
         version = 9;
+    }
+    if version == 9 {
+        migrate_v9_to_v10_add_mirror_state(conn)?;
+        version = 10;
     }
     debug_assert_eq!(
         version, CURRENT_SCHEMA_VERSION,
@@ -563,8 +618,7 @@ impl MailDb {
     #[cfg(test)]
     pub(crate) fn open_in_memory_legacy_v4() -> Result<Self> {
         let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
-        let sql = MAIL_SCHEMA_SQL.replacen("VALUES (9)", "VALUES (4)", 1);
-        conn.execute_batch(&sql)?;
+        conn.execute_batch(&schema_sql_at_version(MAIL_SCHEMA_SQL, 4))?;
         Ok(Self { conn })
     }
 
@@ -575,12 +629,8 @@ impl MailDb {
     #[cfg(test)]
     pub(crate) fn open_in_memory_legacy_v5() -> Result<Self> {
         let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
-        let sql = format!("{}\n{}", MAIL_SCHEMA_SQL, CALENDAR_SCHEMA_SQL).replacen(
-            "VALUES (9)",
-            "VALUES (5)",
-            1,
-        );
-        conn.execute_batch(&sql)?;
+        let sql = format!("{}\n{}", MAIL_SCHEMA_SQL, CALENDAR_SCHEMA_SQL);
+        conn.execute_batch(&schema_sql_at_version(&sql, 5))?;
         Ok(Self { conn })
     }
 
@@ -1414,7 +1464,7 @@ impl MailDb {
     /// those, so a rediscovery pass (which only learns the display name
     /// again) can't accidentally reset sync progress.
     pub fn upsert_calendar(&self, account: &str, url: &str, display_name: &str) -> Result<()> {
-        self.upsert_calendar_with_color(account, url, display_name, None, None)
+        self.upsert_calendar_with_color(account, url, display_name, None, None, None)
     }
 
     /// [`Self::upsert_calendar`] that also records the server's
@@ -1427,21 +1477,27 @@ impl MailDb {
         display_name: &str,
         color: Option<&str>,
         identity: Option<&str>,
+        mirror_state: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO calendars (account, url, display_name, color, identity)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            // `color`/`identity` keep a stored value when the server says
+            // nothing, but `mirror_state` is written through verbatim: a
+            // mirror that has recovered reports `ok` and a `COALESCE`
+            // would leave the old warning on screen forever.
+            "INSERT INTO calendars (account, url, display_name, color, identity, mirror_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(account, url) DO UPDATE SET display_name = excluded.display_name,
                  color = COALESCE(excluded.color, calendars.color),
-                 identity = COALESCE(excluded.identity, calendars.identity)",
-            params![account, url, display_name, color, identity],
+                 identity = COALESCE(excluded.identity, calendars.identity),
+                 mirror_state = excluded.mirror_state",
+            params![account, url, display_name, color, identity, mirror_state],
         )?;
         Ok(())
     }
 
     pub fn get_calendars(&self, account: &str) -> Result<Vec<CalendarRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT url, display_name, ctag, sync_token, color, identity FROM calendars
+            "SELECT url, display_name, ctag, sync_token, color, identity, mirror_state FROM calendars
              WHERE account = ?1 ORDER BY display_name",
         )?;
         let rows = stmt.query_map(params![account], |row| {
@@ -1452,6 +1508,7 @@ impl MailDb {
                 sync_token: row.get(3)?,
                 color: row.get(4)?,
                 identity: row.get(5)?,
+                mirror_state: row.get(6)?,
             })
         })?;
         let mut out = Vec::new();
@@ -2718,6 +2775,45 @@ mod calendar_event_tests {
                 .unwrap()
                 .as_deref(),
             Some("token-1")
+        );
+    }
+
+    #[test]
+    fn mirror_state_round_trips_and_only_a_real_problem_is_a_warning() {
+        let db = MailDb::open_in_memory().unwrap();
+        // A server that says nothing (no mirror, or not a jadav).
+        db.upsert_calendar(ACCOUNT, CAL_URL, "Personal").unwrap();
+        assert!(
+            db.get_calendars(ACCOUNT).unwrap()[0]
+                .mirror_warning()
+                .is_none()
+        );
+
+        // A healthy mirror reports "ok", which is not a warning.
+        db.upsert_calendar_with_color(ACCOUNT, CAL_URL, "Personal", None, None, Some("ok"))
+            .unwrap();
+        assert!(
+            db.get_calendars(ACCOUNT).unwrap()[0]
+                .mirror_warning()
+                .is_none()
+        );
+
+        let stopped = "needs-reauth; last synced 2026-09-18 14:46Z";
+        db.upsert_calendar_with_color(ACCOUNT, CAL_URL, "Personal", None, None, Some(stopped))
+            .unwrap();
+        assert_eq!(
+            db.get_calendars(ACCOUNT).unwrap()[0].mirror_warning(),
+            Some(stopped)
+        );
+
+        // Recovery must clear it — unlike colour/identity, this value is
+        // never COALESCEd, or a fixed mirror would look broken forever.
+        db.upsert_calendar_with_color(ACCOUNT, CAL_URL, "Personal", None, None, Some("ok"))
+            .unwrap();
+        assert!(
+            db.get_calendars(ACCOUNT).unwrap()[0]
+                .mirror_warning()
+                .is_none()
         );
     }
 

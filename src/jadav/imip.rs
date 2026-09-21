@@ -905,14 +905,31 @@ pub fn process_message(
         let stored_doc = existing
             .as_ref()
             .and_then(|o| calendar::parse_document(&o.ics).ok());
+        // Only consulted for mirrored calendars, and cheap enough to ask
+        // per message: a remote that needs re-auth brings nothing in, so
+        // this invitation or cancellation has to be applied here instead.
+        let mirror_offline = calendar.provider != Provider::Native
+            && calendar
+                .remote_account
+                .as_deref()
+                .is_some_and(|r| store.remote_needs_reauth(r).unwrap_or(false));
         let ctx = itip::InboundContext {
             calendar: &calendar,
             identity: &identity,
             all_identities: &runtime.identities,
             stored: stored_doc.as_ref(),
             inbox_for_mirrored: runtime.inbox_for_mirrored,
+            mirror_offline,
             now,
         };
+        if mirror_offline {
+            eprintln!(
+                "jadav: imip-in: applying {} for {} directly — mirror {:?} is stopped",
+                method,
+                calendar.slug,
+                calendar.remote_account.as_deref().unwrap_or("?")
+            );
+        }
         let decision = itip::apply_inbound(&doc, &ctx);
         if let Some(write) = &decision.write {
             let href = existing

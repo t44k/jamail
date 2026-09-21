@@ -1303,6 +1303,36 @@ pub fn spawn_mirror_thread(
     })
 }
 
+/// How a mirrored calendar is faring, as one short line for a CalDAV
+/// client to show its user — the value of jadav's `mirror-state`
+/// property. `None` for a calendar with no remote (nothing to report);
+/// `Some("ok")` while the mirror is keeping up.
+///
+/// This exists because a stopped mirror is otherwise *invisible* to
+/// everyone downstream: jadav keeps serving the last good copy, so
+/// `jamaild` caches it and `jacal` draws it, and the first sign of
+/// trouble is a meeting that turns out to have moved days ago.
+pub fn mirror_state_line(store: &Store, remote: Option<&str>) -> Option<String> {
+    let row = store.remote_status(remote?).ok()??;
+    if !row.needs_reauth && row.last_error.is_none() {
+        return Some("ok".to_string());
+    }
+    let since = row
+        .last_ok_at
+        .and_then(|t| DateTime::<Utc>::from_timestamp(t, 0))
+        .map(|t| t.format("%Y-%m-%d %H:%MZ").to_string())
+        .unwrap_or_else(|| "never".to_string());
+    Some(if row.needs_reauth {
+        format!("needs-reauth; last synced {}", since)
+    } else {
+        format!(
+            "error; last synced {}: {}",
+            since,
+            row.last_error.unwrap_or_default()
+        )
+    })
+}
+
 /// Human-readable status lines for `jadav status`.
 pub fn status_lines(store: &Store) -> Result<Vec<String>> {
     let mut out = Vec::new();

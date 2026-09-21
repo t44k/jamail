@@ -747,6 +747,7 @@ impl Ctx<'_> {
                 QName::caldav("supported-calendar-component-set"),
                 QName::caldav("calendar-description"),
                 QName::new(NS_JADAV, "owner-identity"),
+                QName::new(NS_JADAV, "mirror-state"),
                 QName::apple("calendar-color"),
                 QName::apple("calendar-order"),
                 QName::caldav("calendar-timezone"),
@@ -897,6 +898,16 @@ impl Ctx<'_> {
             // belongs to, so a client can set the right ORGANIZER.
             (NS_JADAV, "owner-identity") => match res {
                 Res::Calendar(c) => Some(xml::escape_text(&format!("mailto:{}", c.identity))),
+                _ => None,
+            },
+            // jadav's own: whether this calendar's mirror is keeping up,
+            // so a client can say "these events are stale" instead of
+            // drawing three-day-old data as if it were current.
+            (NS_JADAV, "mirror-state") => match res {
+                Res::Calendar(c) => {
+                    crate::jadav::mirror::mirror_state_line(self.store, c.remote_account.as_deref())
+                        .map(|s| xml::escape_text(&s))
+                }
                 _ => None,
             },
             (NS_APPLE, "calendar-order") => match res {
@@ -1930,6 +1941,49 @@ mod tests {
         );
         assert_eq!(resp.status, 403);
         assert!(resp.body_str().contains("propfind-finite-depth"));
+    }
+
+    #[test]
+    fn mirror_state_tells_a_client_the_calendar_has_stopped_syncing() {
+        // The failure behind this: a revoked Google token stopped the
+        // mirror, jadav went on serving the last good copy, and every
+        // client downstream drew days-old events as if they were current.
+        let ts = start("mirror-state");
+        let body = r#"<D:propfind xmlns:D="DAV:" xmlns:J="urn:jamail:jadav"><D:prop><J:mirror-state/></D:prop></D:propfind>"#;
+        let ask = |slug: &str| {
+            raw(
+                &ts,
+                "PROPFIND",
+                &format!("/dav/calendars/{}/{}/", LOGIN, slug),
+                &[("Depth", "0")],
+                Some(body),
+            )
+            .body_str()
+        };
+
+        // A native calendar has no mirror to report on.
+        assert!(
+            ask("personal").contains("<D:status>HTTP/1.1 404 Not Found</D:status>"),
+            "native calendars have no mirror-state"
+        );
+        // Neither has a mirror that has never reported in.
+        assert!(ask("rw-mirror").contains("<D:status>HTTP/1.1 404 Not Found</D:status>"));
+
+        let store = Store::open(&ts.store_path).unwrap();
+        store.set_remote_status("r", false, None).unwrap();
+        let text = ask("rw-mirror");
+        assert!(
+            text.contains("<mirror-state xmlns=\"urn:jamail:jadav\">ok</mirror-state>"),
+            "{text}"
+        );
+
+        store
+            .set_remote_status("r", true, Some("authorization revoked"))
+            .unwrap();
+        let text = ask("rw-mirror");
+        assert!(text.contains("needs-reauth"), "{text}");
+        // The last good sync is in there, so a client can say how stale.
+        assert!(text.contains("last synced"), "{text}");
     }
 
     #[test]

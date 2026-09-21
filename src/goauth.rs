@@ -403,6 +403,8 @@ pub struct GoogleTokenSource {
     token_url: String,
     access_token: Option<String>,
     expires_at: i64,
+    #[allow(clippy::type_complexity)]
+    reload: Option<Box<dyn FnMut() -> Result<String> + Send>>,
 }
 
 impl GoogleTokenSource {
@@ -414,6 +416,7 @@ impl GoogleTokenSource {
             token_url: TOKEN_URL.to_string(),
             access_token: None,
             expires_at: 0,
+            reload: None,
         }
     }
 
@@ -423,14 +426,29 @@ impl GoogleTokenSource {
         self
     }
 
-    /// A currently-valid access token, refreshing only when the cached one
-    /// is gone or about to expire.
-    pub fn access_token(&mut self) -> Result<String, TokenError> {
-        if let Some(t) = &self.access_token
-            && self.expires_at - EXPIRY_SKEW_SECS > Utc::now().timestamp()
-        {
-            return Ok(t.clone());
-        }
+    /// Re-read the refresh token from wherever it is configured, called
+    /// only when the one in hand is rejected.
+    ///
+    /// A daemon holds this source for the life of its sync thread, but
+    /// `jamaild google-auth` runs in another process and can only update
+    /// the file (or password manager) the config names. Without this, a
+    /// re-authorization could not take effect until the daemon restarted:
+    /// the thread would keep refreshing with the revoked token it loaded
+    /// at startup.
+    pub fn with_reload(mut self, f: impl FnMut() -> Result<String> + Send + 'static) -> Self {
+        self.reload = Some(Box::new(f));
+        self
+    }
+
+    /// The configured refresh token, when it differs from the one this
+    /// source has been using — i.e. it was re-authorized out of band.
+    fn reloaded_refresh_token(&mut self) -> Option<String> {
+        let current = self.refresh_token.clone();
+        let next = (self.reload.as_mut()?)().ok()?;
+        (!next.is_empty() && next != current).then_some(next)
+    }
+
+    fn refresh_once(&mut self) -> Result<String, TokenError> {
         let grant = refresh_access_token(
             &self.token_url,
             &self.client_id,
@@ -443,6 +461,27 @@ impl GoogleTokenSource {
         self.expires_at = Utc::now().timestamp() + grant.expires_in.unwrap_or(3600);
         self.access_token = Some(token.clone());
         Ok(token)
+    }
+
+    /// A currently-valid access token, refreshing only when the cached one
+    /// is gone or about to expire. A rejected refresh token is retried
+    /// once against a re-authorized one (see [`Self::with_reload`]).
+    pub fn access_token(&mut self) -> Result<String, TokenError> {
+        if let Some(t) = &self.access_token
+            && self.expires_at - EXPIRY_SKEW_SECS > Utc::now().timestamp()
+        {
+            return Ok(t.clone());
+        }
+        match self.refresh_once() {
+            Err(TokenError::InvalidGrant) => match self.reloaded_refresh_token() {
+                Some(newer) => {
+                    self.refresh_token = newer;
+                    self.refresh_once()
+                }
+                None => Err(TokenError::InvalidGrant),
+            },
+            other => other,
+        }
     }
 
     /// Drop the cached access token — called after a `401`, so the next
@@ -595,6 +634,45 @@ mod tests {
         assert_eq!(src.token().unwrap(), "short");
         assert_eq!(src.token().unwrap(), "fresh");
         assert_eq!(handle.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_rejected_token_is_retried_once_against_a_reauthorized_one() {
+        let bad =
+            r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#;
+        let (url, handle) =
+            mock_token_server(vec![json_response(400, bad), json_response(200, OK_BODY)]);
+        let mut src = GoogleTokenSource::new("cid", "csecret", "revoked")
+            .with_token_url(&url)
+            .with_reload(|| Ok("1//reauthorized".to_string()));
+        assert_eq!(src.token().unwrap(), "ya29.a0");
+        let reqs = handle.join().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0].contains("refresh_token=revoked"));
+        // The retry used the re-authorized token, not the revoked one.
+        assert!(reqs[1].contains("refresh_token=1%2F%2Freauthorized"));
+    }
+
+    #[test]
+    fn an_unchanged_reload_does_not_retry_a_token_google_just_refused() {
+        let bad = r#"{"error":"invalid_grant"}"#;
+        let (url, handle) = mock_token_server(vec![json_response(400, bad)]);
+        let mut src = GoogleTokenSource::new("cid", "csecret", "revoked")
+            .with_token_url(&url)
+            // Nothing was re-authorized: the config still names the same
+            // token, so retrying would only burn a request.
+            .with_reload(|| Ok("revoked".to_string()));
+        assert!(matches!(src.access_token(), Err(TokenError::InvalidGrant)));
+        assert_eq!(handle.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn without_a_reload_hook_invalid_grant_is_final() {
+        let bad = r#"{"error":"invalid_grant"}"#;
+        let (url, handle) = mock_token_server(vec![json_response(400, bad)]);
+        let mut src = GoogleTokenSource::new("cid", "csecret", "revoked").with_token_url(&url);
+        assert!(matches!(src.access_token(), Err(TokenError::InvalidGrant)));
+        assert_eq!(handle.join().unwrap().len(), 1);
     }
 
     #[test]

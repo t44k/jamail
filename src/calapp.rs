@@ -784,6 +784,11 @@ pub struct CalendarVisibility {
     /// The address the server says this calendar belongs to (jadav's
     /// `owner-identity`), used as `ORGANIZER` for events created here.
     pub identity: Option<String>,
+    /// Set when the server says its own mirror for this calendar has
+    /// stopped (jadav's `mirror-state`), e.g. `"needs-reauth; last synced
+    /// 2026-09-18 14:46Z"`. `None` means nothing is known to be wrong.
+    /// Shown verbatim — the server phrases it, this client only relays it.
+    pub mirror_warning: Option<String>,
 }
 
 /// Everything that makes up "where you were looking": not just the view,
@@ -1667,6 +1672,39 @@ impl CalApp {
     /// small fixed palette `jamail` uses for per-account list coloring —
     /// used for the small "dot" marker next to each event and consistent
     /// across every view.
+    /// Every calendar whose server reports its mirror has stopped, as
+    /// `(display name, diagnosis)`. Pure, so the header's warning can be
+    /// unit-tested; the wording comes from the server (see
+    /// [`crate::db::CalendarRow::mirror_warning`]).
+    ///
+    /// Hidden calendars are included on purpose: "these events are stale"
+    /// is about the data, and a user who hid a calendar still wants to
+    /// know their server stopped syncing it.
+    pub fn stale_calendars(&self) -> Vec<(&str, &str)> {
+        self.calendars
+            .iter()
+            .filter_map(|c| {
+                c.mirror_warning
+                    .as_deref()
+                    .map(|w| (c.display_name.as_str(), w))
+            })
+            .collect()
+    }
+
+    /// The header's one-line version of [`Self::stale_calendars`], or
+    /// `None` when every calendar is syncing.
+    pub fn stale_banner(&self) -> Option<String> {
+        let stale = self.stale_calendars();
+        let (first_name, first_warning) = *stale.first()?;
+        Some(match stale.len() {
+            1 => format!("⚠ {} not syncing — {}", first_name, first_warning),
+            n => format!(
+                "⚠ {} calendars not syncing — {}: {}",
+                n, first_name, first_warning
+            ),
+        })
+    }
+
     pub fn calendar_color(&self, calendar_url: &str) -> Color {
         let idx = self
             .calendars
@@ -1700,6 +1738,7 @@ impl CalApp {
                 CalendarVisibility {
                     server_color: r.color.as_deref().and_then(parse_hex_color),
                     identity: r.identity.clone(),
+                    mirror_warning: r.mirror_warning().map(str::to_string),
                     url: r.url,
                     display_name: r.display_name,
                     visible,
@@ -2690,6 +2729,15 @@ impl CalApp {
                 ),
                 Span::styled(format!(" {:<8}", source), Style::default().fg(color).bg(bg)),
             ]));
+            // The server's own diagnosis, on its own line under the
+            // calendar it belongs to — this is where a user comes to ask
+            // "why is this calendar wrong?".
+            if let Some(warning) = &cal.mirror_warning {
+                lines.push(Line::from(Span::styled(
+                    format!("     ⚠ {}", warning),
+                    Style::default().fg(theme::STATUS_ERROR).bg(bg),
+                )));
+            }
         }
         lines.push(Line::from(Span::styled(
             "j/k move   space show/hide   c/→ next colour   ← previous   x server colour   d declined   Esc close",
@@ -2801,6 +2849,18 @@ impl CalApp {
         } else {
             Span::styled("no new invitations  ", Style::default().fg(theme::FG_DIM))
         };
+        // A stopped mirror takes the invitation counter's place: stale
+        // data makes every other number on this line untrustworthy, and
+        // this is the only spot the user is guaranteed to look at.
+        let status_span = match self.stale_banner() {
+            Some(text) => Span::styled(
+                format!("{}  ", text),
+                Style::default()
+                    .fg(theme::STATUS_ERROR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            None => invitations_span,
+        };
         let lines = vec![
             Line::from(first_line),
             Line::from(vec![
@@ -2808,7 +2868,7 @@ impl CalApp {
                     format!(" {} ", self.current_account),
                     Style::default().fg(theme::SENDER_COLOR),
                 ),
-                invitations_span,
+                status_span,
                 Span::styled(cal_summary, Style::default().fg(theme::FG_DIM)),
                 Span::raw("  "),
                 Span::styled(
@@ -4393,8 +4453,70 @@ mod tests {
 
     // -- Calendar selection ----------------------------------------------
 
+    fn stale_cal_row(url: &str, name: &str, state: &str) -> CalendarRow {
+        CalendarRow {
+            mirror_state: Some(state.to_string()),
+            ..cal_row(url, name)
+        }
+    }
+
+    #[test]
+    fn a_stopped_mirror_becomes_a_header_banner_that_outranks_the_invitation_count() {
+        let mut app = test_app();
+        app.set_calendars(vec![
+            cal_row("u1", "Personal"),
+            stale_cal_row("u2", "Work", "needs-reauth; last synced 2026-09-18 14:46Z"),
+        ]);
+        assert_eq!(
+            app.stale_calendars(),
+            vec![("Work", "needs-reauth; last synced 2026-09-18 14:46Z")]
+        );
+        let banner = app.stale_banner().expect("a banner");
+        assert!(banner.contains("Work"), "{}", banner);
+        assert!(banner.contains("needs-reauth"), "{}", banner);
+    }
+
+    #[test]
+    fn an_ok_mirror_is_not_a_warning() {
+        let mut app = test_app();
+        app.set_calendars(vec![
+            stale_cal_row("u1", "Personal", "ok"),
+            cal_row("u2", "Work"),
+        ]);
+        assert!(app.stale_calendars().is_empty());
+        assert_eq!(app.stale_banner(), None);
+    }
+
+    #[test]
+    fn several_stopped_calendars_are_counted_in_one_banner() {
+        let mut app = test_app();
+        app.set_calendars(vec![
+            stale_cal_row("u1", "Personal", "needs-reauth; last synced never"),
+            stale_cal_row("u2", "Work", "error; last synced 2026-09-18 14:46Z: boom"),
+        ]);
+        let banner = app.stale_banner().unwrap();
+        assert!(
+            banner.starts_with("⚠ 2 calendars not syncing"),
+            "{}",
+            banner
+        );
+    }
+
+    #[test]
+    fn a_recovered_mirror_clears_the_banner_on_the_next_load() {
+        let mut app = test_app();
+        app.set_calendars(vec![stale_cal_row("u1", "Personal", "needs-reauth")]);
+        assert!(app.stale_banner().is_some());
+        // set_calendars carries visibility and colour across a reload; the
+        // warning must *not* be carried across, or a fixed mirror would go
+        // on looking broken.
+        app.set_calendars(vec![stale_cal_row("u1", "Personal", "ok")]);
+        assert_eq!(app.stale_banner(), None);
+    }
+
     fn cal_row(url: &str, name: &str) -> CalendarRow {
         CalendarRow {
+            mirror_state: None,
             url: url.to_string(),
             display_name: name.to_string(),
             ctag: None,
