@@ -127,7 +127,10 @@ impl GoogleAuth {
         self.expires_at = 0;
     }
 
-    fn persist(&self, needs_reauth: bool) {
+    /// Record a refresh token that just worked, with the access token it
+    /// yielded. Only ever called after a successful refresh, so writing
+    /// our own copy of the refresh token back is safe here.
+    fn persist_working(&self) {
         if let Some(path) = &self.store_path
             && let Ok(store) = Store::open(path)
         {
@@ -137,16 +140,34 @@ impl GoogleAuth {
                     refresh_token: self.refresh_token.clone(),
                     access_token: self.access_token.clone(),
                     expires_at: Some(self.expires_at),
-                    needs_reauth,
+                    needs_reauth: false,
                 },
             );
-            if needs_reauth {
-                let _ = store.set_remote_status(&self.remote, true, Some("refresh token revoked"));
-            }
         }
     }
 
-    fn refresh(&mut self) -> Result<(), RemoteError> {
+    /// Give up: flag the remote, leaving the *stored* refresh token alone
+    /// (see [`Store::mark_oauth_needs_reauth`]).
+    fn persist_needs_reauth(&mut self) {
+        self.invalidate();
+        if let Some(path) = &self.store_path
+            && let Ok(store) = Store::open(path)
+        {
+            let _ = store.mark_oauth_needs_reauth(&self.remote);
+            let _ = store.set_remote_status(&self.remote, true, Some("refresh token revoked"));
+        }
+    }
+
+    /// The refresh token currently in the store, when it differs from the
+    /// one this holder has been using — i.e. somebody ran `jadav google
+    /// auth` in another process since this one loaded it.
+    fn newer_stored_refresh_token(&self) -> Option<String> {
+        let store = Store::open(self.store_path.as_ref()?).ok()?;
+        let row = store.get_oauth_token(&self.remote).ok()??;
+        (row.refresh_token != self.refresh_token).then_some(row.refresh_token)
+    }
+
+    fn refresh_once(&mut self) -> Result<(), RemoteError> {
         let grant = goauth::refresh_access_token(
             TOKEN_URL,
             &self.client_id,
@@ -154,21 +175,47 @@ impl GoogleAuth {
             &self.refresh_token,
         )
         .map_err(|e| match e {
-            // A revoked/expired refresh token is recorded, not retried:
-            // the mirror thread stops on `NeedsReauth` until a human runs
-            // `jadav google auth` again.
-            goauth::TokenError::InvalidGrant => {
-                self.invalidate();
-                self.persist(true);
-                RemoteError::NeedsReauth
-            }
+            goauth::TokenError::InvalidGrant => RemoteError::NeedsReauth,
             goauth::TokenError::Transport(e) => RemoteError::Transient(e),
             goauth::TokenError::Other(e) => RemoteError::Other(e),
         })?;
         self.access_token = grant.access_token;
         self.expires_at = Utc::now().timestamp() + grant.expires_in.unwrap_or(3600);
-        self.persist(false);
+        self.persist_working();
         Ok(())
+    }
+
+    /// Refresh, picking up an out-of-band re-authorization before giving
+    /// up.
+    ///
+    /// `serve` holds one `GoogleAuth` per remote for the life of the
+    /// process, while `jadav google auth` runs in a *separate* process and
+    /// can only write to the store. Without the reload below, a re-auth
+    /// could never take effect: the mirror thread un-parks as soon as the
+    /// store's `needs_reauth` clears, refreshes with the revoked token it
+    /// still holds in memory, and fails again — and, before
+    /// [`Self::persist_needs_reauth`] stopped writing the token back, it
+    /// also overwrote the freshly issued one, so each re-auth destroyed
+    /// itself and only a restart could fix the remote.
+    fn refresh(&mut self) -> Result<(), RemoteError> {
+        let first = self.refresh_once();
+        if !matches!(first, Err(RemoteError::NeedsReauth)) {
+            return first;
+        }
+        match self.newer_stored_refresh_token() {
+            Some(newer) => {
+                self.refresh_token = newer;
+                let second = self.refresh_once();
+                if matches!(second, Err(RemoteError::NeedsReauth)) {
+                    self.persist_needs_reauth();
+                }
+                second
+            }
+            None => {
+                self.persist_needs_reauth();
+                first
+            }
+        }
     }
 }
 

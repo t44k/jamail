@@ -107,6 +107,13 @@ pub struct DiscoveredCalendar {
     /// jadav's `owner-identity` (`urn:jamail:jadav`): the address this
     /// calendar belongs to, bare (no `mailto:`). Other servers: `None`.
     pub identity: Option<String>,
+    /// jadav's `mirror-state` (`urn:jamail:jadav`): how the two-way mirror
+    /// behind this calendar is faring — `"ok"`, or a short diagnosis like
+    /// `"needs-reauth; last synced 2026-09-18 14:46Z"`. `None` for a
+    /// calendar with no mirror, and for every non-jadav server. Treated as
+    /// opaque text: anything but `"ok"` means "the events here may be
+    /// stale, show this to the user" (see `calapp`).
+    pub mirror_state: Option<String>,
 }
 
 pub struct ChangedEvent {
@@ -294,6 +301,7 @@ impl CalDavClient {
                     ctag: r.ctag,
                     color: r.color,
                     identity: r.identity,
+                    mirror_state: r.mirror_state,
                 });
             }
         }
@@ -659,6 +667,7 @@ struct ResponseAccum {
     displayname: Option<String>,
     color: Option<String>,
     identity: Option<String>,
+    mirror_state: Option<String>,
     ctag: Option<String>,
     is_calendar_collection: bool,
     current_user_principal: Option<String>,
@@ -678,6 +687,7 @@ struct PropStatBuf {
     displayname: Option<String>,
     color: Option<String>,
     identity: Option<String>,
+    mirror_state: Option<String>,
     ctag: Option<String>,
     is_calendar: bool,
     current_user_principal: Option<String>,
@@ -814,6 +824,12 @@ fn parse_multistatus(xml: &str) -> Result<MultiStatusDoc> {
                             buf.identity = Some(v.to_ascii_lowercase());
                         }
                     }
+                    "mirror-state" => {
+                        let v = text.trim();
+                        if !v.is_empty() {
+                            buf.mirror_state = Some(v.to_string());
+                        }
+                    }
                     "getctag" => buf.ctag = Some(text.trim().to_string()),
                     "sync-token" => doc.sync_token = Some(text.trim().to_string()),
                     "status" => {
@@ -843,6 +859,9 @@ fn parse_multistatus(xml: &str) -> Result<MultiStatusDoc> {
                             }
                             if buf.identity.is_some() {
                                 c.identity = buf.identity.take();
+                            }
+                            if buf.mirror_state.is_some() {
+                                c.mirror_state = buf.mirror_state.take();
                             }
                             if buf.ctag.is_some() {
                                 c.ctag = buf.ctag.take();
@@ -895,6 +914,7 @@ const CALENDAR_LIST_PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8
     <CS:getctag/>
     <A:calendar-color/>
     <J:owner-identity/>
+    <J:mirror-state/>
   </D:prop>
 </D:propfind>"#;
 
@@ -1059,6 +1079,11 @@ mod tests {
         assert_eq!(calendars[0].display_name, "Personal");
         assert_eq!(calendars[0].color.as_deref(), Some("#3366FFFF"));
         assert_eq!(calendars[0].identity.as_deref(), Some("alice@example.com"));
+        assert_eq!(
+            calendars[0].mirror_state.as_deref(),
+            Some("needs-reauth; last synced 2026-09-18 14:46Z"),
+            "a stopped mirror must reach the client that has to show it"
+        );
         assert!(calendars[0].url.ends_with("/cal/personal/"));
         let requests = handle.join().unwrap();
         assert!(requests[0].starts_with("PROPFIND / HTTP/1.1"));
@@ -1333,6 +1358,7 @@ mod tests {
         <D:displayname>Personal</D:displayname>
         <A:calendar-color xmlns:A="http://apple.com/ns/ical/">#3366FFFF</A:calendar-color>
         <J:owner-identity xmlns:J="urn:jamail:jadav">mailto:Alice@Example.com</J:owner-identity>
+        <J:mirror-state xmlns:J="urn:jamail:jadav">needs-reauth; last synced 2026-09-18 14:46Z</J:mirror-state>
         <CS:getctag>"ctag-1"</CS:getctag>
       </D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>

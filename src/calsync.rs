@@ -187,8 +187,18 @@ pub fn resolve_auth(
             )?
             .resolve_password()
             .context("resolving caldav.oauth.refresh_token")?;
+        // Re-resolve the configured refresh token if Google ever rejects
+        // the one in hand, so a `jamaild google-auth` run in another
+        // process takes effect without restarting the daemon.
+        let reload_from = oauth.refresh_token.clone();
         let source =
-            crate::goauth::GoogleTokenSource::new(&oauth.client_id, &client_secret, &refresh_token);
+            crate::goauth::GoogleTokenSource::new(&oauth.client_id, &client_secret, &refresh_token)
+                .with_reload(move || {
+                    reload_from
+                        .as_ref()
+                        .context("caldav.oauth.refresh_token is not set")?
+                        .resolve_password()
+                });
         let scheme = AuthScheme::Bearer(Arc::new(Mutex::new(source)));
         *bearer = Some(scheme.clone());
         return Ok(scheme);
@@ -331,6 +341,7 @@ fn run_one_cycle(
             &cal.display_name,
             cal.color.as_deref(),
             cal.identity.as_deref(),
+            cal.mirror_state.as_deref(),
         );
         sync_one_calendar(account_name, &cal.url, client, db, tx);
     }

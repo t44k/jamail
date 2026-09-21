@@ -1860,6 +1860,26 @@ impl Store {
         Ok(())
     }
 
+    pub fn remote_status(&self, remote: &str) -> Result<Option<RemoteStatusRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT remote, needs_reauth, last_ok_at, last_error, consecutive_failures \
+                 FROM remotes_status WHERE remote = ?1",
+                params![remote],
+                |r| {
+                    Ok(RemoteStatusRow {
+                        remote: r.get(0)?,
+                        needs_reauth: r.get::<_, i64>(1)? != 0,
+                        last_ok_at: r.get(2)?,
+                        last_error: r.get(3)?,
+                        consecutive_failures: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     pub fn list_remote_status(&self) -> Result<Vec<RemoteStatusRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT remote, needs_reauth, last_ok_at, last_error, consecutive_failures FROM remotes_status ORDER BY remote",
@@ -1878,6 +1898,20 @@ impl Store {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// Flag a remote's stored token as needing re-authorization **without
+    /// touching the token itself**. The distinction matters: the holder in
+    /// memory may be refreshing a token that a `jadav google auth` run in
+    /// another process has already replaced, and writing its own copy back
+    /// would destroy the fresh one — which is exactly what made re-auth
+    /// impossible to complete while `serve` was running.
+    pub fn mark_oauth_needs_reauth(&self, remote: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE oauth_tokens SET needs_reauth = 1 WHERE remote_account = ?1",
+            params![remote],
+        )?;
+        Ok(())
     }
 
     pub fn get_oauth_token(&self, remote: &str) -> Result<Option<OauthTokenRow>> {

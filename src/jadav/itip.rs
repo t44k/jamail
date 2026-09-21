@@ -36,9 +36,12 @@
 //!
 //! ## Inbound (`apply_inbound`)
 //!
-//! `REQUEST`/`CANCEL` for a *mirrored* calendar are not applied (the
-//! provider is authoritative and the mirror brings the event); for native
-//! calendars they create/update by `UID` with `SEQUENCE` then `DTSTAMP`
+//! `REQUEST`/`CANCEL` for a *mirrored* calendar are not applied while its
+//! mirror is running (the provider is authoritative and the mirror brings
+//! the event) — but they *are* applied when that mirror is stopped
+//! (`InboundContext::mirror_offline`), since the mail is then the only
+//! thing still arriving. For native calendars they always create/update
+//! by `UID` with `SEQUENCE` then `DTSTAMP`
 //! ordering, preserving our real `PARTSTAT` on a same-`SEQUENCE` refresh,
 //! and a `CANCEL` sets `STATUS:CANCELLED` — never a delete, which a client
 //! would see as us declining. `REPLY` patches that attendee's `PARTSTAT` on
@@ -959,6 +962,11 @@ pub struct InboundContext<'a> {
     /// Also copy `REQUEST`/`CANCEL` into the schedule inbox for mirrored
     /// calendars (default off: iOS may then re-file the event elsewhere).
     pub inbox_for_mirrored: bool,
+    /// The remote behind this mirrored calendar is not syncing (its OAuth
+    /// authorization was revoked), so nothing is bringing the provider's
+    /// changes in. Lifts the mirrored-calendar skip below — see
+    /// [`apply_inbound`].
+    pub mirror_offline: bool,
     pub now: DateTime<Utc>,
 }
 
@@ -1039,10 +1047,20 @@ pub fn apply_inbound(incoming: &ICalendarDocument, ctx: &InboundContext<'_>) -> 
         return no_write(InboundOutcome::IgnoredMethod(method));
     };
     let mirrored = ctx.calendar.provider != Provider::Native;
+    // A mirrored calendar ignores REQUEST/CANCEL because the provider is
+    // authoritative and the mirror brings them — true only while the
+    // mirror actually runs. With its remote stopped (a revoked OAuth
+    // token), this message is the *only* live signal, and dropping it
+    // leaves the calendar silently wrong until a human notices; a
+    // cancelled meeting in particular keeps showing as if it were on.
+    // Applying it converges on what the provider already holds, so the
+    // mirror finds nothing to push back when it resumes, and remote-wins
+    // reconciliation settles any difference.
+    let skip_as_mirrored = mirrored && !ctx.mirror_offline;
     let native_inbox = !mirrored || ctx.inbox_for_mirrored;
     match method.as_str() {
         "REQUEST" => {
-            if mirrored {
+            if skip_as_mirrored {
                 return no_write(InboundOutcome::NotAppliedMirrored);
             }
             let incoming_has_master = incoming
@@ -1106,7 +1124,7 @@ pub fn apply_inbound(incoming: &ICalendarDocument, ctx: &InboundContext<'_>) -> 
             }
         }
         "CANCEL" => {
-            if mirrored {
+            if skip_as_mirrored {
                 return no_write(InboundOutcome::NotAppliedMirrored);
             }
             let Some(stored) = ctx.stored else {
@@ -1760,7 +1778,20 @@ mod tests {
             all_identities: ids,
             stored,
             inbox_for_mirrored: false,
+            mirror_offline: false,
             now: Utc.with_ymd_and_hms(2024, 2, 1, 12, 0, 0).unwrap(),
+        }
+    }
+
+    /// [`inbound`] with the calendar's mirror stopped.
+    fn inbound_offline<'a>(
+        calendar: &'a CalendarRow,
+        stored: Option<&'a ICalendarDocument>,
+        ids: &'a [String],
+    ) -> InboundContext<'a> {
+        InboundContext {
+            mirror_offline: true,
+            ..inbound(calendar, stored, ids)
         }
     }
 
@@ -1826,6 +1857,11 @@ mod tests {
             apply_inbound(&req, &inbound(&mirrored, None, &all)).outcome,
             InboundOutcome::NotAppliedMirrored
         );
+        // ...unless that mirror is stopped, when the mail is the only
+        // thing still arriving for the calendar.
+        let d = apply_inbound(&req, &inbound_offline(&mirrored, None, &all));
+        assert_eq!(d.outcome, InboundOutcome::Created);
+        assert!(d.write.is_some());
         assert_eq!(
             apply_inbound(
                 &with_method("PUBLISH", &event(ORG, &[], "")),
@@ -1834,6 +1870,35 @@ mod tests {
             .outcome,
             InboundOutcome::IgnoredMethod("PUBLISH".into())
         );
+    }
+
+    #[test]
+    fn a_cancel_for_a_mirrored_calendar_is_applied_once_its_mirror_stops() {
+        // The failure this exists for: an organizer cancels a meeting, the
+        // CANCEL mail arrives, and the calendar's Google mirror is stopped
+        // on a revoked token — dropping it leaves the meeting showing as
+        // if it were still on, on the day it was supposed to happen.
+        let mirrored = cal(Provider::Google);
+        let all = ids(&[ME]);
+        let stored = doc(&format!(
+            "BEGIN:VEVENT\r\nUID:s\r\nDTSTART;TZID=Europe/Budapest:20240301T090000\r\nDTEND;TZID=Europe/Budapest:20240301T100000\r\nSUMMARY:W\r\nSEQUENCE:1\r\nORGANIZER:mailto:{ORG}\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:{ME}\r\nEND:VEVENT\r\n"
+        ));
+        let cancel = with_method(
+            "CANCEL",
+            &format!(
+                "BEGIN:VEVENT\r\nUID:s\r\nDTSTART;TZID=Europe/Budapest:20240301T090000\r\nSUMMARY:W\r\nSEQUENCE:2\r\nORGANIZER:mailto:{ORG}\r\nATTENDEE:mailto:{ME}\r\nEND:VEVENT\r\n"
+            ),
+        );
+        assert_eq!(
+            apply_inbound(&cancel, &inbound(&mirrored, Some(&stored), &all)).outcome,
+            InboundOutcome::NotAppliedMirrored,
+            "a running mirror still owns the calendar"
+        );
+        let d = apply_inbound(&cancel, &inbound_offline(&mirrored, Some(&stored), &all));
+        assert_eq!(d.outcome, InboundOutcome::CancelledWhole);
+        // Cancelled, never deleted — a delete would read as us declining.
+        let written = d.write.expect("a write");
+        assert_eq!(written.master().unwrap().status.as_ics(), "CANCELLED");
     }
 
     #[test]
