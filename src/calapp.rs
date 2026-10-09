@@ -756,6 +756,10 @@ pub fn now_label_position(
 ///   showing the same time.
 /// * **An event nests one column deeper than everything it overlaps in
 ///   time**, capped at `max_indent` so the title never gets squeezed out.
+///
+/// Events are placed by first row, then by `pos` — the day's own event
+/// order, which [`CalApp::refilter`] keeps chronological — so the line
+/// order on screen is the order [`CalApp::event_cursor`] steps through.
 pub fn pack_cascade(
     events: &[(usize, usize, usize)],
     rows: usize,
@@ -766,7 +770,7 @@ pub fn pack_cascade(
         return placements;
     }
     let mut sorted = events.to_vec();
-    sorted.sort_by_key(|&(pos, first, last)| (first, last, pos));
+    sorted.sort_by_key(|&(pos, first, _)| (first, pos));
 
     let mut row_taken = vec![false; rows];
     // (first_row, last_row, indent) of what's already placed — the *real*
@@ -2384,7 +2388,14 @@ impl CalApp {
 
     /// Recompute the displayed/selectable [`Self::events`] from
     /// [`Self::all_events`] using the current calendar visibility, sorted
-    /// by start time, clamping the current selection into bounds.
+    /// all-day first (they are the banners above a day's grid), then by
+    /// start, then by end, clamping the current selection into bounds.
+    ///
+    /// This order *is* the order on screen: [`Self::event_cursor`] counts
+    /// in it and [`pack_cascade`] stacks a slot's events in it, so moving
+    /// the cursor down always selects the event drawn below. The end time
+    /// breaks ties between events starting together, or two events at
+    /// 10:00 would keep whatever order the database returned them in.
     pub fn refilter(&mut self) {
         let mut events: Vec<CalendarEventRow> = self
             .all_events
@@ -2393,7 +2404,7 @@ impl CalApp {
             .filter(|e| self.show_declined || self.participation(e) != Participation::Declined)
             .cloned()
             .collect();
-        events.sort_by_key(|e| e.dtstart_utc);
+        events.sort_by_key(|e| (!e.all_day, e.dtstart_utc, e.dtend_utc));
         self.events = events;
         if let Some(id) = self.pending_focus_id {
             let indices = self.event_indices_for(self.focused_date);
@@ -5248,6 +5259,62 @@ mod tests {
 
         app.move_focus_vertical(-5); // must not undershoot below zero
         assert_eq!(app.event_cursor, 0);
+    }
+
+    #[test]
+    fn moving_down_selects_the_event_drawn_below_when_two_start_together() {
+        // Two events at 10:00, the longer one first out of the database:
+        // the cursor used to step into the long one first while the grid
+        // drew the short one above it, so "down" moved the selection up.
+        let start = ts(2024, 1, 16, 10);
+        let long = make_row("long", start, start + 2 * 3600, None, false);
+        let short = make_row("short", start, start + 60, None, false);
+        let mut app = test_app();
+        app.set_events(vec![long, short]);
+        let day = local_date_of(start);
+        let order: Vec<&str> = app
+            .event_indices_for(day)
+            .iter()
+            .map(|&i| app.events[i].uid.as_str())
+            .collect();
+        assert_eq!(order, vec!["short", "long"]);
+
+        let axis = TimeAxis::uniform(0, 30, 48);
+        let (_, timed) = app.layout_day(day, &axis);
+        let spans: Vec<(usize, usize, usize)> =
+            timed.iter().map(|&(pos, _, f, l)| (pos, f, l)).collect();
+        let mut placed = pack_cascade(&spans, axis.rows(), 8);
+        placed.sort_by_key(|p| p.start_row);
+        let drawn: Vec<usize> = placed.iter().map(|p| p.pos).collect();
+        assert_eq!(
+            drawn,
+            vec![0, 1],
+            "lines top to bottom must be cursor order"
+        );
+    }
+
+    #[test]
+    fn all_day_events_come_first_in_cursor_order_like_their_banners() {
+        // A timed event that starts before the all-day one's stored UTC
+        // midnight must still come after it: the banner is drawn on top.
+        let all_day = make_row(
+            "all-day",
+            EventTime::all_day(date(2024, 1, 16)).utc.timestamp(),
+            EventTime::all_day(date(2024, 1, 17)).utc.timestamp(),
+            None,
+            true,
+        );
+        let timed = make_row(
+            "timed",
+            ts(2024, 1, 15, 22),
+            ts(2024, 1, 15, 23),
+            None,
+            false,
+        );
+        let mut app = test_app();
+        app.set_events(vec![timed, all_day]);
+        let order: Vec<&str> = app.events.iter().map(|e| e.uid.as_str()).collect();
+        assert_eq!(order, vec!["all-day", "timed"]);
     }
 
     #[test]
