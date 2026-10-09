@@ -137,6 +137,42 @@ fn utc_date_of(ts_utc: i64) -> NaiveDate {
         .date_naive()
 }
 
+/// When `ev` happens, the way the header shows it: `All day Mon 15 Jan`,
+/// `Mon 15 Jan 09:00–10:00`, or both ends in full when it spans days.
+fn event_when_label(ev: &CalendarEventRow) -> String {
+    if ev.all_day {
+        return format!(
+            "All day {}",
+            utc_date_of(ev.dtstart_utc).format("%a %-d %b")
+        );
+    }
+    let start = local_time_of(ev.dtstart_utc);
+    let end = local_time_of(ev.dtend_utc);
+    if start.date_naive() == end.date_naive() {
+        format!(
+            "{} {}–{}",
+            start.format("%a %-d %b"),
+            start.format("%H:%M"),
+            end.format("%H:%M")
+        )
+    } else {
+        format!(
+            "{} – {}",
+            start.format("%a %-d %b %H:%M"),
+            end.format("%a %-d %b %H:%M")
+        )
+    }
+}
+
+/// A form date (`YYYY-MM-DD`) moved by `shift`; text that is not a date
+/// is returned unchanged for the form's own validation to report.
+fn shift_form_date(text: &str, shift: Duration) -> String {
+    match NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d") {
+        Ok(d) => (d + shift).format("%Y-%m-%d").to_string(),
+        Err(_) => text.to_string(),
+    }
+}
+
 trait WeekStartExt {
     /// Days from this week-start convention's first day to `weekday`
     /// (0 for the start-of-week day itself, up to 6).
@@ -235,6 +271,9 @@ const NOW_FG: Color = Color::Rgb(255, 232, 232);
 /// The selected event keeps its calendar tint; its text turns this
 /// yellow and bold, and the column's borders show `>`/`<` on its row.
 const SELECTED_FG: Color = Color::Rgb(255, 220, 90);
+/// Marks a held copy (`y`): in the header, and on the focused day's
+/// title, which is where `p` would paste it.
+const YANK_GLYPH: &str = "⧉";
 /// How much of a calendar's colour goes into its events' row background
 /// (the rest is the cell's own background), in percent. Strong enough to
 /// read the calendar from the row alone, weak enough to keep text legible.
@@ -843,6 +882,22 @@ pub struct PendingDelete {
     pub recurring: bool,
 }
 
+/// An event copied with `y`, waiting for `p` to paste it onto the focused
+/// day (see [`CalApp::yank_selected`]). It holds the finished form rather
+/// than a row id: the copy is what was on screen when `y` was pressed, so
+/// a later sync rewriting or deleting the original changes nothing.
+#[derive(Clone)]
+pub struct YankedEvent {
+    /// The form for the copy as it would open on the original's own day.
+    pub template: DraftEvent,
+    /// The day the copied occurrence starts on, in the form's terms (the
+    /// UTC date of an all-day event, the local date of a timed one). A
+    /// paste moves start and end by the distance from here to the target.
+    pub source_date: NaiveDate,
+    /// What the header shows while the copy is held: when and what.
+    pub label: String,
+}
+
 /// The invitation a [`CalMode::Rsvp`] prompt answers, captured when the
 /// prompt opens for the same reason [`PendingDelete`] is.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1063,6 +1118,60 @@ impl DraftEvent {
             attendees_touched: false,
             organizer: event.organizer.clone(),
         })
+    }
+
+    /// The form for a brand-new copy of `row`, the occurrence on screen (so
+    /// a moved instance of a series is copied the way it is shown), on the
+    /// same calendar and day. The copy is a one-off: no `RRULE`, since the
+    /// form would otherwise copy the whole series. Guests are kept with
+    /// their answers reset, minus our own `identities` (copying an
+    /// invitation must not make us our own guest). Reminders are kept as
+    /// far as the form can express them. The organizer is left for the
+    /// paste to take from the target calendar.
+    pub fn copy_of(row: &CalendarEventRow, identities: &[String]) -> Result<Self, String> {
+        let event = row
+            .to_vevent()
+            .map_err(|e| format!("could not read event to copy: {}", e))?;
+        let mut draft = Self::blank(&row.calendar_url, Local::now());
+        draft.summary = row.summary.clone();
+        draft.location = row.location.clone();
+        draft.description = row.description.clone();
+        draft.all_day = row.all_day;
+        if row.all_day {
+            draft.start_date = utc_date_of(row.dtstart_utc).format("%Y-%m-%d").to_string();
+            draft.end_date = utc_date_of(row.dtend_utc).format("%Y-%m-%d").to_string();
+            draft.start_time = "09:00".to_string();
+            draft.end_time = "10:00".to_string();
+        } else {
+            let start = local_time_of(row.dtstart_utc);
+            let end = local_time_of(row.dtend_utc);
+            draft.start_date = start.format("%Y-%m-%d").to_string();
+            draft.start_time = start.format("%H:%M").to_string();
+            draft.end_date = end.format("%Y-%m-%d").to_string();
+            draft.end_time = end.format("%H:%M").to_string();
+        }
+        draft.status = match EventStatus::parse(&row.status) {
+            EventStatus::Cancelled => EventStatus::Confirmed,
+            other => other,
+        };
+        draft.alarms = event
+            .alarms
+            .iter()
+            .filter(|a| a.minutes_before_start().is_some_and(|m| m >= 0))
+            .map(format_alarm_short)
+            .collect::<Vec<_>>()
+            .join(", ");
+        draft.attendees = event
+            .attendees
+            .iter()
+            .filter(|a| !identities.iter().any(|i| i.eq_ignore_ascii_case(&a.email)))
+            .map(|a| AttendeeEntry {
+                email: a.email.clone(),
+                name: a.name.clone(),
+                partstat: None,
+            })
+            .collect();
+        Ok(draft)
     }
 
     /// Move a *new* event to the next/previous of `calendars` (visible
@@ -1355,6 +1464,9 @@ pub struct CalApp {
     /// The invitation the RSVP prompt is about while `mode` is
     /// [`CalMode::Rsvp`] — see [`PendingRsvp`].
     pub pending_rsvp: Option<PendingRsvp>,
+    /// The event `y` copied, held until `Esc` drops it — `p` can paste it
+    /// onto as many days as wanted meanwhile.
+    pub yanked: Option<YankedEvent>,
     /// Our own addresses, lower-cased: the account's `email`, its
     /// `caldav.login` and every `senders` entry. An event is answerable
     /// when one of them is on its `ATTENDEE` list.
@@ -1402,6 +1514,7 @@ impl CalApp {
             draft: None,
             pending_delete: None,
             pending_rsvp: None,
+            yanked: None,
             identities: Vec::new(),
             calendar_prefs: Vec::new(),
             prefs_dirty: false,
@@ -2340,6 +2453,57 @@ impl CalApp {
         self.mode = CalMode::Browse;
     }
 
+    /// Copy the selected event (`y`), replacing anything copied before.
+    /// Returns the status line to show.
+    pub fn yank_selected(&mut self) -> Result<String, String> {
+        let row = self
+            .selected_event()
+            .ok_or_else(|| "no event selected".to_string())?;
+        let template = DraftEvent::copy_of(row, &self.identities)?;
+        let source_date = if row.all_day {
+            utc_date_of(row.dtstart_utc)
+        } else {
+            local_date_of(row.dtstart_utc)
+        };
+        let label = format!("{}  {}", event_when_label(row), row.summary);
+        let status = format!(
+            "Copied \"{}\" — move to a day and press p to paste, Esc to drop the copy",
+            row.summary
+        );
+        self.yanked = Some(YankedEvent {
+            template,
+            source_date,
+            label,
+        });
+        Ok(status)
+    }
+
+    /// Open the new-event form for the copied event on the focused day,
+    /// same time of day and length (`p`). The copy stays held, so it can be
+    /// pasted again elsewhere.
+    pub fn paste_yanked(&mut self) -> Result<(), String> {
+        let yank = self
+            .yanked
+            .as_ref()
+            .ok_or_else(|| "nothing copied — y copies the selected event".to_string())?;
+        if self.view == CalView::Year {
+            return Err("pick a day to paste on — Enter opens the month".to_string());
+        }
+        let shift = self.focused_date - yank.source_date;
+        let mut draft = yank.template.clone();
+        draft.start_date = shift_form_date(&draft.start_date, shift);
+        draft.end_date = shift_form_date(&draft.end_date, shift);
+        draft.organizer = self.calendar_identity(&draft.calendar_url);
+        self.draft = Some(draft);
+        self.mode = CalMode::Create;
+        Ok(())
+    }
+
+    /// Forget the copied event (`Esc`). Returns whether there was one.
+    pub fn drop_yank(&mut self) -> bool {
+        self.yanked.take().is_some()
+    }
+
     /// The `ATTENDEE` of `row` that is one of [`Self::identities`], if any.
     pub fn own_attendee(&self, row: &CalendarEventRow) -> Option<crate::calendar::Attendee> {
         let event = row.to_vevent().ok()?;
@@ -2797,30 +2961,7 @@ impl CalApp {
                 + 4;
             let room = (area.width as usize).saturating_sub(used);
             if room > 8 {
-                let when = if ev.all_day {
-                    format!(
-                        "All day {}",
-                        local_date_of(ev.dtstart_utc).format("%a %-d %b")
-                    )
-                } else {
-                    let start = local_time_of(ev.dtstart_utc);
-                    let end = local_time_of(ev.dtend_utc);
-                    if start.date_naive() == end.date_naive() {
-                        format!(
-                            "{} {}–{}",
-                            start.format("%a %-d %b"),
-                            start.format("%H:%M"),
-                            end.format("%H:%M")
-                        )
-                    } else {
-                        format!(
-                            "{} – {}",
-                            start.format("%a %-d %b %H:%M"),
-                            end.format("%a %-d %b %H:%M")
-                        )
-                    }
-                };
-                let text = truncate_str(&format!("{}  {}", when, ev.summary), room);
+                let text = truncate_str(&format!("{}  {}", event_when_label(ev), ev.summary), room);
                 first_line.push(Span::styled("  │ ", Style::default().fg(theme::FG_DIM)));
                 first_line.push(Span::styled(
                     format!("{} ", self.event_glyph(ev)),
@@ -2861,30 +3002,75 @@ impl CalApp {
             ),
             None => invitations_span,
         };
+        let mut second_line = vec![Span::styled(
+            format!(" {} ", self.current_account),
+            Style::default().fg(theme::SENDER_COLOR),
+        )];
+        // A held copy goes first on this line, before the warnings, since
+        // it changes what `p` and `Esc` do.
+        if let Some(yank) = &self.yanked {
+            second_line.push(Span::styled(
+                format!(" {} copying: {} ", YANK_GLYPH, yank.label),
+                Style::default()
+                    .fg(theme::BG)
+                    .bg(SELECTED_FG)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            second_line.push(Span::styled(
+                " p paste · Esc drop  ",
+                Style::default().fg(SELECTED_FG),
+            ));
+        }
         let lines = vec![
             Line::from(first_line),
-            Line::from(vec![
-                Span::styled(
-                    format!(" {} ", self.current_account),
-                    Style::default().fg(theme::SENDER_COLOR),
-                ),
-                status_span,
-                Span::styled(cal_summary, Style::default().fg(theme::FG_DIM)),
-                Span::raw("  "),
-                Span::styled(
-                    format!("jamaild: {}", conn),
-                    Style::default().fg(if self.ipc_connected {
-                        theme::STATUS_SUCCESS
-                    } else {
-                        theme::STATUS_PENDING
-                    }),
-                ),
-            ]),
+            Line::from(
+                second_line
+                    .into_iter()
+                    .chain([
+                        status_span,
+                        Span::styled(cal_summary, Style::default().fg(theme::FG_DIM)),
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("jamaild: {}", conn),
+                            Style::default().fg(if self.ipc_connected {
+                                theme::STATUS_SUCCESS
+                            } else {
+                                theme::STATUS_PENDING
+                            }),
+                        ),
+                    ])
+                    .collect::<Vec<_>>(),
+            ),
         ];
         let block = Block::default()
             .borders(Borders::BOTTOM)
             .style(Style::default().bg(theme::BG_HEADER));
         frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    /// A day cell's border: highlighted on the focused day, in the copy
+    /// colour while a copy is held (that day is where `p` pastes).
+    fn cell_border_style(&self, is_focused: bool) -> Style {
+        if !is_focused {
+            Style::default().fg(theme::THREAD_BRANCH)
+        } else if self.yanked.is_some() {
+            Style::default().fg(SELECTED_FG)
+        } else {
+            Style::default().fg(theme::HELP_BORDER)
+        }
+    }
+
+    /// The [`YANK_GLYPH`] after the focused day's title while a copy is
+    /// held, so the paste target is visible where the eye already is.
+    fn paste_target_mark(&self, is_focused: bool) -> Option<Span<'static>> {
+        (is_focused && self.yanked.is_some()).then(|| {
+            Span::styled(
+                format!("{} ", YANK_GLYPH),
+                Style::default()
+                    .fg(SELECTED_FG)
+                    .add_modifier(Modifier::BOLD),
+            )
+        })
     }
 
     /// The color of `ev`'s [`EVENT_DOT`]: its calendar's stable color (see
@@ -3578,14 +3764,12 @@ impl CalApp {
         } else {
             format!(" {} ", day.format("%a %-d %b"))
         };
-        let border_style = if is_focused {
-            Style::default().fg(theme::HELP_BORDER)
-        } else {
-            Style::default().fg(theme::THREAD_BRANCH)
-        };
+        let border_style = self.cell_border_style(is_focused);
         let cell_bg = if weekend { WEEKEND_BG } else { theme::BG };
+        let mut title_spans = vec![Span::styled(title, title_style)];
+        title_spans.extend(self.paste_target_mark(is_focused));
         let block = Block::bordered()
-            .title(Span::styled(title, title_style))
+            .title(Line::from(title_spans))
             .border_style(border_style)
             .style(Style::default().bg(cell_bg));
         let inner = block.inner(rect);
@@ -3686,17 +3870,12 @@ impl CalApp {
                 .fg(theme::FG_TEXT)
                 .add_modifier(Modifier::BOLD)
         };
-        let border_style = if is_focused {
-            Style::default().fg(theme::HELP_BORDER)
-        } else {
-            Style::default().fg(theme::THREAD_BRANCH)
-        };
+        let border_style = self.cell_border_style(is_focused);
         let cell_bg = if weekend { WEEKEND_BG } else { theme::BG };
+        let mut title_spans = vec![Span::styled(format!(" {} ", day.day()), day_style)];
+        title_spans.extend(self.paste_target_mark(is_focused));
         let block = Block::bordered()
-            .title(Line::from(Span::styled(
-                format!(" {} ", day.day()),
-                day_style,
-            )))
+            .title(Line::from(title_spans))
             .border_style(border_style)
             .style(Style::default().bg(cell_bg));
         let inner = block.inner(area);
@@ -4103,8 +4282,11 @@ impl CalApp {
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
         let text = if let Some(status) = &self.status {
             status.clone()
+        } else if self.yanked.is_some() {
+            "hjkl move  [/] jump period  p paste copy here  y copy another  Esc drop copy  Tab/S-Tab narrow/widen  Enter zoom  q quit"
+                .to_string()
         } else {
-            "hjkl move  [/] jump period  Tab/S-Tab narrow/widen  Enter zoom  Esc back  t today  n new  e edit  d del  a guests  r rsvp  i invites  v/C cals  1-9 cal  s sync  q quit"
+            "hjkl move  [/] jump period  Tab/S-Tab narrow/widen  Enter zoom  Esc back  t today  n new  e edit  y copy  d del  a guests  r rsvp  i invites  v/C cals  1-9 cal  s sync  q quit"
                 .to_string()
         };
         frame.render_widget(
@@ -5455,6 +5637,124 @@ mod tests {
         app.begin_create();
         assert_eq!(app.mode, CalMode::Create);
         assert_eq!(app.draft.as_ref().unwrap().calendar_url, "c2");
+    }
+
+    // -- Copy (y) and paste (p) ------------------------------------------
+
+    fn local_ts(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
+        Local
+            .with_ymd_and_hms(y, m, d, h, min, 0)
+            .single()
+            .unwrap()
+            .timestamp()
+    }
+
+    /// A daily 09:30–10:15 (local) standup on Mon 2024-01-15 that we were
+    /// invited to, with a 15-minute and an unexpressible absolute alarm.
+    fn invited_standup() -> CalendarEventRow {
+        let start = local_ts(2024, 1, 15, 9, 30);
+        let end = local_ts(2024, 1, 15, 10, 15);
+        let mut row = make_row("standup", start, end, Some("FREQ=DAILY"), false);
+        let raw = row.raw_ics.take().unwrap().replace(
+            "END:VEVENT",
+            "ORGANIZER:mailto:boss@example.com\r\n\
+             ATTENDEE;PARTSTAT=ACCEPTED:mailto:me@example.com\r\n\
+             ATTENDEE;PARTSTAT=DECLINED;CN=Ann:mailto:ann@example.com\r\n\
+             BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\n\
+             BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER;VALUE=DATE-TIME:20240101T000000Z\r\nEND:VALARM\r\n\
+             END:VEVENT",
+        );
+        row.raw_ics = Some(raw);
+        row.organizer = "mailto:boss@example.com".to_string();
+        row
+    }
+
+    #[test]
+    fn yank_without_selection_is_an_explicit_error() {
+        let mut app = test_app();
+        assert!(
+            app.yank_selected()
+                .unwrap_err()
+                .contains("no event selected")
+        );
+        assert!(app.yanked.is_none());
+    }
+
+    #[test]
+    fn paste_without_a_copy_is_an_explicit_error() {
+        let mut app = test_app();
+        assert!(app.paste_yanked().unwrap_err().contains("nothing copied"));
+        assert_eq!(app.mode, CalMode::Browse);
+    }
+
+    #[test]
+    fn paste_opens_a_new_one_off_event_on_the_focused_day_at_the_same_time() {
+        let mut app = test_app();
+        app.identities = vec!["me@example.com".to_string()];
+        app.set_events(vec![invited_standup()]);
+        app.yank_selected().unwrap();
+        assert!(app.yanked.as_ref().unwrap().label.contains("standup"));
+
+        app.focused_date = date(2024, 1, 18);
+        app.paste_yanked().unwrap();
+        assert_eq!(app.mode, CalMode::Create);
+        let draft = app.draft.as_ref().unwrap();
+        assert_eq!(draft.editing_local_id, None, "a paste creates, never edits");
+        assert_eq!(draft.calendar_url, "cal");
+        assert_eq!(draft.start_date, "2024-01-18");
+        assert_eq!(draft.end_date, "2024-01-18");
+        assert_eq!(draft.start_time, "09:30");
+        assert_eq!(draft.end_time, "10:15");
+        assert_eq!(draft.summary, "standup");
+        assert!(
+            draft.rrule.is_empty(),
+            "the copy is one event, not the series"
+        );
+        assert_eq!(draft.alarms, "15m", "only reminders the form can express");
+        // We are not our own guest; the others start unanswered.
+        assert_eq!(draft.attendees.len(), 1);
+        assert_eq!(draft.attendees[0].email, "ann@example.com");
+        assert_eq!(draft.attendees[0].partstat, None);
+        // The copy is ours to organise, not the original organizer's.
+        assert_eq!(draft.organizer.as_deref(), Some("me@example.com"));
+
+        let event = draft.to_new_vevent().unwrap();
+        assert_eq!(event.dtstart.utc.timestamp(), local_ts(2024, 1, 18, 9, 30));
+        assert_eq!(event.alarms.len(), 1);
+        assert_eq!(event.attendees[0].partstat.as_deref(), Some("NEEDS-ACTION"));
+
+        // The copy stays held for another paste until dropped.
+        app.cancel_form();
+        assert!(app.yanked.is_some());
+        assert!(app.drop_yank());
+        assert!(app.yanked.is_none());
+        assert!(!app.drop_yank());
+    }
+
+    #[test]
+    fn pasting_a_multi_day_all_day_event_keeps_its_length() {
+        let mut app = test_app();
+        let start = EventTime::all_day(date(2024, 1, 15)).utc.timestamp();
+        let end = EventTime::all_day(date(2024, 1, 18)).utc.timestamp();
+        app.set_events(vec![make_row("trip", start, end, None, true)]);
+        app.yank_selected().unwrap();
+
+        app.focused_date = date(2024, 2, 1);
+        app.paste_yanked().unwrap();
+        let draft = app.draft.as_ref().unwrap();
+        assert!(draft.all_day);
+        assert_eq!(draft.start_date, "2024-02-01");
+        assert_eq!(draft.end_date, "2024-02-04");
+    }
+
+    #[test]
+    fn paste_is_refused_in_year_view() {
+        let mut app = test_app();
+        app.set_events(vec![invited_standup()]);
+        app.yank_selected().unwrap();
+        app.view = CalView::Year;
+        assert!(app.paste_yanked().unwrap_err().contains("pick a day"));
+        assert_eq!(app.mode, CalMode::Browse);
     }
 
     #[test]
