@@ -298,6 +298,12 @@ fn handle_browse_key(
         // the period and cursor you left behind (CalApp::go_back) — so
         // Enter into a day and Esc puts you back on the month you were
         // reading. It is never a quit key; `q` is the only way out.
+        // ... except while a copy is held (`y`): then Esc drops the copy
+        // first, and only the next one walks back.
+        KeyCode::Esc if app.yanked.is_some() => {
+            app.drop_yank();
+            app.set_status("Copy dropped.");
+        }
         KeyCode::Esc => {
             if app.go_back() {
                 reload_events(app, db);
@@ -378,6 +384,19 @@ fn handle_browse_key(
         }
         KeyCode::Char('e') => {
             if let Err(e) = app.begin_edit() {
+                app.set_status(e);
+            }
+        }
+        // Copy the selected event, then paste it onto the focused day as a
+        // new event: `p` opens the form pre-filled (same time and length),
+        // and the copy stays held for more pastes until Esc drops it.
+        KeyCode::Char('y') => match app.yank_selected() {
+            Ok(status) | Err(status) => app.set_status(status),
+        },
+        KeyCode::Char('p') => {
+            if app.calendars.is_empty() {
+                app.set_status("No calendars discovered yet — try 's' to sync.");
+            } else if let Err(e) = app.paste_yanked() {
                 app.set_status(e);
             }
         }
