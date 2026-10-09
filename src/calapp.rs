@@ -510,28 +510,76 @@ const MINUTES_PER_DAY: i64 = 24 * 60;
 const DAY_CORE: (i64, i64) = (7 * 60, 21 * 60);
 
 /// The vertical time ruler shared by every column of a Day/3-Day/Week
-/// grid: `rows` consecutive slots of `slot_minutes`, the first starting
-/// `start_minutes` after local midnight.
+/// grid: consecutive rows covering `[start_minutes(), end_minutes())`
+/// minutes after local midnight, each row starting where the previous one
+/// ended.
 ///
-/// One axis is computed for the whole view rather than per column, which
-/// is the entire point of the grid — 09:00 sits on the same terminal row
-/// in every day, so events can be compared across days by eye.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// One axis is computed for each group of equal-height columns rather than
+/// per column, which is the entire point of the grid — 09:00 sits on the
+/// same terminal row in every day, so events can be compared across days
+/// by eye.
+///
+/// Rows need not all be the same length: [`plan_time_axis`] draws
+/// [`DAY_CORE`] at one slot length and the hours an early or late event
+/// adds outside it at a coarser one, so a single 23:00 event doesn't cost
+/// the whole working day its resolution.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TimeAxis {
-    pub start_minutes: u32,
-    pub slot_minutes: u32,
-    pub rows: usize,
+    /// Minutes-from-local-midnight at which each row begins, ascending.
+    starts: Vec<u32>,
+    /// Minutes-from-local-midnight at which the last row ends.
+    end: u32,
 }
 
 impl TimeAxis {
+    /// `rows` slots of `slot_minutes` each, the first at `start_minutes`.
+    #[cfg(test)]
+    pub fn uniform(start_minutes: u32, slot_minutes: u32, rows: usize) -> Self {
+        let mut axis = TimeAxis {
+            starts: Vec::with_capacity(rows),
+            end: start_minutes,
+        };
+        axis.push_segment(
+            start_minutes,
+            start_minutes + slot_minutes * rows as u32,
+            slot_minutes,
+        );
+        axis
+    }
+
+    /// Append rows of `slot` minutes covering `[from, to)`; the last one is
+    /// cut short when `slot` doesn't divide the range.
+    fn push_segment(&mut self, from: u32, to: u32, slot: u32) {
+        let mut at = from;
+        while at < to {
+            self.starts.push(at);
+            at += slot;
+        }
+        self.end = self.end.max(to);
+    }
+
+    pub fn rows(&self) -> usize {
+        self.starts.len()
+    }
+
+    /// Minutes-from-local-midnight at which the first row begins.
+    pub fn start_minutes(&self) -> u32 {
+        self.starts.first().copied().unwrap_or(self.end)
+    }
+
     /// Minutes-from-local-midnight at which `row` begins.
     pub fn row_start_minutes(&self, row: usize) -> u32 {
-        self.start_minutes + self.slot_minutes * row as u32
+        self.starts.get(row).copied().unwrap_or(self.end)
+    }
+
+    /// How many minutes `row` covers.
+    pub fn slot_minutes(&self, row: usize) -> u32 {
+        self.row_start_minutes(row + 1) - self.row_start_minutes(row)
     }
 
     /// Minutes-from-local-midnight at which the last row ends.
     pub fn end_minutes(&self) -> u32 {
-        self.start_minutes + self.slot_minutes * self.rows as u32
+        self.end
     }
 
     /// The row `minute` falls in, clamped into the axis — an instant
@@ -539,11 +587,10 @@ impl TimeAxis {
     /// the last row, so a multi-day event that runs through the whole
     /// column still renders instead of vanishing.
     pub fn row_of(&self, minute: i64) -> usize {
-        let rel = minute - self.start_minutes as i64;
-        if rel <= 0 {
-            return 0;
-        }
-        ((rel / self.slot_minutes as i64) as usize).min(self.rows.saturating_sub(1))
+        // Rows starting at or before `minute`, less one, is the row it is in.
+        self.starts
+            .partition_point(|&s| s as i64 <= minute)
+            .saturating_sub(1)
     }
 
     /// The inclusive first/last rows a `[start_min, end_min)` range
@@ -557,24 +604,36 @@ impl TimeAxis {
     }
 }
 
+/// How many rows of `slot` minutes it takes to cover `[from, to)`.
+fn segment_rows(from: i64, to: i64, slot: u32) -> usize {
+    if to <= from {
+        0
+    } else {
+        ((to - from + slot as i64 - 1) / slot as i64) as usize
+    }
+}
+
 /// Lay out the time ruler for a Day/3-Day/Week grid.
 ///
 /// `rows_available` is how many terminal rows the grid itself may use
 /// (all-day banner rows already subtracted). `spans` is every *timed*
-/// event's `[start, end)` in minutes-from-local-midnight across **all**
-/// displayed days, so the resulting axis covers every column.
+/// event's `[start, end)` in minutes-from-local-midnight across all the
+/// days drawn on this axis, so the resulting axis covers every column.
 ///
-/// The axis always covers every span *and* [`DAY_CORE`], at the finest
-/// slot length that fits; whatever height is left over is spent widening
-/// the window around that. Returns `None` only when there isn't the
-/// vertical room for a grid at all — the caller then falls back to the
-/// plain stacked list.
+/// The axis always covers every span *and* [`DAY_CORE`]. The core gets
+/// the finest slot that fits; the whole hours an event adds before or
+/// after it get the finest slot, no finer than the core's, that still
+/// fits in what is left — so a single late event shows its evening at
+/// hour resolution instead of dropping the whole day to it. Returns
+/// `None` only when there isn't the vertical room for a grid at all — the
+/// caller then falls back to the plain stacked list.
 pub fn plan_time_axis(rows_available: usize, spans: &[(i64, i64)]) -> Option<TimeAxis> {
     if rows_available < MIN_GRID_ROWS {
         return None;
     }
     // What has to be on screen: [`DAY_CORE`] widened to take in every
     // event, snapped out to whole hours.
+    let (core_start, core_end) = DAY_CORE;
     let (mut need_start, mut need_end) = DAY_CORE;
     for &(start, end) in spans {
         need_start = need_start.min(start.clamp(0, MINUTES_PER_DAY));
@@ -583,27 +642,29 @@ pub fn plan_time_axis(rows_available: usize, spans: &[(i64, i64)]) -> Option<Tim
     need_start -= need_start.rem_euclid(60);
     need_end = ((need_end + 59) / 60 * 60).min(MINUTES_PER_DAY);
 
-    for slot in SLOT_CHOICES {
-        let slot_min = slot as i64;
-        let day_rows = (MINUTES_PER_DAY / slot_min) as usize;
-        let need_first = need_start.div_euclid(slot_min);
-        let need_last = (need_end - 1).max(need_start).div_euclid(slot_min);
-        let need_rows = (need_last - need_first + 1) as usize;
-        let rows = rows_available.min(day_rows);
-        if need_rows > rows {
-            continue; // too fine a slot to fit what must be shown
+    // Show exactly what must be shown, at the finest resolution that fits:
+    // the core first, then the hours outside it. A taller column buys a
+    // finer slot (every choice divides the hour, so the ruler still lands
+    // on whole hours), never extra hours; at most a few rows stay blank
+    // below the last one.
+    for core_slot in SLOT_CHOICES {
+        let core_rows = segment_rows(core_start, core_end, core_slot);
+        for outer_slot in SLOT_CHOICES.into_iter().filter(|&s| s >= core_slot) {
+            let rows = segment_rows(need_start, core_start, outer_slot)
+                + core_rows
+                + segment_rows(core_end, need_end, outer_slot);
+            if rows > rows_available {
+                continue; // too fine a slot to fit what must be shown
+            }
+            let mut axis = TimeAxis {
+                starts: Vec::with_capacity(rows),
+                end: need_start as u32,
+            };
+            axis.push_segment(need_start as u32, core_start as u32, outer_slot);
+            axis.push_segment(core_start as u32, core_end as u32, core_slot);
+            axis.push_segment(core_end as u32, need_end as u32, outer_slot);
+            return Some(axis);
         }
-        // Show exactly what must be shown — the working day, stretched only
-        // as far as the displayed days' events require — at the finest slot
-        // that fits it. A taller column buys a finer slot (every choice
-        // divides the hour, so the ruler still lands on whole hours), never
-        // extra hours; at most a few rows stay blank below the last one.
-        let _ = rows;
-        return Some(TimeAxis {
-            start_minutes: (need_first * slot_min) as u32,
-            slot_minutes: slot,
-            rows: need_rows,
-        });
     }
     None
 }
@@ -3422,7 +3483,7 @@ impl CalApp {
         };
         let banner_text = CellText::for_width(width);
         let blank = || Line::from(Span::styled(String::new(), Style::default().bg(cell_bg)));
-        let mut lines = Vec::with_capacity(all_day_rows + axis.rows);
+        let mut lines = Vec::with_capacity(all_day_rows + axis.rows());
         let mut selected_line: Option<usize> = None;
 
         // -- All-day banners, padded out to the shared reserved height.
@@ -3480,7 +3541,7 @@ impl CalApp {
             .iter()
             .map(|&(pos, _, first, last)| (pos, first, last))
             .collect();
-        let placements = pack_cascade(&spans, axis.rows, (width / CASCADE_INDENT_SHARE) as usize);
+        let placements = pack_cascade(&spans, axis.rows(), (width / CASCADE_INDENT_SHARE) as usize);
         let of_pos = |pos: usize| timed.iter().find(|&&(p, ..)| p == pos);
         // Today's current slot: a red band across the whole column unless an
         // event's title line starts there (then the event keeps its row);
@@ -3496,10 +3557,10 @@ impl CalApp {
                 .any(|p| p.start_row <= r && r <= p.end_row)
         });
         let now_label_at = now_row.and_then(|r| {
-            now_label_position(r, axis.rows, &placements, now_label_len, width as usize)
+            now_label_position(r, axis.rows(), &placements, now_label_len, width as usize)
         });
 
-        for row in 0..axis.rows {
+        for row in 0..axis.rows() {
             let owner = placements.iter().find(|p| p.start_row == row);
             // Bars of everything still running through this row, by column.
             // Anything at or past the owner's indent is left undrawn: the
@@ -3661,7 +3722,7 @@ impl CalApp {
     /// [`TimeAxis`] shared by the columns of equal height (see
     /// [`Self::grid_column_lines`]) so events sit at their real position in
     /// the day and line up across days; the half-height weekend columns
-    /// plan their own axis. When the terminal is too short or the columns
+    /// plan their own axis, from their own days' events. When the terminal is too short or the columns
     /// too narrow for that, a column falls back to the plain stacked list.
     fn render_columns(&self, frame: &mut Frame, area: Rect, days: &[NaiveDate]) {
         let (single, stacked) = week_columns(days, self.view == CalView::Week);
@@ -3672,15 +3733,17 @@ impl CalApp {
         let columns = Layout::horizontal(constraints).split(area);
         let today = Local::now().date_naive();
 
-        // One time range for every visible day: an early or late event on
-        // any of them stretches all the columns, so they keep lining up.
-        let all_spans = self.timed_spans_for(days);
+        // One time range per group of equal-height columns: an early or
+        // late event on any of its days stretches all of that group's
+        // columns, so they keep lining up. The stacked weekend has rows of a
+        // different height anyway, so its late Saturday evening has no
+        // reason to stretch the weekdays (or the other way round).
         let placed: Vec<(Rect, NaiveDate)> = single
             .iter()
             .zip(columns.iter())
             .map(|(d, r)| (*r, *d))
             .collect();
-        let (axis, all_day_rows) = self.plan_group_axis(&placed, &all_spans);
+        let (axis, all_day_rows) = self.plan_group_axis(&placed, &self.timed_spans_for(&single));
         for (rect, day) in &placed {
             self.render_day_column(frame, *rect, *day, axis.as_ref(), all_day_rows, today);
         }
@@ -3697,7 +3760,8 @@ impl CalApp {
                 .zip(parts.iter())
                 .map(|(d, r)| (*r, *d))
                 .collect();
-            let (axis, all_day_rows) = self.plan_group_axis(&placed, &all_spans);
+            let (axis, all_day_rows) =
+                self.plan_group_axis(&placed, &self.timed_spans_for(&stacked));
             for (rect, day) in &placed {
                 self.render_day_column(frame, *rect, *day, axis.as_ref(), all_day_rows, today);
             }
@@ -5322,7 +5386,7 @@ mod tests {
     #[test]
     fn an_empty_day_gets_a_working_day_ruler_rather_than_a_blank_24_hours() {
         let axis = plan_time_axis(24, &[]).unwrap();
-        assert!(axis.start_minutes <= 8 * 60);
+        assert!(axis.start_minutes() <= 8 * 60);
         assert!(axis.end_minutes() >= 20 * 60);
     }
 
@@ -5331,7 +5395,7 @@ mod tests {
         // 07:00 on one day and 22:00 on another: one shared ruler has to
         // span both, or a column would render an event outside its own grid.
         let axis = plan_time_axis(12, &[(7 * 60, 8 * 60), (21 * 60, 22 * 60)]).unwrap();
-        assert!(axis.start_minutes <= 7 * 60);
+        assert!(axis.start_minutes() <= 7 * 60);
         assert!(axis.end_minutes() >= 22 * 60);
     }
 
@@ -5350,10 +5414,10 @@ mod tests {
                     "rows={}",
                     rows
                 );
-                assert!(axis.rows <= rows, "rows={}", rows);
+                assert!(axis.rows() <= rows, "rows={}", rows);
                 for (start, end) in &spans {
                     let (first, last) = axis.row_span(*start, *end);
-                    assert!(first <= last && last < axis.rows);
+                    assert!(first <= last && last < axis.rows());
                 }
             }
         }
@@ -5364,13 +5428,13 @@ mod tests {
         let roomy = plan_time_axis(40, &[(9 * 60, 10 * 60)]).unwrap();
         let cramped = plan_time_axis(8, &[(9 * 60, 10 * 60)]).unwrap();
         assert!(
-            roomy.slot_minutes < cramped.slot_minutes,
+            roomy.slot_minutes(0) < cramped.slot_minutes(0),
             "{}min vs {}min",
-            roomy.slot_minutes,
-            cramped.slot_minutes
+            roomy.slot_minutes(0),
+            cramped.slot_minutes(0)
         );
         for axis in [roomy, cramped] {
-            assert!(axis.start_minutes as i64 <= DAY_CORE.0);
+            assert!(axis.start_minutes() as i64 <= DAY_CORE.0);
             assert!(axis.end_minutes() as i64 >= DAY_CORE.1);
         }
     }
@@ -5378,7 +5442,7 @@ mod tests {
     #[test]
     fn a_day_with_one_meeting_still_shows_the_whole_working_day() {
         let axis = plan_time_axis(24, &[(12 * 60, 13 * 60)]).unwrap();
-        assert!(axis.start_minutes as i64 <= DAY_CORE.0);
+        assert!(axis.start_minutes() as i64 <= DAY_CORE.0);
         assert!(axis.end_minutes() as i64 >= DAY_CORE.1);
     }
 
@@ -5387,32 +5451,70 @@ mod tests {
         // 60 rows: 15-minute slots fit the 14-hour working day in 56 rows;
         // the 4 rows left over stay blank rather than showing extra hours.
         let axis = plan_time_axis(60, &[(9 * 60, 10 * 60)]).unwrap();
-        assert_eq!(axis.slot_minutes, 15);
-        assert_eq!(axis.rows, 56);
-        assert_eq!(axis.start_minutes as i64, DAY_CORE.0);
+        assert_eq!(axis.slot_minutes(0), 15);
+        assert_eq!(axis.rows(), 56);
+        assert_eq!(axis.start_minutes() as i64, DAY_CORE.0);
         assert_eq!(axis.end_minutes() as i64, DAY_CORE.1);
         // 70 rows fit 12-minute slots exactly; 84 rows fit 10-minute ones.
-        assert_eq!(plan_time_axis(70, &[]).unwrap().slot_minutes, 12);
-        assert_eq!(plan_time_axis(84, &[]).unwrap().slot_minutes, 10);
-        assert_eq!(plan_time_axis(84, &[]).unwrap().rows, 84);
+        assert_eq!(plan_time_axis(70, &[]).unwrap().slot_minutes(0), 12);
+        assert_eq!(plan_time_axis(84, &[]).unwrap().slot_minutes(0), 10);
+        assert_eq!(plan_time_axis(84, &[]).unwrap().rows(), 84);
         // An event at 22:30 on some displayed day pulls the end out to
-        // midnight; the start stays at 07:00 and the slot coarsens to fit.
+        // midnight; the start stays at 07:00, the working day keeps its
+        // 15-minute slots and only the added evening is drawn coarser.
         let late = plan_time_axis(60, &[(22 * 60 + 30, 23 * 60 + 15)]).unwrap();
-        assert_eq!(late.start_minutes as i64, DAY_CORE.0);
+        assert_eq!(late.start_minutes() as i64, DAY_CORE.0);
         assert_eq!(late.end_minutes(), MINUTES_PER_DAY as u32);
-        assert_eq!(late.slot_minutes, 20);
+        assert_eq!(late.slot_minutes(0), 15);
+        assert_eq!(late.slot_minutes(late.rows() - 1), 60);
+        assert_eq!(late.rows(), 56 + 3);
         let early = plan_time_axis(60, &[(5 * 60 + 40, 6 * 60)]).unwrap();
-        assert_eq!(early.start_minutes, 5 * 60);
+        assert_eq!(early.start_minutes(), 5 * 60);
         assert_eq!(early.end_minutes() as i64, DAY_CORE.1);
     }
 
     #[test]
+    fn a_late_event_coarsens_only_the_hours_it_adds() {
+        // The case that motivated the split axis: 31 rows, an event until
+        // 23:55. A uniform ruler needs 34 half-hour rows for 07-24, so it
+        // used to drop the whole day to hourly slots with 14 rows blank.
+        let axis = plan_time_axis(31, &[(20 * 60, 23 * 60 + 55)]).unwrap();
+        assert_eq!(axis.rows(), 28 + 3);
+        assert_eq!(axis.row_start_minutes(0) as i64, DAY_CORE.0);
+        assert_eq!(axis.slot_minutes(0), 30);
+        assert_eq!(axis.row_start_minutes(28) as i64, DAY_CORE.1);
+        assert_eq!(axis.slot_minutes(28), 60);
+        assert_eq!(axis.end_minutes(), MINUTES_PER_DAY as u32);
+        // Rows still land on whole hours, so the ruler labels them.
+        assert_eq!(axis.row_of(22 * 60 + 10), 29);
+        assert_eq!(axis.row_span(20 * 60, 23 * 60 + 55), (26, 30));
+        // With room to spare, the whole range gets the fine slot.
+        let roomy = plan_time_axis(34, &[(20 * 60, 23 * 60 + 55)]).unwrap();
+        assert!((0..roomy.rows()).all(|r| roomy.slot_minutes(r) == 30));
+    }
+
+    #[test]
+    fn rows_cover_the_axis_without_gaps_whatever_the_slots() {
+        for rows in MIN_GRID_ROWS..90 {
+            for spans in [
+                vec![],
+                vec![(60, 90)],
+                vec![(23 * 60, MINUTES_PER_DAY)],
+                vec![(0, 30), (22 * 60, MINUTES_PER_DAY)],
+            ] {
+                let axis = plan_time_axis(rows, &spans).unwrap();
+                assert!(axis.rows() <= rows);
+                for r in 0..axis.rows() {
+                    assert!(axis.slot_minutes(r) > 0);
+                    assert_eq!(axis.row_of(axis.row_start_minutes(r) as i64), r);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn row_span_is_inclusive_and_treats_the_end_as_exclusive() {
-        let axis = TimeAxis {
-            start_minutes: 8 * 60,
-            slot_minutes: 60,
-            rows: 12,
-        };
+        let axis = TimeAxis::uniform(8 * 60, 60, 12);
         // 09:00-10:00 occupies exactly the 09:00 row, not 09:00 and 10:00.
         assert_eq!(axis.row_span(9 * 60, 10 * 60), (1, 1));
         assert_eq!(axis.row_span(9 * 60, 11 * 60), (1, 2));
@@ -5422,11 +5524,7 @@ mod tests {
 
     #[test]
     fn an_event_outside_the_axis_pins_to_the_nearest_edge_instead_of_vanishing() {
-        let axis = TimeAxis {
-            start_minutes: 8 * 60,
-            slot_minutes: 60,
-            rows: 12,
-        };
+        let axis = TimeAxis::uniform(8 * 60, 60, 12);
         assert_eq!(axis.row_span(-120, 9 * 60), (0, 0)); // began yesterday
         assert_eq!(axis.row_span(23 * 60, 24 * 60), (11, 11)); // runs past the end
     }
