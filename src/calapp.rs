@@ -137,6 +137,19 @@ fn utc_date_of(ts_utc: i64) -> NaiveDate {
         .date_naive()
 }
 
+/// The form's start and end dates for an all-day event stored as
+/// `dtstart_utc`..`dtend_utc`. The end shown is the event's last day,
+/// not the exclusive `DTEND` (see [`DraftEvent::parse_times`], which
+/// adds the day back); a malformed zero-length event shows its start.
+fn all_day_form_dates(dtstart_utc: i64, dtend_utc: i64) -> (String, String) {
+    let start = utc_date_of(dtstart_utc);
+    let last = (utc_date_of(dtend_utc) - Duration::days(1)).max(start);
+    (
+        start.format("%Y-%m-%d").to_string(),
+        last.format("%Y-%m-%d").to_string(),
+    )
+}
+
 /// When `ev` happens, the way the header shows it: `All day Mon 15 Jan`,
 /// `Mon 15 Jan 09:00–10:00`, or both ends in full when it spans days.
 fn event_when_label(ev: &CalendarEventRow) -> String {
@@ -1150,14 +1163,22 @@ impl DraftEvent {
             .map_err(|e| format!("could not read event for editing: {}", e))?;
         let start_local = event.dtstart.utc.with_timezone(&Local);
         let end_local = event.dtend.utc.with_timezone(&Local);
+        let (start_date, end_date) = if event.dtstart.all_day {
+            all_day_form_dates(event.dtstart.utc.timestamp(), event.dtend.utc.timestamp())
+        } else {
+            (
+                start_local.format("%Y-%m-%d").to_string(),
+                end_local.format("%Y-%m-%d").to_string(),
+            )
+        };
         Ok(Self {
             summary: event.summary,
             location: event.location,
             description: event.description,
             all_day: event.dtstart.all_day,
-            start_date: start_local.format("%Y-%m-%d").to_string(),
+            start_date,
             start_time: start_local.format("%H:%M").to_string(),
-            end_date: end_local.format("%Y-%m-%d").to_string(),
+            end_date,
             end_time: end_local.format("%H:%M").to_string(),
             rrule: event.rrule.unwrap_or_default(),
             status: event.status,
@@ -1203,8 +1224,7 @@ impl DraftEvent {
         draft.description = row.description.clone();
         draft.all_day = row.all_day;
         if row.all_day {
-            draft.start_date = utc_date_of(row.dtstart_utc).format("%Y-%m-%d").to_string();
-            draft.end_date = utc_date_of(row.dtend_utc).format("%Y-%m-%d").to_string();
+            (draft.start_date, draft.end_date) = all_day_form_dates(row.dtstart_utc, row.dtend_utc);
             draft.start_time = "09:00".to_string();
             draft.end_time = "10:00".to_string();
         } else {
@@ -1332,10 +1352,13 @@ impl DraftEvent {
 
     /// Parse the text start/end fields into [`EventTime`]s, or a
     /// human-readable error naming exactly what's wrong — never silently
-    /// falls back to a guessed value. All-day events default a blank end
-    /// date to one day after the start; timed events default a blank end
-    /// date to the start date (same-day) but always require an explicit
-    /// end time distinct from — and after — the start.
+    /// falls back to a guessed value. For an all-day event the form's end
+    /// date is the event's *last day* (what a person types: Dec 11 to
+    /// Dec 14 means the 14th too), so the returned end is the day after
+    /// it — RFC 5545's exclusive `DTEND`; a blank end date means a
+    /// one-day event. Timed events default a blank end date to the start
+    /// date (same-day) but always require an explicit end time distinct
+    /// from — and after — the start.
     pub fn parse_times(&self) -> Result<(EventTime, EventTime), String> {
         let start_date =
             NaiveDate::parse_from_str(self.start_date.trim(), "%Y-%m-%d").map_err(|_| {
@@ -1346,17 +1369,20 @@ impl DraftEvent {
             })?;
 
         if self.all_day {
-            let end_date = if self.end_date.trim().is_empty() {
-                start_date + Duration::days(1)
+            let last_day = if self.end_date.trim().is_empty() {
+                start_date
             } else {
                 NaiveDate::parse_from_str(self.end_date.trim(), "%Y-%m-%d").map_err(|_| {
                     format!("invalid end date (expected YYYY-MM-DD): {}", self.end_date)
                 })?
             };
-            if end_date <= start_date {
-                return Err("end date must be after start date".to_string());
+            if last_day < start_date {
+                return Err("end date must not be before start date".to_string());
             }
-            return Ok((EventTime::all_day(start_date), EventTime::all_day(end_date)));
+            return Ok((
+                EventTime::all_day(start_date),
+                EventTime::all_day(last_day + Duration::days(1)),
+            ));
         }
 
         let start_time = NaiveTime::parse_from_str(self.start_time.trim(), "%H:%M")
@@ -5909,7 +5935,10 @@ mod tests {
         let draft = app.draft.as_ref().unwrap();
         assert!(draft.all_day);
         assert_eq!(draft.start_date, "2024-02-01");
-        assert_eq!(draft.end_date, "2024-02-04");
+        assert_eq!(draft.end_date, "2024-02-03", "the form shows the last day");
+        let (start, end) = draft.parse_times().unwrap();
+        assert_eq!(start.utc, EventTime::all_day(date(2024, 2, 1)).utc);
+        assert_eq!(end.utc, EventTime::all_day(date(2024, 2, 4)).utc);
     }
 
     #[test]
@@ -6097,6 +6126,39 @@ mod tests {
         draft.start_date = "not-a-date".to_string();
         let err = draft.parse_times().unwrap_err();
         assert!(err.contains("invalid start date"));
+    }
+
+    #[test]
+    fn all_day_end_date_is_the_last_day_inclusive() {
+        let mut draft =
+            DraftEvent::blank("c1", Local.with_ymd_and_hms(2026, 12, 11, 9, 0, 0).unwrap());
+        draft.all_day = true;
+        draft.end_date = "2026-12-14".to_string();
+        let (start, end) = draft.parse_times().unwrap();
+        assert_eq!(start.utc, EventTime::all_day(date(2026, 12, 11)).utc);
+        assert_eq!(end.utc, EventTime::all_day(date(2026, 12, 15)).utc);
+
+        // A one-day event: end date equal to the start date.
+        draft.end_date = draft.start_date.clone();
+        let (start, end) = draft.parse_times().unwrap();
+        assert_eq!(end.utc, start.utc + Duration::days(1));
+
+        draft.end_date = "2026-12-10".to_string();
+        assert!(draft.parse_times().unwrap_err().contains("before start"));
+    }
+
+    #[test]
+    fn editing_an_all_day_event_shows_its_last_day_and_round_trips() {
+        let start = EventTime::all_day(date(2026, 12, 11)).utc.timestamp();
+        let end = EventTime::all_day(date(2026, 12, 15)).utc.timestamp();
+        let mut app = test_app();
+        app.set_events(vec![make_row("retreat", start, end, None, true)]);
+        let row = app.events[0].clone();
+        let draft = DraftEvent::from_row(&row).unwrap();
+        assert_eq!(draft.start_date, "2026-12-11");
+        assert_eq!(draft.end_date, "2026-12-14");
+        let (s, e) = draft.parse_times().unwrap();
+        assert_eq!((s.utc.timestamp(), e.utc.timestamp()), (start, end));
     }
 
     #[test]
