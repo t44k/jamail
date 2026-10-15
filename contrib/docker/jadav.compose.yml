@@ -18,6 +18,8 @@ services:
     volumes:
       - ./docker-data/jadav/config:/config:ro
       - ./docker-data/jadav/state:/state
+      # Only with a `jadav.webdav` block: its `root` (e.g. /files).
+      # - ./docker-data/jadav/files:/files
     # The mail server jadav reads iTIP mail from and sends iMIP through
     # (jadav.mail.imap/smtp) presents a certificate for its public name, so
     # jadav must reach it by that name. A container cannot rely on hairpinning

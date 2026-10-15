@@ -86,6 +86,23 @@ impl Element {
     pub fn text_trim(&self) -> &str {
         self.text.trim()
     }
+
+    /// Re-serialise this element (namespace-qualified, attributes and
+    /// namespace declarations dropped) — enough to echo a client's
+    /// `<D:owner>` back in `lockdiscovery`.
+    pub fn to_xml(&self) -> String {
+        prop_element(&self.name, &self.inner_xml())
+    }
+
+    /// The element's text followed by its children, serialised. Mixed
+    /// content loses its interleaving, which no WebDAV client relies on.
+    pub fn inner_xml(&self) -> String {
+        let mut out = escape_text(self.text_trim());
+        for child in &self.children {
+            out.push_str(&child.to_xml());
+        }
+        out
+    }
 }
 
 /// Parse a request body into an element tree. Depth and size are capped
@@ -405,6 +422,7 @@ pub fn reason_phrase(code: u16) -> &'static str {
         200 => "OK",
         201 => "Created",
         204 => "No Content",
+        206 => "Partial Content",
         207 => "Multi-Status",
         301 => "Moved Permanently",
         304 => "Not Modified",
@@ -417,9 +435,12 @@ pub fn reason_phrase(code: u16) -> &'static str {
         412 => "Precondition Failed",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
+        416 => "Range Not Satisfiable",
+        423 => "Locked",
         424 => "Failed Dependency",
         500 => "Internal Server Error",
         501 => "Not Implemented",
+        502 => "Bad Gateway",
         507 => "Insufficient Storage",
         _ => "Unknown",
     }
