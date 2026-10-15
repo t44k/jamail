@@ -31,6 +31,7 @@ pub mod itip;
 pub mod mirror;
 pub mod server;
 pub mod store;
+pub mod webdav;
 pub mod xml;
 
 use crate::caldav::CalDavClient;
@@ -889,6 +890,15 @@ fn serve(config_path: &std::path::Path) -> Result<()> {
     }
     let scheduling = Arc::new(scheduling_runtime(&cfg));
     state.scheduling = Some(Arc::clone(&scheduling));
+    if let Some(wd) = webdav::WebdavState::from_config(&cfg)? {
+        eprintln!(
+            "jadav: webdav enabled at /webdav/ (root {}, {} users, {} shares)",
+            wd.root().display(),
+            cfg.webdav.as_ref().map_or(0, |w| w.users.len()),
+            cfg.webdav.as_ref().map_or(0, |w| w.shares.len()),
+        );
+        state.webdav = Some(Arc::new(wd));
+    }
     let state = Arc::new(state);
     install_signal_handlers();
     let (handle, addr) = server::spawn(&cfg.listen, Arc::clone(&state))?;
@@ -977,6 +987,9 @@ fn serve(config_path: &std::path::Path) -> Result<()> {
                 }
                 Err(e) => eprintln!("jadav: SIGHUP: could not re-resolve password: {:#}", e),
             }
+            if let Some(wd) = &state.webdav {
+                reload_webdav(config_path, wd);
+            }
         }
         if last_compaction.elapsed() >= COMPACTION_INTERVAL {
             last_compaction = Instant::now();
@@ -1001,6 +1014,34 @@ fn serve(config_path: &std::path::Path) -> Result<()> {
         let _ = t.join();
     }
     Ok(())
+}
+
+/// `SIGHUP`: re-read the config file and swap in its WebDAV users,
+/// passwords and shares. Turning WebDAV off or moving its root needs a
+/// restart; a config that fails to load keeps the current access table.
+fn reload_webdav(config_path: &Path, wd: &webdav::WebdavState) {
+    let result = JadavConfig::load_from(config_path).and_then(|cfg| {
+        cfg.validate()?;
+        if let Some(new) = &cfg.webdav
+            && new.root != wd.root()
+        {
+            eprintln!(
+                "jadav: SIGHUP: webdav root changed to {}; restart jadav to use it",
+                new.root.display()
+            );
+        }
+        webdav::Access::from_config(&cfg)
+    });
+    match result {
+        Ok(Some(access)) => match wd.reload(access) {
+            Ok(()) => eprintln!("jadav: SIGHUP: webdav users and shares reloaded"),
+            Err(e) => eprintln!("jadav: SIGHUP: webdav reload failed: {:#}", e),
+        },
+        Ok(None) => {
+            eprintln!("jadav: SIGHUP: webdav removed from config; restart jadav to turn it off")
+        }
+        Err(e) => eprintln!("jadav: SIGHUP: webdav reload failed: {:#}", e),
+    }
 }
 
 /// Resolve everything the scheduling paths need from config, once.
@@ -1088,6 +1129,37 @@ fn check_config(config_path: &std::path::Path) -> Result<()> {
                 String::new()
             }
         );
+    }
+    match &cfg.webdav {
+        Some(wd) => {
+            println!(
+                "webdav:    /webdav/ root={} max_upload={}",
+                wd.root.display(),
+                wd.max_upload_bytes
+                    .map_or_else(|| "unlimited".to_string(), |n| format!("{}B", n))
+            );
+            for (login, user) in &wd.users {
+                println!(
+                    "webdav:    user {} home=/webdav/{}/{}",
+                    login,
+                    login,
+                    if user.auth.is_none() {
+                        " (principal's password)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            for (name, share) in &wd.shares {
+                println!(
+                    "webdav:    share /webdav/shared/{}/ read_write=[{}] read_only=[{}]",
+                    name,
+                    share.read_write.join(", "),
+                    share.read_only.join(", ")
+                );
+            }
+        }
+        None => println!("webdav:    off (no webdav: section)"),
     }
     match &cfg.mail {
         Some(mail) => {

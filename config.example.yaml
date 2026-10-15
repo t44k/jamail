@@ -322,3 +322,24 @@ jadav:
   # How long the RFC 6578 change log is kept; older client sync-tokens get a
   # full resync instead of a delta.
   sync_log_retention_days: 90
+  # Optional WebDAV file server on the same listener, under /webdav/. Off
+  # unless this block is present. Each user gets a private home at
+  # /webdav/<login>/ (<root>/users/<login>/ on disk); each share appears at
+  # /webdav/shared/<name>/ (<root>/shared/<name>/) to its members only.
+  # Works with macOS Finder and Windows Explorer (class 2 locking) as well
+  # as rclone, davfs2 and Nautilus; Windows only sends Basic auth over
+  # HTTPS, which the reverse proxy provides. SIGHUP reloads users,
+  # passwords and shares.
+  # webdav:
+  #   root: /var/lib/jadav/files      # absolute; created on start
+  #   max_upload_bytes: 10737418240   # optional; no limit when unset
+  #   users:
+  #     alice@example.com: {}         # the principal's login: reuses principal.auth
+  #     bob:
+  #       auth:
+  #         type: command
+  #         value: pass show jadav/webdav-bob
+  #   shares:
+  #     family:
+  #       read_write: [alice@example.com, bob]
+  #       read_only: []

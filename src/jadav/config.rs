@@ -57,6 +57,131 @@ pub struct JadavConfig {
     /// answered with `valid-sync-token` (a full resync).
     #[serde(default = "default_retention_days")]
     pub sync_log_retention_days: u32,
+    /// Optional WebDAV file server under `/webdav/` on the same listener:
+    /// a private home per user plus named shared spaces, stored as a plain
+    /// directory tree. Unset: no `/webdav/` routes and nothing on disk —
+    /// see `jadav::webdav`.
+    pub webdav: Option<WebdavConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct WebdavConfig {
+    /// Directory holding every space: `users/<login>/`, `shared/<name>/`
+    /// and jadav's own `.tmp/` for uploads in flight. Absolute.
+    pub root: PathBuf,
+    /// Largest single `PUT` accepted; unset means no limit.
+    pub max_upload_bytes: Option<u64>,
+    /// Who may log in, keyed by login. A user without `auth` is only
+    /// valid for `principal.login`, and reuses the principal's password.
+    #[serde(default)]
+    pub users: IndexMap<String, WebdavUserConfig>,
+    /// Named spaces several users see under `/webdav/shared/<name>/`.
+    #[serde(default)]
+    pub shares: IndexMap<String, WebdavShareConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WebdavUserConfig {
+    pub auth: Option<AuthConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WebdavShareConfig {
+    #[serde(default)]
+    pub read_write: Vec<String>,
+    #[serde(default)]
+    pub read_only: Vec<String>,
+}
+
+/// The URL segment under `/webdav/` holding the shared spaces; no user
+/// may take it as a login.
+pub const WEBDAV_SHARED_SEGMENT: &str = "shared";
+
+/// WebDAV logins and share names become directory names: letters, digits
+/// and `._@+-`, not starting with `.`, at most 128 bytes.
+pub fn is_valid_webdav_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'@' | b'+' | b'-'))
+}
+
+impl WebdavConfig {
+    /// The secret `login` authenticates with: its own `auth`, else the
+    /// principal's (only the principal may omit it, see [`Self::validate`]).
+    pub fn user_auth<'a>(
+        &'a self,
+        login: &str,
+        principal: &'a PrincipalConfig,
+    ) -> Option<&'a AuthConfig> {
+        let user = self.users.get(login)?;
+        match &user.auth {
+            Some(a) => Some(a),
+            None if login == principal.login => Some(&principal.auth),
+            None => None,
+        }
+    }
+
+    pub fn validate(&self, principal_login: &str) -> Result<Vec<String>> {
+        let mut warnings = Vec::new();
+        if self.root.as_os_str().is_empty() || !self.root.is_absolute() {
+            bail!("jadav.webdav.root must be an absolute path");
+        }
+        if self.users.is_empty() {
+            bail!("jadav.webdav.users is empty; list at least one user");
+        }
+        for (login, user) in &self.users {
+            if !is_valid_webdav_name(login) {
+                bail!(
+                    "webdav user {:?} is not a valid name: use letters, digits and ._@+-, \
+                     not starting with '.'",
+                    login
+                );
+            }
+            if login == WEBDAV_SHARED_SEGMENT {
+                bail!("webdav user name {:?} is reserved", login);
+            }
+            if user.auth.is_none() && login != principal_login {
+                bail!(
+                    "webdav user {:?} has no `auth` (only the principal's login may omit it)",
+                    login
+                );
+            }
+        }
+        for (name, share) in &self.shares {
+            if !is_valid_webdav_name(name) {
+                bail!(
+                    "webdav share {:?} is not a valid name: use letters, digits and ._@+-, \
+                     not starting with '.'",
+                    name
+                );
+            }
+            for member in share.read_write.iter().chain(&share.read_only) {
+                if !self.users.contains_key(member) {
+                    bail!(
+                        "webdav share {:?} names {:?}, who is not in webdav.users",
+                        name,
+                        member
+                    );
+                }
+            }
+            if share.read_write.is_empty() && share.read_only.is_empty() {
+                warnings.push(format!("webdav share {:?} has no members", name));
+            }
+            for member in &share.read_only {
+                if share.read_write.contains(member) {
+                    warnings.push(format!(
+                        "webdav share {:?} lists {:?} as both read_write and read_only; \
+                         read_write wins",
+                        name, member
+                    ));
+                }
+            }
+        }
+        Ok(warnings)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -525,6 +650,9 @@ impl JadavConfig {
                 );
             }
         }
+        if let Some(webdav) = &self.webdav {
+            warnings.extend(webdav.validate(&self.principal.login)?);
+        }
         Ok(warnings)
     }
 }
@@ -674,5 +802,63 @@ mod tests {
         ok.validate().unwrap();
         assert!(ok.remotes["g"].mirror_all);
         assert_eq!(ok.remotes["g"].skip_calendars, vec!["Holidays".to_string()]);
+    }
+    #[test]
+    fn webdav_is_off_by_default_and_validated_when_present() {
+        assert!(parse(MINIMAL).webdav.is_none());
+        let base = "jadav:\n  store: /tmp/x.db\n  principal:\n    login: t@example.com\n    auth: {type: password, value: pw}\n  webdav:\n";
+        let ok = parse(&format!(
+            "{base}    root: /srv/files\n    max_upload_bytes: 1024\n    users:\n      t@example.com: {{}}\n      alice: {{auth: {{type: password, value: pa}}}}\n      bob: {{auth: {{type: password, value: pb}}}}\n    shares:\n      fam: {{read_write: [t@example.com, alice], read_only: [bob, alice]}}\n      empty: {{}}\n"
+        ));
+        let warnings = ok.validate().unwrap();
+        let wd = ok.webdav.as_ref().unwrap();
+        assert_eq!(wd.max_upload_bytes, Some(1024));
+        assert_eq!(wd.users.len(), 3);
+        // The principal's own login reuses the principal's password.
+        assert_eq!(
+            wd.user_auth("t@example.com", &ok.principal).unwrap().value,
+            "pw"
+        );
+        assert_eq!(wd.user_auth("alice", &ok.principal).unwrap().value, "pa");
+        assert!(wd.user_auth("nobody", &ok.principal).is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("\"empty\"") && w.contains("no members")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("\"alice\"") && w.contains("read_write wins")),
+            "{warnings:?}"
+        );
+
+        let bad = |body: &str| {
+            parse(&format!("{base}{body}"))
+                .validate()
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(
+            bad("    root: files\n    users: {a: {auth: {type: password, value: p}}}\n")
+                .contains("absolute")
+        );
+        assert!(bad("    root: /srv/files\n").contains("users is empty"));
+        assert!(
+            bad("    root: /srv/files\n    users: {.hidden: {auth: {type: password, value: p}}}\n")
+                .contains("not a valid name")
+        );
+        assert!(
+            bad("    root: /srv/files\n    users: {a/b: {auth: {type: password, value: p}}}\n")
+                .contains("not a valid name")
+        );
+        assert!(
+            bad("    root: /srv/files\n    users: {shared: {auth: {type: password, value: p}}}\n")
+                .contains("reserved")
+        );
+        assert!(bad("    root: /srv/files\n    users: {alice: {}}\n").contains("no `auth`"));
+        assert!(bad("    root: /srv/files\n    users: {alice: {auth: {type: password, value: p}}}\n    shares: {fam: {read_only: [bob]}}\n").contains("not in webdav.users"));
+        assert!(bad("    root: /srv/files\n    users: {alice: {auth: {type: password, value: p}}}\n    shares: {..: {read_only: [alice]}}\n").contains("not a valid name"));
     }
 }

@@ -47,9 +47,12 @@
 //! - `calendar-query` honours the `VEVENT` `comp-filter` and its
 //!   `time-range` (recurring masters are expanded to test overlap); every
 //!   other filter is ignored, so results are a correct superset.
-//! - No `MOVE`/`COPY`, no `LOCK`, no quotas, no free-busy (the outbox `POST`
+//! - No `MOVE`/`COPY`, no `LOCK` on calendar resources, no quotas, no free-busy (the outbox `POST`
 //!   answers "no scheduling support" per recipient until the scheduling
 //!   milestone).
+//! - `/webdav/` is not handled here at all when `jadav.webdav` is set: the
+//!   file server in `jadav::webdav` takes the connection over right after
+//!   the request head.
 //! - Plain HTTP: TLS is the reverse proxy's job. Nothing from proxy headers
 //!   is trusted except `X-Forwarded-For` for the request log.
 
@@ -62,6 +65,7 @@ use crate::jadav::store::{
     CalendarRow, DeleteError, InboxItem, ObjectRow, Origin, Precondition, PropPatch, Provider,
     PutError, Store, WriteOutcome, parse_sync_token,
 };
+use crate::jadav::webdav;
 use crate::jadav::xml::{
     self, MultiStatus, NS_APPLE, NS_CALDAV, NS_CS, NS_DAV, PropOp, PropfindRequest, QName,
     ReportRequest, prop_element,
@@ -133,6 +137,10 @@ pub struct ServerState {
     /// The iTIP/iMIP broker. `None` (tests, `mail:` absent and no
     /// scheduling wanted) stores client documents exactly as received.
     pub scheduling: Option<Arc<SchedulingRuntime>>,
+    /// The WebDAV file server under `/webdav/`; `None` (the default, no
+    /// `jadav.webdav` configured) leaves that prefix to the CalDAV router,
+    /// which answers 404.
+    pub webdav: Option<Arc<webdav::WebdavState>>,
 }
 
 impl ServerState {
@@ -145,6 +153,7 @@ impl ServerState {
             shutdown: Arc::new(AtomicBool::new(false)),
             on_client_write: None,
             scheduling: None,
+            webdav: None,
         }
     }
 }
@@ -293,11 +302,11 @@ impl Resp {
     }
 }
 
-struct RequestHead {
-    method: String,
-    raw_target: String,
-    version_11: bool,
-    headers: HashMap<String, String>,
+pub(crate) struct RequestHead {
+    pub(crate) method: String,
+    pub(crate) raw_target: String,
+    pub(crate) version_11: bool,
+    pub(crate) headers: HashMap<String, String>,
 }
 
 /// Read request line + headers. `Ok(None)` on a clean EOF before any byte
@@ -400,6 +409,16 @@ fn handle_connection(
         }) else {
             return Ok(());
         };
+        // The file server streams its own bodies (and decides when to send
+        // `100 Continue`), so it takes over before anything is read.
+        if let Some(wd) = &state.webdav
+            && webdav::claims(&head.raw_target)
+        {
+            if webdav::handle(head, &mut reader, &mut stream, peer, wd)? {
+                continue;
+            }
+            return Ok(());
+        }
         let expects_continue = head
             .headers
             .get("expect")
