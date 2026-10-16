@@ -362,6 +362,13 @@ pub struct CalDavConfig {
     /// notification. Each entry fires its own notification (e.g. `[30,
     /// 5]` notifies both 30 and 5 minutes before).
     pub default_alarm_minutes_before: Option<Vec<i64>>,
+    /// Whether `jamaild` pops up desktop notifications for this account's
+    /// calendar alarms. Unset (default): `true`. `false` keeps calendar
+    /// sync and the `VALARM`s themselves untouched (other clients still
+    /// see and fire them) — only this machine stays quiet, the calendar
+    /// counterpart of leaving `notify_folders` unset.
+    #[serde(default = "default_true")]
+    pub notify_alarms: bool,
 }
 
 impl CalDavConfig {
@@ -973,6 +980,7 @@ mod tests {
         assert_eq!(caldav.poll_interval_secs, 300);
         assert!(caldav.calendars.is_none());
         assert!(caldav.default_alarm_minutes_before.is_none());
+        assert!(caldav.notify_alarms);
     }
 
     #[test]
@@ -992,7 +1000,8 @@ mod tests {
              \x20     auth: {type: command, value: 'pass show cal/alice'}\n\
              \x20     calendars: [Personal, Work]\n\
              \x20     poll_interval_secs: 60\n\
-             \x20     default_alarm_minutes_before: [30, 5]\n",
+             \x20     default_alarm_minutes_before: [30, 5]\n\
+             \x20     notify_alarms: false\n",
         );
         let (_, acc) = cfg.default_account().unwrap();
         let caldav = acc.caldav.as_ref().expect("caldav present");
@@ -1002,6 +1011,7 @@ mod tests {
         );
         assert_eq!(caldav.poll_interval_secs, 60);
         assert_eq!(caldav.default_alarm_minutes_before, Some(vec![30, 5]));
+        assert!(!caldav.notify_alarms);
     }
 
     fn prefs() -> Vec<JacalCalendarPref> {

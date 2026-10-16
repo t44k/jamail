@@ -169,9 +169,10 @@ create/update/delete requests.
   in the visible range (`EXDATE` exclusions honored), so a repeating event
   shows up on each date it actually occurs, not just its first occurrence.
 - **Alarms**: `VALARM`s on an event (including each occurrence of a
-  recurring one) fire a desktop notification while `jacal` is open;
-  `default_alarm_minutes_before` sets a fallback lead time for events with
-  no alarm of their own.
+  recurring one) fire a desktop notification from `jamaild`, whether or
+  not `jacal` is open; `default_alarm_minutes_before` sets a fallback lead
+  time for events with no alarm of their own, and `notify_alarms: false`
+  silences them on this machine.
 - **Inbound CalDAV server** (optional): set `daemon.caldav_server_listen`
   to have `jamaild` also serve each `caldav`-configured account's calendar
   back out over real CalDAV/WebDAV, so another CalDAV client (or another
@@ -410,6 +411,7 @@ accounts:
 | `accounts.<name>.caldav.calendars` | No | Only sync calendars whose server display name is in this list. Omitted: every discovered calendar |
 | `accounts.<name>.caldav.poll_interval_secs` | No | How often `jamaild` polls for calendar changes. Omitted (default): 300 |
 | `accounts.<name>.caldav.default_alarm_minutes_before` | No | Fallback alarm lead times (minutes) for events with no `VALARM`. Omitted: no reminder for those |
+| `accounts.<name>.caldav.notify_alarms` | No | Whether `jamaild` shows desktop notifications for this account's calendar alarms. Omitted (default): `true`; `false` silences them without touching sync |
 | `daemon.socket_path` | No | Override the `jamaild`/`jamail` IPC socket path (see [Socket path](#socket-path)). Omitted (default): `$XDG_RUNTIME_DIR/jamail/jamaild.sock` |
 
 Auth type `command` runs the value as a shell command and reads the password from stdout. Works with `pass`, `gpg`, `secret-tool`, etc.

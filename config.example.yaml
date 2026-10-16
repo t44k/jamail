@@ -138,6 +138,9 @@ accounts:
       # default): no notification unless the event itself has an alarm.
       # Each entry fires its own notification.
       default_alarm_minutes_before: [30, 5]
+      # Optional: set to false to keep this account's calendar alarms from
+      # popping up on this machine (sync is unaffected). Default: true.
+      # notify_alarms: false
 
   # Gmail example
   gmail:
