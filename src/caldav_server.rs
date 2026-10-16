@@ -660,6 +660,7 @@ mod tests {
                 calendars: None,
                 poll_interval_secs: 300,
                 default_alarm_minutes_before: None,
+                notify_alarms: true,
             }),
         }
     }

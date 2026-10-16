@@ -524,11 +524,14 @@ pub fn run_with_notifier(notifier: Notifier) -> Result<()> {
     // Calendar alarms are this daemon's job, like mail notifications: one
     // clock thread over every caldav-configured account's cached events,
     // so a reminder fires whether or not `jacal` is open. Failures are
-    // logged, never swallowed (see `calnotify`'s module docs).
+    // logged, never swallowed (see `calnotify`'s module docs). An account
+    // with `caldav.notify_alarms: false` syncs its calendars but never
+    // pops anything up on this machine.
     let alarm_accounts: Vec<calnotify::AlarmAccount> = accounts
         .iter()
         .filter_map(|(name, account)| {
-            account.caldav.as_ref().map(|c| calnotify::AlarmAccount {
+            let c = account.caldav.as_ref().filter(|c| c.notify_alarms)?;
+            Some(calnotify::AlarmAccount {
                 name: name.clone(),
                 default_lead_minutes: c.default_alarm_minutes_before.clone().unwrap_or_default(),
             })
